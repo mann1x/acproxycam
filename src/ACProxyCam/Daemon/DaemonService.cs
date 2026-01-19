@@ -1,0 +1,148 @@
+// DaemonService.cs - Main daemon service loop
+
+using System.Runtime.InteropServices;
+using ACProxyCam.Models;
+
+namespace ACProxyCam.Daemon;
+
+/// <summary>
+/// Main daemon service that manages printer threads and IPC.
+/// </summary>
+public class DaemonService
+{
+    private readonly CancellationTokenSource _cts = new();
+    private readonly DateTime _startTime = DateTime.UtcNow;
+    private IpcServer? _ipcServer;
+    private PrinterManager? _printerManager;
+    private AppConfig? _config;
+
+    public TimeSpan Uptime => DateTime.UtcNow - _startTime;
+
+    public async Task RunAsync()
+    {
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ACProxyCam daemon starting...");
+
+        // Set up signal handlers for graceful shutdown
+        SetupSignalHandlers();
+
+        // Load configuration
+        _config = await ConfigManager.LoadAsync();
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Configuration loaded: {_config.Printers.Count} printers");
+
+        // Initialize printer manager
+        _printerManager = new PrinterManager(_config);
+
+        // Start IPC server
+        _ipcServer = new IpcServer(this, _printerManager);
+        await _ipcServer.StartAsync();
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] IPC server started");
+
+        // Start all configured printers
+        await _printerManager.StartAllAsync();
+
+        // Notify systemd we're ready (if running under systemd)
+        NotifySystemdReady();
+
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Daemon ready");
+
+        // Main loop - wait for cancellation
+        try
+        {
+            await Task.Delay(Timeout.Infinite, _cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown
+        }
+
+        // Graceful shutdown
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Shutting down...");
+
+        await _printerManager.StopAllAsync();
+        _ipcServer.Stop();
+
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Daemon stopped");
+    }
+
+    public void Stop()
+    {
+        _cts.Cancel();
+    }
+
+    public DaemonStatusData GetStatus()
+    {
+        var printers = _printerManager?.GetAllStatus() ?? new List<PrinterStatus>();
+
+        return new DaemonStatusData
+        {
+            Version = Program.Version,
+            Running = true,
+            Uptime = Uptime,
+            PrinterCount = printers.Count,
+            ActiveStreamers = printers.Count(p => p.State == PrinterState.Running),
+            InactiveStreamers = printers.Count(p => p.State != PrinterState.Running),
+            TotalClients = printers.Sum(p => p.ConnectedClients),
+            ListenInterfaces = _config?.ListenInterfaces ?? new List<string>()
+        };
+    }
+
+    public async Task ReloadConfigAsync()
+    {
+        _config = await ConfigManager.LoadAsync();
+        _printerManager?.UpdateConfig(_config);
+    }
+
+    public async Task ChangeInterfacesAsync(List<string> interfaces)
+    {
+        if (_config != null)
+        {
+            _config.ListenInterfaces = interfaces;
+            await ConfigManager.SaveAsync(_config);
+            // Restart printer threads with new interfaces
+            await _printerManager?.RestartAllAsync()!;
+        }
+    }
+
+    private void SetupSignalHandlers()
+    {
+        // Handle SIGTERM (systemd stop)
+        PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Received SIGTERM");
+            _cts.Cancel();
+        });
+
+        // Handle SIGINT (Ctrl+C)
+        PosixSignalRegistration.Create(PosixSignal.SIGINT, context =>
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Received SIGINT");
+            _cts.Cancel();
+        });
+
+        // Handle SIGHUP (reload config)
+        PosixSignalRegistration.Create(PosixSignal.SIGHUP, context =>
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Received SIGHUP - reloading config");
+            _ = ReloadConfigAsync();
+        });
+    }
+
+    private void NotifySystemdReady()
+    {
+        // sd_notify(0, "READY=1") equivalent
+        var notifySocket = Environment.GetEnvironmentVariable("NOTIFY_SOCKET");
+        if (!string.IsNullOrEmpty(notifySocket))
+        {
+            try
+            {
+                // This would need a proper implementation with Unix sockets
+                // For now, just log that we would notify
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Would notify systemd: READY=1");
+            }
+            catch
+            {
+                // Ignore errors
+            }
+        }
+    }
+}
