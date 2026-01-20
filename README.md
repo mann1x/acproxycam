@@ -2,6 +2,8 @@
 
 Anycubic Camera Proxy for Linux - Converts FLV camera streams from Anycubic 3D printers to MJPEG for Mainsail/Fluidd/Moonraker compatibility.
 
+![ACProxyCam Management Interface](docs/screenshot.png)
+
 ## Features
 
 - Multi-printer support with individual MJPEG streams on separate ports
