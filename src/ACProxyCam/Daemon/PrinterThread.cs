@@ -33,6 +33,7 @@ public class PrinterThread : IDisposable
 
     // Services
     private SshCredentialService? _sshService;
+    private LanModeService? _lanModeService;
     private MqttCameraController? _mqttController;
     private FfmpegDecoder? _decoder;
     private MjpegServer? _mjpegServer;
@@ -41,6 +42,12 @@ public class PrinterThread : IDisposable
     private readonly SshStatus _sshStatus = new();
     private readonly MqttStatus _mqttStatus = new();
     private readonly StreamStatus _streamStatus = new();
+
+    // LED auto-control state
+    private string? _printerMqttState;
+    private LedStatus? _cachedLedStatus;
+    private DateTime? _ledOnIdleSince;
+    private readonly object _ledStateLock = new();
 
     // Watchdog settings
     private const int RetryDelayResponsive = 5;   // 5 seconds if host responds
@@ -153,26 +160,143 @@ public class PrinterThread : IDisposable
 
     public PrinterStatus GetStatus()
     {
-        return new PrinterStatus
+        lock (_ledStateLock)
         {
-            Name = Config.Name,
-            Ip = Config.Ip,
-            MjpegPort = Config.MjpegPort,
-            State = _state,
-            ConnectedClients = _mjpegServer?.ConnectedClients ?? 0,
-            IsPaused = _isPaused,
-            CpuAffinity = _cpuAffinity,
-            CurrentFps = (_mjpegServer?.ConnectedClients ?? 0) > 0 ? Config.MaxFps : Config.IdleFps,
-            IsIdle = (_mjpegServer?.ConnectedClients ?? 0) == 0,
-            IsOnline = _state == PrinterState.Running,
-            LastError = _lastError,
-            LastSeenOnline = _lastSeenOnline,
-            NextRetryAt = _nextRetryAt,
-            SshStatus = _sshStatus,
-            MqttStatus = _mqttStatus,
-            StreamStatus = _streamStatus
-        };
+            return new PrinterStatus
+            {
+                Name = Config.Name,
+                Ip = Config.Ip,
+                MjpegPort = Config.MjpegPort,
+                State = _state,
+                ConnectedClients = _mjpegServer?.ConnectedClients ?? 0,
+                IsPaused = _isPaused,
+                CpuAffinity = _cpuAffinity,
+                CurrentFps = (_mjpegServer?.ConnectedClients ?? 0) > 0 ? Config.MaxFps : Config.IdleFps,
+                IsIdle = (_mjpegServer?.ConnectedClients ?? 0) == 0,
+                IsOnline = _state == PrinterState.Running,
+                LastError = _lastError,
+                LastSeenOnline = _lastSeenOnline,
+                NextRetryAt = _nextRetryAt,
+                SshStatus = _sshStatus,
+                MqttStatus = _mqttStatus,
+                StreamStatus = _streamStatus,
+                PrinterMqttState = _printerMqttState,
+                CameraLed = _cachedLedStatus
+            };
+        }
     }
+
+    /// <summary>
+    /// Query the current LED status via MQTT.
+    /// </summary>
+    public async Task<LedStatus?> GetLedStatusAsync(CancellationToken ct = default)
+    {
+        if (_mqttController == null || !_mqttController.IsConnected ||
+            string.IsNullOrEmpty(Config.DeviceId))
+            return _cachedLedStatus;
+
+        try
+        {
+            var status = await _mqttController.QueryLedStatusAsync(Config.DeviceId, Config.ModelCode, ct);
+            if (status != null)
+            {
+                lock (_ledStateLock)
+                {
+                    _cachedLedStatus = status;
+                }
+            }
+            return status ?? _cachedLedStatus;
+        }
+        catch
+        {
+            return _cachedLedStatus;
+        }
+    }
+
+    /// <summary>
+    /// Set the camera LED on or off via MQTT.
+    /// </summary>
+    public async Task<bool> SetLedAsync(bool on, CancellationToken ct = default)
+    {
+        if (_mqttController == null || !_mqttController.IsConnected ||
+            string.IsNullOrEmpty(Config.DeviceId))
+            return false;
+
+        try
+        {
+            var success = await _mqttController.SetLedAsync(Config.DeviceId, on, 100, Config.ModelCode, ct);
+            if (success)
+            {
+                lock (_ledStateLock)
+                {
+                    _cachedLedStatus = new LedStatus { Type = 2, IsOn = on, Brightness = on ? 100 : 0 };
+
+                    // Reset idle tracking when LED is toggled
+                    if (on && IsPrinterIdle())
+                    {
+                        _ledOnIdleSince = DateTime.UtcNow;
+                    }
+                    else
+                    {
+                        _ledOnIdleSince = null;
+                    }
+                }
+                LogStatus($"LED set to {(on ? "ON" : "OFF")}");
+            }
+            return success;
+        }
+        catch (Exception ex)
+        {
+            LogStatus($"Failed to set LED: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Query printer info (state, temps) via MQTT.
+    /// </summary>
+    public async Task<PrinterInfoResult?> GetPrinterInfoAsync(CancellationToken ct = default)
+    {
+        if (_mqttController == null || !_mqttController.IsConnected ||
+            string.IsNullOrEmpty(Config.DeviceId))
+            return null;
+
+        try
+        {
+            var info = await _mqttController.QueryPrinterInfoAsync(Config.DeviceId, Config.ModelCode, ct);
+            if (info != null)
+            {
+                lock (_ledStateLock)
+                {
+                    _printerMqttState = info.State;
+                }
+            }
+            return info;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Check if the printer is in an idle state (free/standby).
+    /// </summary>
+    private bool IsPrinterIdle()
+    {
+        var state = _printerMqttState?.ToLowerInvariant();
+        return state == null || state == "free" || state == "standby" || state == "ready";
+    }
+
+    /// <summary>
+    /// Expose the MjpegServer for HTTP endpoint extensions (LED control).
+    /// </summary>
+    internal MjpegServer? MjpegServer => _mjpegServer;
+
+    /// <summary>
+    /// Expose the MqttController for direct LED/info queries from HTTP endpoints.
+    /// </summary>
+    internal MqttCameraController? MqttController => _mqttController;
 
     private async Task WorkerLoopAsync(CancellationToken ct)
     {
@@ -310,11 +434,36 @@ public class PrinterThread : IDisposable
         // Subscribe to camera stop detection - immediately restart when external stop is detected
         _mqttController.CameraStopDetected += OnExternalCameraStopDetected;
 
-        await _mqttController.ConnectAsync(
-            Config.Ip,
-            Config.MqttUsername!,
-            Config.MqttPassword!,
-            ct);
+        // Subscribe to LED status updates from MQTT messages
+        _mqttController.LedStatusReceived += OnLedStatusReceived;
+
+        // Subscribe to printer state updates from MQTT messages
+        _mqttController.PrinterStateReceived += OnPrinterStateReceived;
+
+        try
+        {
+            await _mqttController.ConnectAsync(
+                Config.Ip,
+                Config.MqttUsername!,
+                Config.MqttPassword!,
+                ct);
+        }
+        catch (Exception ex) when (Config.AutoLanMode)
+        {
+            // MQTT connection failed - try to enable LAN mode
+            LogStatus($"MQTT connection failed: {ex.Message}");
+            LogStatus("AutoLanMode is enabled, attempting to enable LAN mode on printer...");
+
+            await TryEnableLanModeAsync(ct);
+
+            // Retry MQTT connection after enabling LAN mode
+            LogStatus("Retrying MQTT connection...");
+            await _mqttController.ConnectAsync(
+                Config.Ip,
+                Config.MqttUsername!,
+                Config.MqttPassword!,
+                ct);
+        }
 
         _mqttStatus.Connected = true;
 
@@ -365,6 +514,37 @@ public class PrinterThread : IDisposable
         LogStatus("MQTT staying connected for stream recovery");
     }
 
+    /// <summary>
+    /// Try to enable LAN mode on the printer via SSH.
+    /// </summary>
+    private async Task TryEnableLanModeAsync(CancellationToken ct)
+    {
+        _lanModeService = new LanModeService();
+        _lanModeService.StatusChanged += (s, msg) => LogStatus($"LAN Mode: {msg}");
+
+        var result = await _lanModeService.EnableLanModeAsync(
+            Config.Ip,
+            Config.SshPort,
+            Config.SshUser,
+            Config.SshPassword,
+            ct);
+
+        if (!result.Success)
+        {
+            throw new Exception($"Failed to enable LAN mode: {result.Error}");
+        }
+
+        if (result.WasAlreadyOpen)
+        {
+            LogStatus("LAN mode was already enabled on printer");
+        }
+        else
+        {
+            LogStatus("LAN mode enabled successfully, waiting 5 seconds for MQTT to become available...");
+            await Task.Delay(5000, ct);
+        }
+    }
+
     private void StartMjpegServer()
     {
         LogStatus($"Starting MJPEG server on port {Config.MjpegPort}...");
@@ -388,6 +568,10 @@ public class PrinterThread : IDisposable
                 bindAddress = addr;
             }
         }
+
+        // Wire up LED control callbacks
+        _mjpegServer.GetLedStatusAsync = GetLedStatusAsync;
+        _mjpegServer.SetLedAsync = SetLedAsync;
 
         _mjpegServer.Start(Config.MjpegPort, bindAddress);
         LogStatus($"MJPEG server listening on {bindAddress}:{Config.MjpegPort} (maxFps={Config.MaxFps}, idleFps={Config.IdleFps}, quality={Config.JpegQuality})");
@@ -445,6 +629,11 @@ public class PrinterThread : IDisposable
         int quickRetryCount = 0;
         const int maxQuickRetries = 3;
 
+        // LED auto-control: poll interval (every 30 seconds)
+        var lastLedAutoControlCheck = DateTime.MinValue;
+        const int ledAutoControlIntervalSeconds = 30;
+        var initialLedQueryDone = false;
+
         try
         {
             while (!ct.IsCancellationRequested && !_isPaused)
@@ -453,6 +642,28 @@ public class PrinterThread : IDisposable
                 {
                     _lastSeenOnline = DateTime.UtcNow;
                     quickRetryCount = 0; // Reset on successful streaming
+
+                    // Query LED status once on startup
+                    if (!initialLedQueryDone)
+                    {
+                        initialLedQueryDone = true;
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await GetLedStatusAsync(ct);
+                            }
+                            catch { /* Ignore errors on initial query */ }
+                        }, ct);
+                    }
+
+                    // LED auto-control check (every 30 seconds)
+                    if (Config.LedAutoControl && (DateTime.UtcNow - lastLedAutoControlCheck).TotalSeconds >= ledAutoControlIntervalSeconds)
+                    {
+                        lastLedAutoControlCheck = DateTime.UtcNow;
+                        await ProcessLedAutoControlAsync(ct);
+                    }
+
                     await Task.Delay(1000, ct);
                 }
                 else
@@ -495,6 +706,25 @@ public class PrinterThread : IDisposable
                 _mjpegServer.SnapshotRequested -= OnSnapshotRequested;
             }
             _decoder.Stop();
+        }
+    }
+
+    /// <summary>
+    /// Called when LED status is received from MQTT messages.
+    /// </summary>
+    private void OnLedStatusReceived(object? sender, LedStatus status)
+    {
+        lock (_ledStateLock)
+        {
+            _cachedLedStatus = status;
+        }
+    }
+
+    private void OnPrinterStateReceived(object? sender, string state)
+    {
+        lock (_ledStateLock)
+        {
+            _printerMqttState = state;
         }
     }
 
@@ -603,6 +833,8 @@ public class PrinterThread : IDisposable
                     _mqttController.StatusChanged += (s, msg) => LogStatus($"MQTT: {msg}");
                     _mqttController.ErrorOccurred += (s, ex) => LogStatus($"MQTT Error: {ex.Message}");
                     _mqttController.CameraStopDetected += OnExternalCameraStopDetected;
+                    _mqttController.LedStatusReceived += OnLedStatusReceived;
+                    _mqttController.PrinterStateReceived += OnPrinterStateReceived;
                 }
 
                 await _mqttController.ConnectAsync(Config.Ip, Config.MqttUsername, Config.MqttPassword, ct);
@@ -627,6 +859,76 @@ public class PrinterThread : IDisposable
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Process LED auto-control based on printer state.
+    /// - Turns LED on when printer is active (not idle)
+    /// - Turns LED off after timeout when printer is idle
+    /// </summary>
+    private async Task ProcessLedAutoControlAsync(CancellationToken ct)
+    {
+        try
+        {
+            // Try to query printer state (updates _printerMqttState if successful)
+            // Don't fail if query returns null - use cached state instead
+            _ = await GetPrinterInfoAsync(ct);
+
+            // Get LED status (uses cached status if query fails)
+            var ledStatus = await GetLedStatusAsync(ct);
+
+            var isIdle = IsPrinterIdle();
+            var ledIsOn = ledStatus?.IsOn ?? _cachedLedStatus?.IsOn ?? false;
+            var currentState = _printerMqttState ?? "unknown";
+
+            lock (_ledStateLock)
+            {
+                if (!isIdle)
+                {
+                    // Printer is active (printing, etc.) - turn LED on
+                    _ledOnIdleSince = null;
+
+                    if (!ledIsOn)
+                    {
+                        LogStatus($"LED Auto-control: Printer is active ({currentState}), turning LED on");
+                        _ = SetLedAsync(true, ct);
+                    }
+                }
+                else
+                {
+                    // Printer is idle
+                    if (ledIsOn)
+                    {
+                        // LED is on while idle - check timeout
+                        if (_ledOnIdleSince == null)
+                        {
+                            _ledOnIdleSince = DateTime.UtcNow;
+                            LogStatus($"LED Auto-control: Printer is idle ({currentState}), LED on - starting timeout timer ({Config.StandbyLedTimeoutMinutes}min)");
+                        }
+
+                        if (Config.StandbyLedTimeoutMinutes > 0)
+                        {
+                            var idleMinutes = (DateTime.UtcNow - _ledOnIdleSince.Value).TotalMinutes;
+                            if (idleMinutes >= Config.StandbyLedTimeoutMinutes)
+                            {
+                                LogStatus($"LED Auto-control: Idle timeout ({Config.StandbyLedTimeoutMinutes}min) reached, turning LED off");
+                                _ = SetLedAsync(false, ct);
+                                _ledOnIdleSince = null;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // LED is off while idle - reset tracking
+                        _ledOnIdleSince = null;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogStatus($"LED Auto-control error: {ex.Message}");
+        }
     }
 
     private async Task<bool> IsHostRespondingAsync()
@@ -684,6 +986,8 @@ public class PrinterThread : IDisposable
         {
             // Unsubscribe from events first
             _mqttController.CameraStopDetected -= OnExternalCameraStopDetected;
+            _mqttController.LedStatusReceived -= OnLedStatusReceived;
+            _mqttController.PrinterStateReceived -= OnPrinterStateReceived;
 
             // Stop camera via MQTT only if SendStopCommand is enabled
             if (Config.SendStopCommand &&
@@ -712,6 +1016,7 @@ public class PrinterThread : IDisposable
         }
 
         _sshService = null;
+        _lanModeService = null;
     }
 
     private void LogStatus(string message)

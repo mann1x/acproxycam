@@ -4,6 +4,8 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
+using ACProxyCam.Models;
 using SkiaSharp;
 
 namespace ACProxyCam.Services;
@@ -59,6 +61,16 @@ public class MjpegServer : IDisposable
     /// FPS when no clients are connected (for snapshot availability). 0 = no encoding when idle.
     /// </summary>
     public int IdleFps { get; set; } = 1;
+
+    /// <summary>
+    /// Callback to get current LED status. Returns null if not available.
+    /// </summary>
+    public Func<CancellationToken, Task<LedStatus?>>? GetLedStatusAsync { get; set; }
+
+    /// <summary>
+    /// Callback to set LED state. Returns true on success.
+    /// </summary>
+    public Func<bool, CancellationToken, Task<bool>>? SetLedAsync { get; set; }
 
     // MJPEG boundary string
     private const string Boundary = "--mjpegboundary";
@@ -339,7 +351,14 @@ public class MjpegServer : IDisposable
                 return;
             }
 
-            var path = ParseRequestPath(request);
+            // Handle CORS preflight requests
+            if (request.StartsWith("OPTIONS", StringComparison.OrdinalIgnoreCase))
+            {
+                HandleOptionsRequest(client);
+                return;
+            }
+
+            var (path, method, body) = ParseRequest(request);
 
             switch (path.ToLowerInvariant())
             {
@@ -356,6 +375,18 @@ public class MjpegServer : IDisposable
 
                 case "/status":
                     HandleStatusRequest(client);
+                    break;
+
+                case "/led":
+                    HandleLedRequest(client, method, body);
+                    break;
+
+                case "/led/on":
+                    HandleLedOnRequest(client, method);
+                    break;
+
+                case "/led/off":
+                    HandleLedOffRequest(client, method);
                     break;
 
                 default:
@@ -376,11 +407,14 @@ public class MjpegServer : IDisposable
 
     private void HandleStreamRequest(ClientConnection client)
     {
-        // Send MJPEG header
+        // Send MJPEG header with CORS support for Mainsail/Fluidd
         var header = "HTTP/1.1 200 OK\r\n" +
-                     "Content-Type: multipart/x-mixed-replace;boundary=mjpegboundary\r\n" +
+                     "Content-Type: multipart/x-mixed-replace; boundary=mjpegboundary\r\n" +
                      "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
                      "Pragma: no-cache\r\n" +
+                     "Access-Control-Allow-Origin: *\r\n" +
+                     "Access-Control-Allow-Methods: GET, OPTIONS\r\n" +
+                     "Access-Control-Allow-Headers: Content-Type\r\n" +
                      "Connection: close\r\n" +
                      "\r\n";
 
@@ -432,6 +466,7 @@ public class MjpegServer : IDisposable
                      "Content-Type: image/jpeg\r\n" +
                      $"Content-Length: {frame.Length}\r\n" +
                      "Cache-Control: no-cache\r\n" +
+                     "Access-Control-Allow-Origin: *\r\n" +
                      "Connection: close\r\n" +
                      "\r\n";
 
@@ -469,6 +504,20 @@ public class MjpegServer : IDisposable
         client.Dispose();
     }
 
+    private void HandleOptionsRequest(ClientConnection client)
+    {
+        var header = "HTTP/1.1 204 No Content\r\n" +
+                     "Access-Control-Allow-Origin: *\r\n" +
+                     "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
+                     "Access-Control-Allow-Headers: Content-Type\r\n" +
+                     "Access-Control-Max-Age: 86400\r\n" +
+                     "Connection: close\r\n" +
+                     "\r\n";
+
+        client.TrySend(Encoding.ASCII.GetBytes(header));
+        client.Dispose();
+    }
+
     private void SendNotFound(ClientConnection client)
     {
         var body = "Not Found";
@@ -495,21 +544,279 @@ public class MjpegServer : IDisposable
         client.Dispose();
     }
 
+    /// <summary>
+    /// Handle LED GET (status) and POST (control) requests.
+    /// HomeAssistant-compatible format.
+    /// </summary>
+    private void HandleLedRequest(ClientConnection client, string method, string? body)
+    {
+        if (method == "GET")
+        {
+            // Query LED status
+            HandleLedStatusRequest(client);
+        }
+        else if (method == "POST")
+        {
+            // Set LED state from body: {"state": "on"|"off"}
+            HandleLedControlRequest(client, body);
+        }
+        else
+        {
+            SendMethodNotAllowed(client);
+        }
+    }
+
+    private void HandleLedStatusRequest(ClientConnection client)
+    {
+        if (GetLedStatusAsync == null)
+        {
+            SendServiceUnavailable(client, "LED control not available");
+            return;
+        }
+
+        try
+        {
+            var status = GetLedStatusAsync(CancellationToken.None).GetAwaiter().GetResult();
+            var response = new
+            {
+                state = status?.IsOn == true ? "on" : "off",
+                brightness = status?.Brightness ?? 0
+            };
+
+            SendJsonResponse(client, response);
+        }
+        catch (Exception ex)
+        {
+            SendError(client, 500, $"Failed to query LED: {ex.Message}");
+        }
+    }
+
+    private void HandleLedControlRequest(ClientConnection client, string? body)
+    {
+        if (SetLedAsync == null)
+        {
+            SendServiceUnavailable(client, "LED control not available");
+            return;
+        }
+
+        try
+        {
+            bool turnOn;
+
+            if (string.IsNullOrEmpty(body))
+            {
+                SendBadRequest(client, "Missing request body");
+                return;
+            }
+
+            // Parse body: {"state": "on"|"off"} or {"state": true|false}
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("state", out var stateEl))
+            {
+                if (stateEl.ValueKind == JsonValueKind.String)
+                {
+                    var stateStr = stateEl.GetString()?.ToLowerInvariant();
+                    turnOn = stateStr == "on" || stateStr == "true" || stateStr == "1";
+                }
+                else if (stateEl.ValueKind == JsonValueKind.True || stateEl.ValueKind == JsonValueKind.False)
+                {
+                    turnOn = stateEl.GetBoolean();
+                }
+                else
+                {
+                    SendBadRequest(client, "Invalid state value");
+                    return;
+                }
+            }
+            else
+            {
+                SendBadRequest(client, "Missing 'state' field");
+                return;
+            }
+
+            var success = SetLedAsync(turnOn, CancellationToken.None).GetAwaiter().GetResult();
+            if (success)
+            {
+                var response = new { state = turnOn ? "on" : "off", success = true };
+                SendJsonResponse(client, response);
+            }
+            else
+            {
+                SendError(client, 500, "Failed to set LED");
+            }
+        }
+        catch (JsonException)
+        {
+            SendBadRequest(client, "Invalid JSON body");
+        }
+        catch (Exception ex)
+        {
+            SendError(client, 500, $"Failed to set LED: {ex.Message}");
+        }
+    }
+
+    private void HandleLedOnRequest(ClientConnection client, string method)
+    {
+        if (method != "POST")
+        {
+            SendMethodNotAllowed(client);
+            return;
+        }
+
+        if (SetLedAsync == null)
+        {
+            SendServiceUnavailable(client, "LED control not available");
+            return;
+        }
+
+        try
+        {
+            var success = SetLedAsync(true, CancellationToken.None).GetAwaiter().GetResult();
+            if (success)
+            {
+                var response = new { state = "on", success = true };
+                SendJsonResponse(client, response);
+            }
+            else
+            {
+                SendError(client, 500, "Failed to turn LED on");
+            }
+        }
+        catch (Exception ex)
+        {
+            SendError(client, 500, $"Failed to turn LED on: {ex.Message}");
+        }
+    }
+
+    private void HandleLedOffRequest(ClientConnection client, string method)
+    {
+        if (method != "POST")
+        {
+            SendMethodNotAllowed(client);
+            return;
+        }
+
+        if (SetLedAsync == null)
+        {
+            SendServiceUnavailable(client, "LED control not available");
+            return;
+        }
+
+        try
+        {
+            var success = SetLedAsync(false, CancellationToken.None).GetAwaiter().GetResult();
+            if (success)
+            {
+                var response = new { state = "off", success = true };
+                SendJsonResponse(client, response);
+            }
+            else
+            {
+                SendError(client, 500, "Failed to turn LED off");
+            }
+        }
+        catch (Exception ex)
+        {
+            SendError(client, 500, $"Failed to turn LED off: {ex.Message}");
+        }
+    }
+
+    private void SendJsonResponse(ClientConnection client, object data)
+    {
+        var json = JsonSerializer.Serialize(data);
+        var bodyBytes = Encoding.UTF8.GetBytes(json);
+
+        var header = "HTTP/1.1 200 OK\r\n" +
+                     "Content-Type: application/json\r\n" +
+                     $"Content-Length: {bodyBytes.Length}\r\n" +
+                     "Access-Control-Allow-Origin: *\r\n" +
+                     "Connection: close\r\n" +
+                     "\r\n";
+
+        client.TrySend(Encoding.ASCII.GetBytes(header));
+        client.TrySend(bodyBytes);
+        client.Dispose();
+    }
+
+    private void SendBadRequest(ClientConnection client, string message)
+    {
+        SendError(client, 400, message);
+    }
+
+    private void SendMethodNotAllowed(ClientConnection client)
+    {
+        SendError(client, 405, "Method Not Allowed");
+    }
+
+    private void SendServiceUnavailable(ClientConnection client, string message)
+    {
+        SendError(client, 503, message);
+    }
+
+    private void SendError(ClientConnection client, int statusCode, string message)
+    {
+        var statusText = statusCode switch
+        {
+            400 => "Bad Request",
+            405 => "Method Not Allowed",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            _ => "Error"
+        };
+
+        var json = JsonSerializer.Serialize(new { error = message });
+        var bodyBytes = Encoding.UTF8.GetBytes(json);
+
+        var header = $"HTTP/1.1 {statusCode} {statusText}\r\n" +
+                     "Content-Type: application/json\r\n" +
+                     $"Content-Length: {bodyBytes.Length}\r\n" +
+                     "Access-Control-Allow-Origin: *\r\n" +
+                     "Connection: close\r\n" +
+                     "\r\n";
+
+        client.TrySend(Encoding.ASCII.GetBytes(header));
+        client.TrySend(bodyBytes);
+        client.Dispose();
+    }
+
     private static string ParseRequestPath(string request)
+    {
+        var (path, _, _) = ParseRequest(request);
+        return path;
+    }
+
+    private static (string Path, string Method, string? Body) ParseRequest(string request)
     {
         // Parse "GET /path HTTP/1.1"
         var lines = request.Split('\n');
-        if (lines.Length == 0) return "/";
+        if (lines.Length == 0) return ("/", "GET", null);
 
         var parts = lines[0].Split(' ');
-        if (parts.Length < 2) return "/";
+        if (parts.Length < 2) return ("/", "GET", null);
 
+        var method = parts[0].ToUpperInvariant();
         var path = parts[1];
         var queryIndex = path.IndexOf('?');
         if (queryIndex >= 0)
             path = path.Substring(0, queryIndex);
 
-        return path;
+        // Extract body (after empty line)
+        string? body = null;
+        var bodyIndex = request.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+        if (bodyIndex >= 0 && bodyIndex + 4 < request.Length)
+        {
+            body = request.Substring(bodyIndex + 4).Trim();
+        }
+        else
+        {
+            bodyIndex = request.IndexOf("\n\n", StringComparison.Ordinal);
+            if (bodyIndex >= 0 && bodyIndex + 2 < request.Length)
+            {
+                body = request.Substring(bodyIndex + 2).Trim();
+            }
+        }
+
+        return (path, method, body);
     }
 
     public void Dispose()

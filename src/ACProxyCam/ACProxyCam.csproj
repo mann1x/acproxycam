@@ -9,10 +9,10 @@
     <RootNamespace>ACProxyCam</RootNamespace>
 
     <!-- Version info - timestamp appended at build time -->
-    <Version>1.0.0</Version>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
-    <InformationalVersion>1.0.0.$([System.DateTime]::UtcNow.ToString("yyyyMMddHHmm"))</InformationalVersion>
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
+    <InformationalVersion>1.1.0.$([System.DateTime]::UtcNow.ToString("yyyyMMddHHmm"))</InformationalVersion>
     <!-- Disable automatic git hash in version -->
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 

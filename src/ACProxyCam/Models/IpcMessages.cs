@@ -122,6 +122,18 @@ public class ChangeInterfacesRequest
 }
 
 /// <summary>
+/// Request to control LED.
+/// </summary>
+public class SetLedRequest
+{
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("on")]
+    public bool On { get; set; }
+}
+
+/// <summary>
 /// IPC command names.
 /// </summary>
 public static class IpcCommands
@@ -138,4 +150,6 @@ public static class IpcCommands
     public const string ReloadConfig = "reload_config";
     public const string ChangeInterfaces = "change_interfaces";
     public const string StopService = "stop_service";
+    public const string GetLedStatus = "get_led_status";
+    public const string SetLed = "set_led";
 }

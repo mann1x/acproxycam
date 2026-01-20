@@ -1,9 +1,11 @@
 // MqttCameraController.cs - MQTT-based camera controller for Anycubic printers
 
+using System.Collections.Concurrent;
 using System.Security.Authentication;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using ACProxyCam.Models;
 using MQTTnet;
 using MQTTnet.Client;
 using MQTTnet.Protocol;
@@ -31,6 +33,16 @@ public class MqttCameraController : IAsyncDisposable
     /// </summary>
     public event EventHandler? CameraStopDetected;
 
+    /// <summary>
+    /// Raised when LED status is detected from MQTT messages.
+    /// </summary>
+    public event EventHandler<LedStatus>? LedStatusReceived;
+
+    /// <summary>
+    /// Raised when printer state is detected from MQTT messages.
+    /// </summary>
+    public event EventHandler<string>? PrinterStateReceived;
+
     public bool IsConnected => _mqttClient?.IsConnected ?? false;
     public string? DetectedModelCode => _detectedModelCode;
 
@@ -38,13 +50,23 @@ public class MqttCameraController : IAsyncDisposable
     public int MqttPort { get; set; } = 9883;
     public bool UseTls { get; set; } = true;
 
-    // Topic pattern: anycubic/anycubicCloud/v1/web/printer/{model}/{deviceId}/video
-    private const string TopicTemplate = "anycubic/anycubicCloud/v1/web/printer/{0}/{1}/video";
+    // Topic patterns: anycubic/anycubicCloud/v1/web/printer/{model}/{deviceId}/{type}
+    private const string VideoTopicTemplate = "anycubic/anycubicCloud/v1/web/printer/{0}/{1}/video";
+    private const string LightTopicTemplate = "anycubic/anycubicCloud/v1/web/printer/{0}/{1}/light";
+    private const string InfoTopicTemplate = "anycubic/anycubicCloud/v1/web/printer/{0}/{1}/info";
+
+    // Response topic patterns
+    private const string LightReportSuffix = "/light/report";
+    private const string InfoReportSuffix = "/info/report";
+    private const string ResponseSuffix = "/response";  // Anycubic sends responses here
 
     // Regex to extract model code from MQTT topics
     private static readonly Regex ModelCodeRegex = new(
         @"anycubic/anycubicCloud/v1/(?:printer/public|sever/printer|server/printer|web/printer)/(\d+)/",
         RegexOptions.Compiled);
+
+    // Response tracking for async queries
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<JsonDocument?>> _pendingResponses = new();
 
     public MqttCameraController()
     {
@@ -80,6 +102,15 @@ public class MqttCameraController : IAsyncDisposable
 
             // Detect camera stop commands from other sources (slicer, etc.)
             TryDetectStopCommand(topic, payload);
+
+            // Try to detect LED status from messages
+            TryDetectLedStatus(topic, payload);
+
+            // Try to detect printer state from messages
+            TryDetectPrinterState(topic, payload);
+
+            // Handle responses for pending queries (LED, info)
+            TryCompleteResponse(topic, payload);
 
             return Task.CompletedTask;
         };
@@ -221,6 +252,82 @@ public class MqttCameraController : IAsyncDisposable
     }
 
     /// <summary>
+    /// Try to detect LED status from incoming MQTT messages.
+    /// </summary>
+    private void TryDetectLedStatus(string topic, string payload)
+    {
+        // Look for light-related topics or payloads containing light data
+        if (!topic.Contains("/light") && !payload.Contains("\"lights\""))
+            return;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(payload);
+            var root = doc.RootElement;
+
+            // Check for lights array in data: {"data": {"lights": [{"type": 2, "status": 0|1, "brightness": 0-100}]}}
+            if (root.TryGetProperty("data", out var data) &&
+                data.TryGetProperty("lights", out var lights) &&
+                lights.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var light in lights.EnumerateArray())
+                {
+                    if (light.TryGetProperty("type", out var typeEl) && typeEl.GetInt32() == 2)
+                    {
+                        var ledStatus = new LedStatus
+                        {
+                            Type = 2,
+                            IsOn = light.TryGetProperty("status", out var statusEl) && statusEl.GetInt32() == 1,
+                            Brightness = light.TryGetProperty("brightness", out var brightnessEl) ? brightnessEl.GetInt32() : 0
+                        };
+                        StatusChanged?.Invoke(this, $"LED status detected: {(ledStatus.IsOn ? "ON" : "OFF")}, brightness={ledStatus.Brightness}");
+                        LedStatusReceived?.Invoke(this, ledStatus);
+                        return;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Not valid JSON or doesn't have expected fields - ignore
+        }
+    }
+
+    /// <summary>
+    /// Try to detect printer state from MQTT message payload.
+    /// State comes in messages with {"data": {"state": "free|printing|paused|..."}}
+    /// </summary>
+    private void TryDetectPrinterState(string topic, string payload)
+    {
+        // Only process topics that might contain state info
+        if (!payload.Contains("\"state\""))
+            return;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(payload);
+            var root = doc.RootElement;
+
+            // Check for state in data: {"data": {"state": "free"}}
+            if (root.TryGetProperty("data", out var data) &&
+                data.TryGetProperty("state", out var stateEl) &&
+                stateEl.ValueKind == JsonValueKind.String)
+            {
+                var state = stateEl.GetString();
+                if (!string.IsNullOrEmpty(state))
+                {
+                    StatusChanged?.Invoke(this, $"Printer state detected: {state}");
+                    PrinterStateReceived?.Invoke(this, state);
+                }
+            }
+        }
+        catch
+        {
+            // Not valid JSON or doesn't have expected fields - ignore
+        }
+    }
+
+    /// <summary>
     /// Register a message ID as our own to avoid reacting to it.
     /// </summary>
     private void RegisterOwnMessageId(string msgId)
@@ -233,6 +340,49 @@ public class MqttCameraController : IAsyncDisposable
             {
                 _ownMessageIds.Clear();
             }
+        }
+    }
+
+    /// <summary>
+    /// Try to complete a pending response based on the message ID.
+    /// </summary>
+    private void TryCompleteResponse(string topic, string payload)
+    {
+        // Only process report or response topics
+        var isReportTopic = topic.EndsWith(LightReportSuffix) || topic.EndsWith(InfoReportSuffix);
+        var isResponseTopic = topic.EndsWith(ResponseSuffix);
+
+        if (!isReportTopic && !isResponseTopic)
+            return;
+
+        try
+        {
+            var doc = JsonDocument.Parse(payload);
+            if (doc.RootElement.TryGetProperty("msgid", out var msgIdElement))
+            {
+                var msgId = msgIdElement.GetString();
+                if (msgId != null && _pendingResponses.TryRemove(msgId, out var tcs))
+                {
+                    // For /response topics, the printer only sends back msgid on success
+                    // Create a success response with code 200
+                    if (isResponseTopic && !doc.RootElement.TryGetProperty("code", out _))
+                    {
+                        // Response topic with just msgid = success
+                        var successJson = JsonDocument.Parse("{\"code\":200,\"msgid\":\"" + msgId + "\"}");
+                        doc.Dispose();
+                        tcs.TrySetResult(successJson);
+                        return;
+                    }
+                    tcs.TrySetResult(doc);
+                    return;
+                }
+            }
+            // If no msgid match, dispose the document
+            doc.Dispose();
+        }
+        catch
+        {
+            // Not valid JSON - ignore
         }
     }
 
@@ -277,7 +427,23 @@ public class MqttCameraController : IAsyncDisposable
     /// </summary>
     private static string BuildVideoTopic(string modelCode, string deviceId)
     {
-        return string.Format(TopicTemplate, modelCode, deviceId);
+        return string.Format(VideoTopicTemplate, modelCode, deviceId);
+    }
+
+    /// <summary>
+    /// Build the MQTT topic for LED control.
+    /// </summary>
+    private static string BuildLightTopic(string modelCode, string deviceId)
+    {
+        return string.Format(LightTopicTemplate, modelCode, deviceId);
+    }
+
+    /// <summary>
+    /// Build the MQTT topic for printer info.
+    /// </summary>
+    private static string BuildInfoTopic(string modelCode, string deviceId)
+    {
+        return string.Format(InfoTopicTemplate, modelCode, deviceId);
     }
 
     /// <summary>
@@ -391,6 +557,237 @@ public class MqttCameraController : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Query the current LED status.
+    /// </summary>
+    public async Task<LedStatus?> QueryLedStatusAsync(
+        string deviceId,
+        string? modelCode = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_mqttClient == null || !_mqttClient.IsConnected)
+            return null;
+
+        var effectiveModelCode = modelCode ?? _detectedModelCode;
+        if (string.IsNullOrEmpty(effectiveModelCode))
+            return null;
+
+        var topic = BuildLightTopic(effectiveModelCode, deviceId);
+        var msgId = Guid.NewGuid().ToString();
+        var command = new Dictionary<string, object?>
+        {
+            ["type"] = "light",
+            ["action"] = "query",
+            ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["msgid"] = msgId,
+            ["data"] = new { type = 2 }
+        };
+        var payload = JsonSerializer.Serialize(command);
+
+        var tcs = new TaskCompletionSource<JsonDocument?>();
+        _pendingResponses[msgId] = tcs;
+
+        try
+        {
+            var message = new MqttApplicationMessageBuilder()
+                .WithTopic(topic)
+                .WithPayload(payload)
+                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+                .Build();
+
+            await _mqttClient.PublishAsync(message, cancellationToken);
+
+            // Wait for response with timeout
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromSeconds(5));
+
+            var response = await tcs.Task.WaitAsync(cts.Token);
+            if (response == null)
+                return null;
+
+            using (response)
+            {
+                // Parse response: {"data": {"lights": [{"type": 2, "status": 0|1, "brightness": 0-100}]}}
+                if (response.RootElement.TryGetProperty("data", out var data) &&
+                    data.TryGetProperty("lights", out var lights) &&
+                    lights.GetArrayLength() > 0)
+                {
+                    foreach (var light in lights.EnumerateArray())
+                    {
+                        if (light.TryGetProperty("type", out var typeEl) && typeEl.GetInt32() == 2)
+                        {
+                            return new LedStatus
+                            {
+                                Type = 2,
+                                IsOn = light.TryGetProperty("status", out var statusEl) && statusEl.GetInt32() == 1,
+                                Brightness = light.TryGetProperty("brightness", out var brightnessEl) ? brightnessEl.GetInt32() : 0
+                            };
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+        finally
+        {
+            _pendingResponses.TryRemove(msgId, out _);
+        }
+    }
+
+    /// <summary>
+    /// Set the camera LED on or off.
+    /// </summary>
+    public async Task<bool> SetLedAsync(
+        string deviceId,
+        bool on,
+        int brightness = 100,
+        string? modelCode = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_mqttClient == null || !_mqttClient.IsConnected)
+            return false;
+
+        var effectiveModelCode = modelCode ?? _detectedModelCode;
+        if (string.IsNullOrEmpty(effectiveModelCode))
+            return false;
+
+        var topic = BuildLightTopic(effectiveModelCode, deviceId);
+        var msgId = Guid.NewGuid().ToString();
+        var command = new Dictionary<string, object?>
+        {
+            ["type"] = "light",
+            ["action"] = "control",
+            ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["msgid"] = msgId,
+            ["data"] = new { type = 2, status = on ? 1 : 0, brightness = on ? brightness : 0 }
+        };
+        var payload = JsonSerializer.Serialize(command);
+
+        var tcs = new TaskCompletionSource<JsonDocument?>();
+        _pendingResponses[msgId] = tcs;
+
+        try
+        {
+            var message = new MqttApplicationMessageBuilder()
+                .WithTopic(topic)
+                .WithPayload(payload)
+                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+                .Build();
+
+            await _mqttClient.PublishAsync(message, cancellationToken);
+
+            // Wait for response with timeout
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromSeconds(5));
+
+            var response = await tcs.Task.WaitAsync(cts.Token);
+            if (response == null)
+                return false;
+
+            using (response)
+            {
+                // Check for success: {"code": 200, ...}
+                return response.RootElement.TryGetProperty("code", out var codeEl) && codeEl.GetInt32() == 200;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+        finally
+        {
+            _pendingResponses.TryRemove(msgId, out _);
+        }
+    }
+
+    /// <summary>
+    /// Query printer info including state.
+    /// </summary>
+    public async Task<PrinterInfoResult?> QueryPrinterInfoAsync(
+        string deviceId,
+        string? modelCode = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_mqttClient == null || !_mqttClient.IsConnected)
+            return null;
+
+        var effectiveModelCode = modelCode ?? _detectedModelCode;
+        if (string.IsNullOrEmpty(effectiveModelCode))
+            return null;
+
+        var topic = BuildInfoTopic(effectiveModelCode, deviceId);
+        var msgId = Guid.NewGuid().ToString();
+        var command = new Dictionary<string, object?>
+        {
+            ["type"] = "info",
+            ["action"] = "query",
+            ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["msgid"] = msgId
+        };
+        var payload = JsonSerializer.Serialize(command);
+
+        var tcs = new TaskCompletionSource<JsonDocument?>();
+        _pendingResponses[msgId] = tcs;
+
+        try
+        {
+            var message = new MqttApplicationMessageBuilder()
+                .WithTopic(topic)
+                .WithPayload(payload)
+                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+                .Build();
+
+            await _mqttClient.PublishAsync(message, cancellationToken);
+
+            // Wait for response with timeout
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromSeconds(5));
+
+            var response = await tcs.Task.WaitAsync(cts.Token);
+            if (response == null)
+                return null;
+
+            using (response)
+            {
+                // Parse response: {"data": {"state": "free", "temp": {...}, ...}}
+                if (response.RootElement.TryGetProperty("data", out var data))
+                {
+                    var result = new PrinterInfoResult();
+
+                    if (data.TryGetProperty("state", out var stateEl))
+                        result.State = stateEl.GetString();
+
+                    if (data.TryGetProperty("temp", out var tempEl))
+                    {
+                        if (tempEl.TryGetProperty("curr_nozzle_temp", out var nozzleTemp))
+                            result.NozzleTemp = nozzleTemp.GetInt32();
+                        if (tempEl.TryGetProperty("curr_hotbed_temp", out var bedTemp))
+                            result.BedTemp = bedTemp.GetInt32();
+                        if (tempEl.TryGetProperty("target_nozzle_temp", out var targetNozzle))
+                            result.TargetNozzleTemp = targetNozzle.GetInt32();
+                        if (tempEl.TryGetProperty("target_hotbed_temp", out var targetBed))
+                            result.TargetBedTemp = targetBed.GetInt32();
+                    }
+
+                    return result;
+                }
+            }
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+        finally
+        {
+            _pendingResponses.TryRemove(msgId, out _);
+        }
+    }
+
     public async Task DisconnectAsync()
     {
         if (_mqttClient != null && _mqttClient.IsConnected)
@@ -426,4 +823,20 @@ public class MqttMessageEventArgs : EventArgs
         Topic = topic;
         Payload = payload;
     }
+}
+
+/// <summary>
+/// Result of printer info query via MQTT.
+/// </summary>
+public class PrinterInfoResult
+{
+    /// <summary>
+    /// Printer state: "free" (idle), "printing", "paused", etc.
+    /// </summary>
+    public string? State { get; set; }
+
+    public int NozzleTemp { get; set; }
+    public int BedTemp { get; set; }
+    public int TargetNozzleTemp { get; set; }
+    public int TargetBedTemp { get; set; }
 }

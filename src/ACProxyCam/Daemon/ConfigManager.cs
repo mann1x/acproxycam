@@ -75,7 +75,14 @@ public static class ConfigManager
                 MqttUsername = EncryptIfNeeded(p.MqttUsername),
                 MqttPassword = EncryptIfNeeded(p.MqttPassword),
                 DeviceId = p.DeviceId,
-                ModelCode = p.ModelCode
+                ModelCode = p.ModelCode,
+                MaxFps = p.MaxFps,
+                IdleFps = p.IdleFps,
+                JpegQuality = p.JpegQuality,
+                SendStopCommand = p.SendStopCommand,
+                AutoLanMode = p.AutoLanMode,
+                LedAutoControl = p.LedAutoControl,
+                StandbyLedTimeoutMinutes = p.StandbyLedTimeoutMinutes
             }).ToList()
         };
 

@@ -183,6 +183,16 @@ public class IpcServer
                     _daemon.Stop();
                     return IpcResponse.Ok();
 
+                case IpcCommands.GetLedStatus:
+                    var ledStatusReq = DeserializeData<PrinterNameRequest>(request.Data);
+                    if (ledStatusReq == null) return IpcResponse.Fail("Invalid request data");
+                    return await GetLedStatusAsync(ledStatusReq.Name);
+
+                case IpcCommands.SetLed:
+                    var setLedReq = DeserializeData<SetLedRequest>(request.Data);
+                    if (setLedReq == null) return IpcResponse.Fail("Invalid request data");
+                    return await SetLedAsync(setLedReq.Name, setLedReq.On);
+
                 default:
                     return IpcResponse.Fail($"Unknown command: {request.Command}");
             }
@@ -201,5 +211,28 @@ public class IpcServer
             return JsonSerializer.Deserialize<T>(element.GetRawText());
         }
         return data as T;
+    }
+
+    private async Task<IpcResponse> GetLedStatusAsync(string printerName)
+    {
+        var thread = _printerManager.GetPrinterThread(printerName);
+        if (thread == null)
+            return IpcResponse.Fail("Printer not found");
+
+        var ledStatus = await thread.GetLedStatusAsync();
+        return IpcResponse.Ok(ledStatus);
+    }
+
+    private async Task<IpcResponse> SetLedAsync(string printerName, bool on)
+    {
+        var thread = _printerManager.GetPrinterThread(printerName);
+        if (thread == null)
+            return IpcResponse.Fail("Printer not found");
+
+        var success = await thread.SetLedAsync(on);
+        if (success)
+            return IpcResponse.Ok(new { state = on ? "on" : "off" });
+        else
+            return IpcResponse.Fail("Failed to set LED");
     }
 }

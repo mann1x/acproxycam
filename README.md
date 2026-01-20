@@ -12,12 +12,14 @@ Anycubic Camera Proxy for Linux - Converts FLV camera streams from Anycubic 3D p
 - **Stream recovery** - intercepts external stop commands (from slicers) and instantly restarts camera
 - **Configurable FPS** - MaxFps for streaming, IdleFps for snapshots when no clients connected
 - **CPU affinity** - distributes printer threads across CPU cores for better performance
+- **Camera LED control** - toggle camera LED via HTTP API or management interface, with optional auto-control
 - Systemd service with watchdog support
 - Interactive terminal management interface using Spectre.Console with auto-refresh
 - Pre-flight connectivity check when adding printers
 - Encrypted credential storage (AES-256-GCM with machine-specific key)
 - Automatic retry with intelligent backoff (5s if responsive, 30s if offline)
 - Log rotation via logrotate
+- **HomeAssistant integration** - REST API compatible with HomeAssistant switches
 
 ## Requirements
 
@@ -85,6 +87,7 @@ Run `sudo acproxycam` to enter the interactive management interface.
 | `D` | Delete printer |
 | `M` | Modify printer settings |
 | `Space` | Pause/Resume printer |
+| `T` | Toggle camera LED |
 | `Enter` | View printer details |
 | `Q` | Quit |
 
@@ -107,8 +110,11 @@ Once a printer is configured and running, access the streams at:
 | MJPEG Stream | `http://server-ip:8080/stream` | Live video stream |
 | Snapshot | `http://server-ip:8080/snapshot` | Current frame as JPEG |
 | Status | `http://server-ip:8080/status` | JSON status info |
+| LED Status | `http://server-ip:8080/led` | GET: JSON `{"state":"on\|off","brightness":0-100}` |
+| LED On | `http://server-ip:8080/led/on` | POST: Turn LED on |
+| LED Off | `http://server-ip:8080/led/off` | POST: Turn LED off |
 
-Configure these URLs in Mainsail/Fluidd webcam settings.
+Configure the stream URLs in Mainsail/Fluidd webcam settings.
 
 ### Multiple Printers
 
@@ -155,6 +161,43 @@ Example configuration:
   ]
 }
 ```
+
+## HomeAssistant Integration
+
+You can integrate the camera LED control with HomeAssistant as a switch.
+
+### REST Switch Configuration
+
+Add this to your `configuration.yaml`:
+
+```yaml
+rest_command:
+  printer_led_on:
+    url: http://192.168.1.10:8080/led/on
+    method: POST
+  printer_led_off:
+    url: http://192.168.1.10:8080/led/off
+    method: POST
+
+switch:
+  - platform: template
+    switches:
+      printer_camera_led:
+        friendly_name: "Printer Camera LED"
+        turn_on:
+          service: rest_command.printer_led_on
+        turn_off:
+          service: rest_command.printer_led_off
+```
+
+Replace `192.168.1.10:8080` with your ACProxyCam server IP and port.
+
+After adding the configuration:
+1. Go to **Developer Tools > YAML > Check Configuration**
+2. Click **Restart** to apply the changes
+3. Find `switch.printer_camera_led` in **Settings > Devices & Services > Entities**
+
+You can then add this switch to any dashboard.
 
 ## Systemd Service
 

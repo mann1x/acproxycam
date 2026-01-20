@@ -88,4 +88,25 @@ public class PrinterConfig
     /// </summary>
     [JsonPropertyName("sendStopCommand")]
     public bool SendStopCommand { get; set; } = false;
+
+    /// <summary>
+    /// Automatically enable LAN mode on the printer if MQTT connection fails.
+    /// Uses the printer's local API on port 18086 via SSH tunnel.
+    /// </summary>
+    [JsonPropertyName("autoLanMode")]
+    public bool AutoLanMode { get; set; } = false;
+
+    /// <summary>
+    /// Automatically control camera LED based on printer state.
+    /// When enabled, LED turns on when printer is active (printing, etc.) and off after idle timeout.
+    /// </summary>
+    [JsonPropertyName("ledAutoControl")]
+    public bool LedAutoControl { get; set; } = false;
+
+    /// <summary>
+    /// Minutes to wait before turning off LED when printer is idle (standby/free).
+    /// Default: 20 minutes. Set to 0 to disable auto-off (LED stays on).
+    /// </summary>
+    [JsonPropertyName("standbyLedTimeoutMinutes")]
+    public int StandbyLedTimeoutMinutes { get; set; } = 20;
 }

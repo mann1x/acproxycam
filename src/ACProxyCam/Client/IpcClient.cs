@@ -218,6 +218,28 @@ public class IpcClient : IDisposable
         return (response.Success, response.Error);
     }
 
+    /// <summary>
+    /// Get LED status for a printer.
+    /// </summary>
+    public async Task<(bool Success, LedStatus? Data, string? Error)> GetLedStatusAsync(string name)
+    {
+        var response = await SendAsync(IpcCommands.GetLedStatus, new PrinterNameRequest { Name = name });
+        if (!response.Success)
+            return (false, null, response.Error);
+
+        var data = DeserializeData<LedStatus>(response.Data);
+        return (true, data, null);
+    }
+
+    /// <summary>
+    /// Set LED state for a printer.
+    /// </summary>
+    public async Task<(bool Success, string? Error)> SetLedAsync(string name, bool on)
+    {
+        var response = await SendAsync(IpcCommands.SetLed, new SetLedRequest { Name = name, On = on });
+        return (response.Success, response.Error);
+    }
+
     private T? DeserializeData<T>(object? data) where T : class
     {
         if (data == null) return null;

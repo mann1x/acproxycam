@@ -122,6 +122,17 @@ public class PrinterManager
         return _config.Printers.FirstOrDefault(p => p.Name == name);
     }
 
+    /// <summary>
+    /// Get the PrinterThread for a specific printer by name.
+    /// </summary>
+    public PrinterThread? GetPrinterThread(string name)
+    {
+        lock (_lock)
+        {
+            return _printers.TryGetValue(name, out var printer) ? printer : null;
+        }
+    }
+
     public async Task<IpcResponse> AddPrinterAsync(PrinterConfig config)
     {
         // Validate required fields

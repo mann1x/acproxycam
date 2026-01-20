@@ -29,6 +29,12 @@ public class PrinterStatus
     public SshStatus SshStatus { get; set; } = new();
     public MqttStatus MqttStatus { get; set; } = new();
     public StreamStatus StreamStatus { get; set; } = new();
+
+    // Printer state from MQTT (e.g., "free", "printing", "paused")
+    public string? PrinterMqttState { get; set; }
+
+    // Camera LED status
+    public LedStatus? CameraLed { get; set; }
 }
 
 public enum PrinterState
@@ -72,4 +78,25 @@ public class StreamStatus
     public string? DecoderStatus { get; set; }
     public string? Error { get; set; }
     public DateTime? LastFrameAt { get; set; }
+}
+
+/// <summary>
+/// Camera LED status.
+/// </summary>
+public class LedStatus
+{
+    /// <summary>
+    /// LED type (2 = camera LED).
+    /// </summary>
+    public int Type { get; set; } = 2;
+
+    /// <summary>
+    /// LED state: true = on, false = off.
+    /// </summary>
+    public bool IsOn { get; set; }
+
+    /// <summary>
+    /// LED brightness (0-100).
+    /// </summary>
+    public int Brightness { get; set; }
 }

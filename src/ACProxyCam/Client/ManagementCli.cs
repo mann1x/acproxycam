@@ -762,7 +762,8 @@ WantedBy=multi-user.target
         DeletePrinter,
         ModifyPrinter,
         TogglePause,
-        ShowDetails
+        ShowDetails,
+        ToggleLed
     }
 
     private async Task<int> ManagementLoopAsync()
@@ -810,6 +811,7 @@ WantedBy=multi-user.target
                                     ConsoleKey.M => MenuAction.ModifyPrinter,
                                     ConsoleKey.Spacebar => MenuAction.TogglePause,
                                     ConsoleKey.Enter => MenuAction.ShowDetails,
+                                    ConsoleKey.T => MenuAction.ToggleLed,
                                     _ => MenuAction.None
                                 };
                                 break; // Exit inner loop to refresh or handle action
@@ -870,6 +872,11 @@ WantedBy=multi-user.target
                     AnsiConsole.Clear();
                     await ShowPrinterDetailsAsync();
                     break;
+
+                case MenuAction.ToggleLed:
+                    AnsiConsole.Clear();
+                    await TogglePrinterLedAsync();
+                    break;
             }
         }
     }
@@ -926,11 +933,12 @@ WantedBy=multi-user.target
                 .BorderColor(Color.Blue)
                 .Title("[bold blue]Printers[/]")
                 .AddColumn(new TableColumn("[bold]Name[/]"))
-                .AddColumn(new TableColumn("[bold]IP Address[/]"))
+                .AddColumn(new TableColumn("[bold]IP/Hostname[/]"))
                 .AddColumn(new TableColumn("[bold]Port[/]").Centered())
                 .AddColumn(new TableColumn("[bold]Resolution[/]").Centered())
                 .AddColumn(new TableColumn("[bold]FPS[/]").Centered())
                 .AddColumn(new TableColumn("[bold]CPU[/]").Centered())
+                .AddColumn(new TableColumn("[bold]LED[/]").Centered())
                 .AddColumn(new TableColumn("[bold]Status[/]").Centered())
                 .AddColumn(new TableColumn("[bold]Clients[/]").Centered());
 
@@ -958,6 +966,13 @@ WantedBy=multi-user.target
                     ? $"[green]{p.ConnectedClients}[/]"
                     : "[grey]0[/]";
 
+                // LED status display
+                var ledDisplay = p.CameraLed == null
+                    ? "[grey]?[/]"
+                    : p.CameraLed.IsOn
+                        ? "[yellow]On[/]"
+                        : "[grey]Off[/]";
+
                 printerTable.AddRow(
                     $"[white]{Markup.Escape(p.Name)}[/]",
                     $"[grey]{Markup.Escape(p.Ip)}[/]",
@@ -965,6 +980,7 @@ WantedBy=multi-user.target
                     resolution,
                     fpsDisplay,
                     cpuDisplay,
+                    ledDisplay,
                     $"[{statusColor}]{statusIcon} {p.State}[/]",
                     clientsDisplay
                 );
@@ -975,7 +991,7 @@ WantedBy=multi-user.target
 
         // === PRINTER CONTROLS ===
         renderables.Add(new Markup(
-            "[grey]Printers:[/] [white][[A]][/][grey]dd[/]  [white][[D]][/][grey]elete[/]  [white][[M]][/][grey]odify[/]  [white][[Space]][/][grey]Pause[/]  [white][[Enter]][/][grey]Details[/]  [white][[F]][/][grey]Refresh[/]"
+            "[grey]Printers:[/] [white][[A]][/][grey]dd[/]  [white][[D]][/][grey]elete[/]  [white][[M]][/][grey]odify[/]  [white][[Space]][/][grey]Pause[/]  [white][[T]][/][grey]LED[/]  [white][[Enter]][/][grey]Details[/]"
         ));
 
         return new Rows(renderables);
@@ -1204,7 +1220,7 @@ WantedBy=multi-user.target
         if (name == null) return;
 
         // Get printer IP (validated)
-        var ip = AskValidatedString("Printer IP address:", ValidateIpAddress);
+        var ip = AskValidatedString("Printer IP/hostname:", ValidateIpAddress);
         if (ip == null) return;
 
         // Get MJPEG port (validated, with retry on conflict)
@@ -1224,6 +1240,19 @@ WantedBy=multi-user.target
         var mqttPort = AskValidatedPort("MQTT port:", 9883);
         if (mqttPort == null) return;
 
+        // Auto LAN Mode setting
+        var autoLanMode = _ui.Confirm("Auto LAN Mode (enable LAN mode on printer if MQTT fails)?", true);
+
+        // LED settings
+        _ui.WriteLine();
+        _ui.WriteInfo("LED settings:");
+        var ledAutoControl = _ui.Confirm("LED Auto Control (automatically manage camera LED)?", false);
+        var standbyLedTimeout = 20;
+        if (ledAutoControl)
+        {
+            standbyLedTimeout = AskValidatedInt("Standby LED timeout (minutes):", 1, 1440, 20);
+        }
+
         // Encoding settings (optional, show defaults)
         _ui.WriteLine();
         _ui.WriteInfo("Encoding settings (press Enter for defaults):");
@@ -1241,6 +1270,9 @@ WantedBy=multi-user.target
             SshUser = sshUser,
             SshPassword = sshPassword,
             MqttPort = mqttPort.Value,
+            AutoLanMode = autoLanMode,
+            LedAutoControl = ledAutoControl,
+            StandbyLedTimeoutMinutes = standbyLedTimeout,
             MaxFps = maxFps,
             IdleFps = idleFps,
             JpegQuality = jpegQuality
@@ -1353,7 +1385,7 @@ WantedBy=multi-user.target
         if (newName == null) return;
 
         // Modify settings with validation
-        var ip = AskValidatedString($"IP address [{existingConfig.Ip}]:", ValidateIpAddress, existingConfig.Ip);
+        var ip = AskValidatedString($"IP/hostname [{existingConfig.Ip}]:", ValidateIpAddress, existingConfig.Ip);
         if (ip == null) return;
 
         var mjpegPort = await AskPortWithRetryAsync($"MJPEG port [{existingConfig.MjpegPort}]:", existingConfig.MjpegPort, originalName, originalPort);
@@ -1367,6 +1399,19 @@ WantedBy=multi-user.target
 
         var mqttPort = AskValidatedPort($"MQTT port [{existingConfig.MqttPort}]:", existingConfig.MqttPort);
         if (mqttPort == null) return;
+
+        // Auto LAN Mode setting
+        var autoLanMode = _ui.Confirm($"Auto LAN Mode [{(existingConfig.AutoLanMode ? "Yes" : "No")}]?", existingConfig.AutoLanMode);
+
+        // LED settings
+        _ui.WriteLine();
+        _ui.WriteInfo("LED settings:");
+        var ledAutoControl = _ui.Confirm($"LED Auto Control [{(existingConfig.LedAutoControl ? "Yes" : "No")}]?", existingConfig.LedAutoControl);
+        var standbyLedTimeout = existingConfig.StandbyLedTimeoutMinutes;
+        if (ledAutoControl)
+        {
+            standbyLedTimeout = AskValidatedInt($"Standby LED timeout (minutes) [{existingConfig.StandbyLedTimeoutMinutes}]:", 1, 1440, existingConfig.StandbyLedTimeoutMinutes);
+        }
 
         // Encoding settings
         _ui.WriteLine();
@@ -1382,6 +1427,9 @@ WantedBy=multi-user.target
         existingConfig.SshPort = sshPort.Value;
         existingConfig.SshUser = sshUser;
         existingConfig.MqttPort = mqttPort.Value;
+        existingConfig.AutoLanMode = autoLanMode;
+        existingConfig.LedAutoControl = ledAutoControl;
+        existingConfig.StandbyLedTimeoutMinutes = standbyLedTimeout;
         existingConfig.MaxFps = maxFps;
         existingConfig.IdleFps = idleFps;
         existingConfig.JpegQuality = jpegQuality;
@@ -1447,6 +1495,51 @@ WantedBy=multi-user.target
         await Task.Delay(1000);
     }
 
+    private async Task TogglePrinterLedAsync()
+    {
+        var (success, printers, _) = await _ipcClient!.ListPrintersAsync();
+
+        if (!success || printers == null || printers.Count == 0)
+        {
+            _ui.WriteWarning("No printers available.");
+            await Task.Delay(1500);
+            return;
+        }
+
+        // Build choices showing current LED status
+        var choices = printers.Select(p =>
+        {
+            var ledStatus = p.CameraLed == null ? "?" : (p.CameraLed.IsOn ? "On" : "Off");
+            return $"{p.Name} (LED: {ledStatus})";
+        }).ToList();
+        choices.Add("Cancel");
+
+        var selected = _ui.SelectOne("Select printer to toggle LED:", choices);
+
+        if (selected == "Cancel")
+            return;
+
+        // Extract printer name
+        var printerName = selected.Split(' ')[0];
+        var printer = printers.First(p => p.Name == printerName);
+
+        // Toggle LED: if currently on or unknown, turn off; if off, turn on
+        var turnOn = printer.CameraLed == null || !printer.CameraLed.IsOn;
+
+        var (toggleSuccess, error) = await _ipcClient.SetLedAsync(printerName, turnOn);
+
+        if (toggleSuccess)
+        {
+            _ui.WriteSuccess($"LED turned {(turnOn ? "on" : "off")}.");
+        }
+        else
+        {
+            _ui.WriteError($"Error: {error ?? "Unknown error"}");
+        }
+
+        await Task.Delay(1000);
+    }
+
     private async Task ShowPrinterDetailsAsync()
     {
         var (success, printers, _) = await _ipcClient!.ListPrintersAsync();
@@ -1493,7 +1586,7 @@ WantedBy=multi-user.target
 
         var details = new List<(string, string)>
         {
-            ("IP Address", detailedStatus.Ip),
+            ("IP/Hostname", detailedStatus.Ip),
             ("MJPEG Port", detailedStatus.MjpegPort.ToString()),
             ("Status", $"[{statusColor}]{detailedStatus.State}[/]"),
             ("Connected Clients", detailedStatus.ConnectedClients.ToString())
@@ -1558,6 +1651,15 @@ WantedBy=multi-user.target
         var (configSuccess, printerConfig, _) = await _ipcClient.GetPrinterConfigAsync(selected);
         if (configSuccess && printerConfig != null)
         {
+            // Connection Settings
+            _ui.WriteLine();
+            _ui.WriteRule("Connection Settings");
+            _ui.WriteGrid(new[]
+            {
+                ("Auto LAN Mode", printerConfig.AutoLanMode ? "[green]Enabled[/]" : "[grey]Disabled[/]"),
+                ("Send Stop Command", printerConfig.SendStopCommand ? "[green]Yes[/]" : "[grey]No[/]")
+            });
+
             _ui.WriteLine();
             _ui.WriteRule("Encoding Settings");
             _ui.WriteGrid(new[]
@@ -1565,6 +1667,21 @@ WantedBy=multi-user.target
                 ("Max FPS", printerConfig.MaxFps.ToString()),
                 ("Idle FPS", printerConfig.IdleFps.ToString()),
                 ("JPEG Quality", printerConfig.JpegQuality.ToString())
+            });
+
+            // LED Settings
+            _ui.WriteLine();
+            _ui.WriteRule("LED Settings");
+            var ledStatusDisplay = detailedStatus.CameraLed == null
+                ? "[grey]Unknown[/]"
+                : detailedStatus.CameraLed.IsOn
+                    ? $"[yellow]On[/] (brightness: {detailedStatus.CameraLed.Brightness}%)"
+                    : "[grey]Off[/]";
+            _ui.WriteGrid(new[]
+            {
+                ("Current LED Status", ledStatusDisplay),
+                ("Auto Control", printerConfig.LedAutoControl ? "[green]Enabled[/]" : "[grey]Disabled[/]"),
+                ("Standby Timeout", $"{printerConfig.StandbyLedTimeoutMinutes} minutes")
             });
         }
 
@@ -1574,6 +1691,7 @@ WantedBy=multi-user.target
         _ui.WriteInfo($"MJPEG Stream: http://<server>:{detailedStatus.MjpegPort}/stream");
         _ui.WriteInfo($"Snapshot: http://<server>:{detailedStatus.MjpegPort}/snapshot");
         _ui.WriteInfo($"Status: http://<server>:{detailedStatus.MjpegPort}/status");
+        _ui.WriteInfo($"LED Control: http://<server>:{detailedStatus.MjpegPort}/led");
 
         _ui.WriteLine();
         _ui.WaitForKey("Press any key to return...");
@@ -1596,15 +1714,49 @@ WantedBy=multi-user.target
     }
 
     /// <summary>
-    /// Validates an IP address.
+    /// Validates an IP address (IPv4/IPv6) or hostname.
     /// </summary>
     private string? ValidateIpAddress(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
-            return "IP address cannot be empty";
-        if (!System.Net.IPAddress.TryParse(value, out _))
-            return "Invalid IP address format";
-        return null; // Valid
+            return "Address cannot be empty";
+
+        // Try parsing as IPv4 or IPv6
+        if (System.Net.IPAddress.TryParse(value, out _))
+            return null; // Valid IP address
+
+        // Validate as hostname
+        return ValidateHostname(value);
+    }
+
+    /// <summary>
+    /// Validates a hostname format.
+    /// </summary>
+    private string? ValidateHostname(string value)
+    {
+        // Hostname max length is 253 characters
+        if (value.Length > 253)
+            return "Hostname too long (max 253 characters)";
+
+        // Split into labels
+        var labels = value.Split('.');
+
+        foreach (var label in labels)
+        {
+            // Each label must be 1-63 characters
+            if (string.IsNullOrEmpty(label) || label.Length > 63)
+                return "Invalid hostname format (empty or too long label)";
+
+            // Labels can only contain alphanumeric and hyphens
+            if (!System.Text.RegularExpressions.Regex.IsMatch(label, @"^[a-zA-Z0-9-]+$"))
+                return "Hostname contains invalid characters (only letters, numbers, hyphens allowed)";
+
+            // Labels cannot start or end with hyphen
+            if (label.StartsWith('-') || label.EndsWith('-'))
+                return "Hostname labels cannot start or end with a hyphen";
+        }
+
+        return null; // Valid hostname
     }
 
     /// <summary>
