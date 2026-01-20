@@ -152,3 +152,121 @@ scp src/ACProxyCam/bin/Release/net8.0/linux-arm64/publish/acproxycam claude_test
 # Install and restart
 ssh claude_test@192.168.178.12 "sudo cp /tmp/acproxycam_new /usr/local/bin/acproxycam && sudo chmod +x /usr/local/bin/acproxycam && sudo systemctl start acproxycam"
 ```
+
+### Deploy via Python (paramiko)
+
+SSH key authentication is required. Use paramiko with Ed25519 key:
+
+```python
+import paramiko
+
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+pkey = paramiko.Ed25519Key.from_private_key_file(r'c:\users\manni\.ssh\claude_test')
+ssh.connect('192.168.178.12', username='claude_test', pkey=pkey, timeout=10)
+
+# Stop, upload, install, start
+ssh.exec_command('sudo systemctl stop acproxycam')
+sftp = ssh.open_sftp()
+sftp.put(local_path, '/tmp/acproxycam_new')
+sftp.close()
+ssh.exec_command('sudo cp /tmp/acproxycam_new /usr/local/bin/acproxycam && sudo chmod +x /usr/local/bin/acproxycam && sudo systemctl start acproxycam')
+ssh.close()
+```
+
+## Creating a Release
+
+### Step 1: Bump Version
+
+Edit `src/ACProxyCam/ACProxyCam.csproj` and update the version numbers:
+
+```xml
+<Version>1.X.0</Version>
+<AssemblyVersion>1.X.0.0</AssemblyVersion>
+<FileVersion>1.X.0.0</FileVersion>
+<InformationalVersion>1.X.0.$([System.DateTime]::UtcNow.ToString("yyyyMMddHHmm"))</InformationalVersion>
+```
+
+### Step 2: Commit Changes
+
+```bash
+git add -A
+git commit -m "Description of changes
+
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
+git push origin main
+```
+
+### Step 3: Build Release Artifacts
+
+Run the build script from the repository root:
+
+```cmd
+build.bat
+```
+
+This script:
+1. Reads version from `.csproj` file
+2. Publishes for both `linux-x64` and `linux-arm64`
+3. Creates zip files with the binary named `acproxycam` inside
+4. Generates SHA256 checksums
+5. Outputs to `D:\INSTALL\acproxycam\releases\`:
+   - `acproxycam-linux-x64-v{VERSION}.zip`
+   - `acproxycam-linux-x64-v{VERSION}.zip.sha256`
+   - `acproxycam-linux-arm64-v{VERSION}.zip`
+   - `acproxycam-linux-arm64-v{VERSION}.zip.sha256`
+
+**Requirements:**
+- 7-Zip installed at `c:\Program Files\7-Zip\7z.exe`
+- .NET 8.0 SDK
+
+### Step 4: Create GitHub Release
+
+Use the GitHub CLI to create the release:
+
+```bash
+gh release create v1.X.0 \
+  "D:/INSTALL/acproxycam/releases/acproxycam-linux-x64-v1.X.0.zip" \
+  "D:/INSTALL/acproxycam/releases/acproxycam-linux-x64-v1.X.0.zip.sha256" \
+  "D:/INSTALL/acproxycam/releases/acproxycam-linux-arm64-v1.X.0.zip" \
+  "D:/INSTALL/acproxycam/releases/acproxycam-linux-arm64-v1.X.0.zip.sha256" \
+  --title "v1.X.0 - Release Title" \
+  --notes "RELEASE_NOTES_HERE"
+```
+
+### Release Notes Template
+
+```markdown
+## What's New
+
+### Feature Category
+- Feature or fix description
+
+### Bug Fixes
+- Bug fix description
+
+## Installation
+
+\```bash
+# Download for your architecture
+wget https://github.com/mann1x/acproxycam/releases/download/v1.X.0/acproxycam-linux-arm64-v1.X.0.zip
+unzip acproxycam-linux-arm64-v1.X.0.zip
+chmod +x acproxycam
+
+# Run with sudo for installation
+sudo ./acproxycam
+\```
+
+## Checksums (SHA256)
+
+\```
+CHECKSUM_X64  acproxycam-linux-x64-v1.X.0.zip
+CHECKSUM_ARM64  acproxycam-linux-arm64-v1.X.0.zip
+\```
+```
+
+Get checksums from the `.sha256` files:
+```bash
+cat "D:/INSTALL/acproxycam/releases/acproxycam-linux-x64-v1.X.0.zip.sha256"
+cat "D:/INSTALL/acproxycam/releases/acproxycam-linux-arm64-v1.X.0.zip.sha256"
+```
