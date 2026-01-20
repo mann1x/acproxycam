@@ -7,8 +7,12 @@ Anycubic Camera Proxy for Linux - Converts FLV camera streams from Anycubic 3D p
 - Multi-printer support with individual MJPEG streams on separate ports
 - Auto-detection of printer model code and device ID via MQTT
 - Auto-retrieval of MQTT credentials from printer via SSH
+- **Stream recovery** - intercepts external stop commands (from slicers) and instantly restarts camera
+- **Configurable FPS** - MaxFps for streaming, IdleFps for snapshots when no clients connected
+- **CPU affinity** - distributes printer threads across CPU cores for better performance
 - Systemd service with watchdog support
-- Interactive terminal management interface using Spectre.Console
+- Interactive terminal management interface using Spectre.Console with auto-refresh
+- Pre-flight connectivity check when adding printers
 - Encrypted credential storage (AES-256-GCM with machine-specific key)
 - Automatic retry with intelligent backoff (5s if responsive, 30s if offline)
 - Log rotation via logrotate
@@ -16,8 +20,29 @@ Anycubic Camera Proxy for Linux - Converts FLV camera streams from Anycubic 3D p
 ## Requirements
 
 - Linux x64 or arm64 (Raspberry Pi 4+, etc.)
-- FFmpeg installed via system package manager
+- **FFmpeg 6.x or 7.x** with development libraries
 - Anycubic printer with camera (Kobra S1, etc.)
+
+### FFmpeg Installation
+
+The application requires FFmpeg runtime libraries (not just the binary). Install the appropriate packages for your distribution:
+
+**Debian/Ubuntu/Raspberry Pi OS:**
+```bash
+sudo apt install ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+```
+
+**Fedora/RHEL:**
+```bash
+sudo dnf install ffmpeg ffmpeg-devel
+```
+
+**Arch Linux:**
+```bash
+sudo pacman -S ffmpeg
+```
+
+> **Note:** The app requires FFmpeg 6.x or newer. Older distributions with FFmpeg 4.x are not supported.
 
 ## Quick Start
 
@@ -164,7 +189,7 @@ Log rotation is configured to keep 7 days of compressed logs.
 ### Stream not working
 1. Check printer details in management UI (press Enter on printer)
 2. Verify all status indicators are green (SSH, MQTT, Stream)
-3. Check the FLV stream directly: `curl http://<printer-ip>:8080/flv`
+3. Check the FLV stream directly: `curl http://<printer-ip>:18088/flv`
 
 ### Service won't start
 1. Check logs: `journalctl -u acproxycam -e`
@@ -186,7 +211,7 @@ Log rotation is configured to keep 7 days of compressed logs.
 2. Connect to MQTT broker on printer (port 9883, TLS)
 3. Subscribe to all topics, auto-detect model code
 4. Send "startCapture" command to enable camera stream
-5. Connect to FLV stream at `http://<printer>:8080/flv`
+5. Connect to FLV stream at `http://<printer>:18088/flv`
 6. Decode H.264 frames using FFmpeg, convert to JPEG using SkiaSharp
 7. Serve MJPEG stream on configured port
 

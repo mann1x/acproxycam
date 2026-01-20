@@ -24,15 +24,41 @@ public class MjpegServer : IDisposable
     private readonly object _frameLock = new();
     private int _frameWidth;
     private int _frameHeight;
+    private DateTime _lastEncodeTime = DateTime.MinValue;
+    private int _framesSkipped;
 
     public event EventHandler<string>? StatusChanged;
     public event EventHandler<Exception>? ErrorOccurred;
+    /// <summary>
+    /// Raised when a snapshot is requested but no frame is available.
+    /// Allows the owner to try to restart the camera.
+    /// </summary>
+    public event EventHandler? SnapshotRequested;
 
     public int Port { get; private set; }
     public IPAddress BindAddress { get; private set; } = IPAddress.Any;
     public bool IsRunning { get; private set; }
-    public int ConnectedClients => _clients.Count;
+    public int ConnectedClients
+    {
+        get
+        {
+            lock (_clientLock)
+            {
+                return _clients.Count;
+            }
+        }
+    }
     public int JpegQuality { get; set; } = 80;
+
+    /// <summary>
+    /// Maximum frames per second to encode. 0 = unlimited.
+    /// </summary>
+    public int MaxFps { get; set; } = 10;
+
+    /// <summary>
+    /// FPS when no clients are connected (for snapshot availability). 0 = no encoding when idle.
+    /// </summary>
+    public int IdleFps { get; set; } = 1;
 
     // MJPEG boundary string
     private const string Boundary = "--mjpegboundary";
@@ -100,15 +126,41 @@ public class MjpegServer : IDisposable
     /// <summary>
     /// Push a new frame to all connected clients.
     /// Frame data should be BGR24 format.
+    /// Implements frame rate limiting and lazy encoding.
     /// </summary>
     public void PushFrame(byte[] bgrData, int width, int height, int stride)
     {
         try
         {
+            var now = DateTime.UtcNow;
+            var hasClients = ConnectedClients > 0;
+
+            // Determine target FPS based on whether clients are connected
+            var targetFps = hasClients ? MaxFps : IdleFps;
+
+            // Skip frame if we're encoding too fast
+            if (targetFps > 0)
+            {
+                var minInterval = TimeSpan.FromSeconds(1.0 / targetFps);
+                if (now - _lastEncodeTime < minInterval)
+                {
+                    _framesSkipped++;
+                    return;
+                }
+            }
+            else if (!hasClients)
+            {
+                // IdleFps = 0 means no encoding when idle
+                _framesSkipped++;
+                return;
+            }
+
             // Encode BGR24 to JPEG using SkiaSharp
             var jpegData = EncodeBgrToJpeg(bgrData, width, height, stride);
             if (jpegData == null)
                 return;
+
+            _lastEncodeTime = now;
 
             lock (_frameLock)
             {
@@ -118,26 +170,29 @@ public class MjpegServer : IDisposable
             }
 
             // Send to all streaming clients
-            lock (_clientLock)
+            if (hasClients)
             {
-                var deadClients = new List<ClientConnection>();
-
-                foreach (var client in _clients)
+                lock (_clientLock)
                 {
-                    if (client.IsStreaming)
+                    var deadClients = new List<ClientConnection>();
+
+                    foreach (var client in _clients)
                     {
-                        if (!client.TrySendFrame(jpegData))
+                        if (client.IsStreaming)
                         {
-                            deadClients.Add(client);
+                            if (!client.TrySendFrame(jpegData))
+                            {
+                                deadClients.Add(client);
+                            }
                         }
                     }
-                }
 
-                // Remove disconnected clients
-                foreach (var dead in deadClients)
-                {
-                    _clients.Remove(dead);
-                    dead.Dispose();
+                    // Remove disconnected clients
+                    foreach (var dead in deadClients)
+                    {
+                        _clients.Remove(dead);
+                        dead.Dispose();
+                    }
                 }
             }
         }
@@ -366,6 +421,9 @@ public class MjpegServer : IDisposable
 
         if (frame == null)
         {
+            // Notify that a snapshot was requested but no frame available
+            // This allows the owner to try to restart the camera
+            SnapshotRequested?.Invoke(this, EventArgs.Empty);
             SendServiceUnavailable(client);
             return;
         }
@@ -390,7 +448,11 @@ public class MjpegServer : IDisposable
             clients = ConnectedClients,
             frameWidth = _frameWidth,
             frameHeight = _frameHeight,
-            hasFrame = _lastJpegFrame != null
+            hasFrame = _lastJpegFrame != null,
+            maxFps = MaxFps,
+            idleFps = IdleFps,
+            jpegQuality = JpegQuality,
+            framesSkipped = _framesSkipped
         };
 
         var json = System.Text.Json.JsonSerializer.Serialize(status);

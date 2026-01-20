@@ -92,7 +92,7 @@ public class AddPrinterRequest
 }
 
 /// <summary>
-/// Request to modify a printer.
+/// Request to modify a printer (supports rename via originalName).
 /// </summary>
 public class ModifyPrinterRequest
 {
@@ -100,7 +100,7 @@ public class ModifyPrinterRequest
     public string OriginalName { get; set; } = "";
 
     [JsonPropertyName("config")]
-    public AddPrinterRequest Config { get; set; } = new();
+    public PrinterConfig Config { get; set; } = new();
 }
 
 /// <summary>

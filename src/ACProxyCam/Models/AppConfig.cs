@@ -63,4 +63,29 @@ public class PrinterConfig
 
     [JsonPropertyName("modelCode")]
     public string ModelCode { get; set; } = "";
+
+    /// <summary>
+    /// Maximum frames per second when clients are connected. Default: 0 (unlimited, use source FPS).
+    /// </summary>
+    [JsonPropertyName("maxFps")]
+    public int MaxFps { get; set; } = 0;
+
+    /// <summary>
+    /// Frames per second when no clients connected (for snapshots). Default: 1. Set to 0 to disable idle encoding.
+    /// </summary>
+    [JsonPropertyName("idleFps")]
+    public int IdleFps { get; set; } = 1;
+
+    /// <summary>
+    /// JPEG encoding quality (1-100). Default: 80.
+    /// </summary>
+    [JsonPropertyName("jpegQuality")]
+    public int JpegQuality { get; set; } = 80;
+
+    /// <summary>
+    /// Send stopCapture command via MQTT when stopping/cleaning up.
+    /// Default: false (disabled to avoid interfering with other software like slicers).
+    /// </summary>
+    [JsonPropertyName("sendStopCommand")]
+    public bool SendStopCommand { get; set; } = false;
 }

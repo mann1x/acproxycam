@@ -67,20 +67,17 @@ public class IpcClient : IDisposable
 
     /// <summary>
     /// Send a request and receive a response.
+    /// Each request uses a new connection since the server closes after each request.
     /// </summary>
     public async Task<IpcResponse> SendAsync(string command, object? data = null)
     {
-        if (_socket == null || !_socket.Connected)
-        {
-            if (!Connect())
-            {
-                return IpcResponse.Fail("Cannot connect to daemon");
-            }
-        }
-
         try
         {
-            using var stream = new NetworkStream(_socket!, ownsSocket: false);
+            // Create a new connection for each request
+            using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+            socket.Connect(new UnixDomainSocketEndPoint(IpcServer.SocketPath));
+
+            using var stream = new NetworkStream(socket, ownsSocket: false);
             using var reader = new StreamReader(stream, Encoding.UTF8);
             using var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
 
@@ -174,9 +171,14 @@ public class IpcClient : IDisposable
     /// <summary>
     /// Modify a printer.
     /// </summary>
-    public async Task<(bool Success, string? Error)> ModifyPrinterAsync(PrinterConfig config)
+    public async Task<(bool Success, string? Error)> ModifyPrinterAsync(string originalName, PrinterConfig config)
     {
-        var response = await SendAsync(IpcCommands.ModifyPrinter, config);
+        var request = new ModifyPrinterRequest
+        {
+            OriginalName = originalName,
+            Config = config
+        };
+        var response = await SendAsync(IpcCommands.ModifyPrinter, request);
         return (response.Success, response.Error);
     }
 

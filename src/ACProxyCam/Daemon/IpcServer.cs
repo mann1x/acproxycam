@@ -12,7 +12,7 @@ namespace ACProxyCam.Daemon;
 /// </summary>
 public class IpcServer
 {
-    public const string SocketPath = "/var/run/acproxycam.sock";
+    public const string SocketPath = "/run/acproxycam/acproxycam.sock";
 
     private readonly DaemonService _daemon;
     private readonly PrinterManager _printerManager;
@@ -155,14 +155,14 @@ public class IpcServer
                     return await _printerManager.DeletePrinterAsync(deleteReq.Name);
 
                 case IpcCommands.ModifyPrinter:
-                    var modifyReq = DeserializeData<PrinterConfig>(request.Data);
+                    var modifyReq = DeserializeData<ModifyPrinterRequest>(request.Data);
                     if (modifyReq == null) return IpcResponse.Fail("Invalid request data");
-                    return await _printerManager.ModifyPrinterAsync(modifyReq);
+                    return await _printerManager.ModifyPrinterAsync(modifyReq.OriginalName, modifyReq.Config);
 
                 case IpcCommands.PausePrinter:
                     var pauseReq = DeserializeData<PrinterNameRequest>(request.Data);
                     if (pauseReq == null) return IpcResponse.Fail("Invalid request data");
-                    return _printerManager.PausePrinter(pauseReq.Name);
+                    return await _printerManager.PausePrinterAsync(pauseReq.Name);
 
                 case IpcCommands.ResumePrinter:
                     var resumeReq = DeserializeData<PrinterNameRequest>(request.Data);

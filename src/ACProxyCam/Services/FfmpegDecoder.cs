@@ -120,11 +120,13 @@ public unsafe class FfmpegDecoder : IDisposable
     /// </summary>
     public void Stop()
     {
+        if (!_isRunning && _decodingThread == null)
+            return; // Already stopped
+
         _cts?.Cancel();
         _decodingThread?.Join(2000);
         _decodingThread = null;
-        _isRunning = false;
-        DecodingStopped?.Invoke(this, EventArgs.Empty);
+        // Note: _isRunning is set to false and DecodingStopped is invoked in DecodingLoop's finally block
     }
 
     private void DecodingLoop(string url, CancellationToken ct)

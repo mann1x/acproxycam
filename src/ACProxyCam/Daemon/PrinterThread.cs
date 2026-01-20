@@ -21,11 +21,15 @@ public class PrinterThread : IDisposable
     private Task? _workerTask;
     private bool _disposed;
 
-    private PrinterState _state = PrinterState.Stopped;
-    private bool _isPaused;
+    private volatile PrinterState _state = PrinterState.Stopped;
+    private volatile bool _isPaused;
     private string? _lastError;
     private DateTime? _lastSeenOnline;
     private DateTime? _nextRetryAt;
+
+    // CPU affinity for this thread (-1 = no affinity set)
+    private int _cpuAffinity = -1;
+    public int CpuAffinity => _cpuAffinity;
 
     // Services
     private SshCredentialService? _sshService;
@@ -44,7 +48,7 @@ public class PrinterThread : IDisposable
     private const int MqttDetectionTimeout = 10;  // 10 seconds to detect model code
 
     // Camera stream URL pattern
-    private const string FlvUrlTemplate = "http://{0}:8080/flv";
+    private const string FlvUrlTemplate = "http://{0}:18088/flv";
 
     public event EventHandler<string>? StatusChanged;
 
@@ -60,6 +64,15 @@ public class PrinterThread : IDisposable
     public void UpdateConfig(PrinterConfig config)
     {
         Config = config;
+    }
+
+    /// <summary>
+    /// Set CPU affinity for this printer's worker thread.
+    /// Call before StartAsync for best effect.
+    /// </summary>
+    public void SetCpuAffinity(int cpuNumber)
+    {
+        _cpuAffinity = cpuNumber;
     }
 
     public async Task StartAsync()
@@ -97,11 +110,36 @@ public class PrinterThread : IDisposable
         _state = PrinterState.Stopped;
     }
 
+    public async Task PauseAsync()
+    {
+        _isPaused = true;
+        _state = PrinterState.Paused;
+        _cts?.Cancel();
+
+        // Wait for worker to actually stop (with timeout)
+        if (_workerTask != null && !_workerTask.IsCompleted)
+        {
+            try
+            {
+                await _workerTask.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch (TimeoutException)
+            {
+                // Worker didn't stop in time, state is already set to Paused
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected
+            }
+        }
+    }
+
+    // Keep sync version for backward compatibility
     public void Pause()
     {
         _isPaused = true;
-        _cts?.Cancel();
         _state = PrinterState.Paused;
+        _cts?.Cancel();
     }
 
     public async Task ResumeAsync()
@@ -123,6 +161,9 @@ public class PrinterThread : IDisposable
             State = _state,
             ConnectedClients = _mjpegServer?.ConnectedClients ?? 0,
             IsPaused = _isPaused,
+            CpuAffinity = _cpuAffinity,
+            CurrentFps = (_mjpegServer?.ConnectedClients ?? 0) > 0 ? Config.MaxFps : Config.IdleFps,
+            IsIdle = (_mjpegServer?.ConnectedClients ?? 0) == 0,
             IsOnline = _state == PrinterState.Running,
             LastError = _lastError,
             LastSeenOnline = _lastSeenOnline,
@@ -135,6 +176,19 @@ public class PrinterThread : IDisposable
 
     private async Task WorkerLoopAsync(CancellationToken ct)
     {
+        // Apply CPU affinity if set
+        if (_cpuAffinity >= 0)
+        {
+            if (Services.CpuAffinityService.SetThreadAffinity(_cpuAffinity))
+            {
+                LogStatus($"Thread pinned to CPU {_cpuAffinity}");
+            }
+            else
+            {
+                LogStatus($"Failed to pin thread to CPU {_cpuAffinity} (may not be supported on this platform)");
+            }
+        }
+
         while (!ct.IsCancellationRequested && !_isPaused)
         {
             try
@@ -221,9 +275,9 @@ public class PrinterThread : IDisposable
 
         _sshStatus.CredentialsRetrieved = true;
 
-        // Update config with retrieved credentials
-        Config.MqttUsername = result.MqttUsername;
-        Config.MqttPassword = result.MqttPassword;
+        // Update config with retrieved credentials (null-coalesce to empty if somehow null)
+        Config.MqttUsername = result.MqttUsername ?? "";
+        Config.MqttPassword = result.MqttPassword ?? "";
 
         if (!string.IsNullOrEmpty(result.DeviceId))
             Config.DeviceId = result.DeviceId;
@@ -253,6 +307,9 @@ public class PrinterThread : IDisposable
 
         _mqttController.MqttPort = Config.MqttPort;
 
+        // Subscribe to camera stop detection - immediately restart when external stop is detected
+        _mqttController.CameraStopDetected += OnExternalCameraStopDetected;
+
         await _mqttController.ConnectAsync(
             Config.Ip,
             Config.MqttUsername!,
@@ -261,7 +318,7 @@ public class PrinterThread : IDisposable
 
         _mqttStatus.Connected = true;
 
-        // Subscribe to all topics to detect model code
+        // Subscribe to all topics to detect model code and monitor for stop commands
         await _mqttController.SubscribeToAllAsync(ct);
 
         // Wait for model code detection if not already known
@@ -302,6 +359,10 @@ public class PrinterThread : IDisposable
 
         _mqttStatus.CameraStarted = true;
         LogStatus("Camera start command sent successfully");
+
+        // Keep MQTT connected for instant stream recovery
+        // When the slicer or another app stops the camera, we can restart it immediately
+        LogStatus("MQTT staying connected for stream recovery");
     }
 
     private void StartMjpegServer()
@@ -311,6 +372,11 @@ public class PrinterThread : IDisposable
         _mjpegServer = new MjpegServer();
         _mjpegServer.StatusChanged += (s, msg) => LogStatus($"MJPEG: {msg}");
         _mjpegServer.ErrorOccurred += (s, ex) => LogStatus($"MJPEG Error: {ex.Message}");
+
+        // Apply per-printer encoding settings
+        _mjpegServer.MaxFps = Config.MaxFps;
+        _mjpegServer.IdleFps = Config.IdleFps;
+        _mjpegServer.JpegQuality = Config.JpegQuality;
 
         // Determine bind address from config
         IPAddress bindAddress = IPAddress.Any;
@@ -324,7 +390,7 @@ public class PrinterThread : IDisposable
         }
 
         _mjpegServer.Start(Config.MjpegPort, bindAddress);
-        LogStatus($"MJPEG server listening on {bindAddress}:{Config.MjpegPort}");
+        LogStatus($"MJPEG server listening on {bindAddress}:{Config.MjpegPort} (maxFps={Config.MaxFps}, idleFps={Config.IdleFps}, quality={Config.JpegQuality})");
     }
 
     private async Task RunStreamingLoopAsync(CancellationToken ct)
@@ -363,31 +429,204 @@ public class PrinterThread : IDisposable
             LogStatus("Stream stopped");
         };
 
+        // Register callback for snapshot requests when no frame available
+        if (_mjpegServer != null)
+        {
+            _mjpegServer.SnapshotRequested += OnSnapshotRequested;
+        }
+
         // Build stream URL
         var streamUrl = string.Format(FlvUrlTemplate, Config.Ip);
         LogStatus($"Connecting to stream: {streamUrl}");
 
         _decoder.Start(streamUrl);
 
-        // Wait for cancellation or decoder to stop
+        // Wait for cancellation or decoder to stop, with quick recovery on stream failure
+        int quickRetryCount = 0;
+        const int maxQuickRetries = 3;
+
         try
         {
-            while (!ct.IsCancellationRequested && _decoder.IsRunning)
+            while (!ct.IsCancellationRequested && !_isPaused)
             {
-                _lastSeenOnline = DateTime.UtcNow;
-                await Task.Delay(1000, ct);
-            }
+                if (_decoder.IsRunning)
+                {
+                    _lastSeenOnline = DateTime.UtcNow;
+                    quickRetryCount = 0; // Reset on successful streaming
+                    await Task.Delay(1000, ct);
+                }
+                else
+                {
+                    // Stream stopped - try quick recovery via MQTT restart
+                    if (quickRetryCount < maxQuickRetries)
+                    {
+                        quickRetryCount++;
+                        LogStatus($"Stream stopped, attempting quick recovery ({quickRetryCount}/{maxQuickRetries})...");
 
-            // If decoder stopped on its own, throw to trigger retry
-            if (!ct.IsCancellationRequested && !_decoder.IsRunning)
-            {
-                throw new Exception("Stream disconnected unexpectedly");
+                        if (await TryQuickCameraRestartAsync(ct))
+                        {
+                            // Wait a moment for camera to start
+                            await Task.Delay(2000, ct);
+
+                            // Restart decoder
+                            _decoder.Stop();
+                            _decoder.Start(streamUrl);
+
+                            // Wait for decoder to connect
+                            await Task.Delay(3000, ct);
+
+                            if (_decoder.IsRunning)
+                            {
+                                LogStatus("Quick recovery successful");
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Quick recovery failed - throw to trigger full retry
+                    throw new Exception("Stream disconnected and quick recovery failed");
+                }
             }
         }
         finally
         {
+            if (_mjpegServer != null)
+            {
+                _mjpegServer.SnapshotRequested -= OnSnapshotRequested;
+            }
             _decoder.Stop();
         }
+    }
+
+    /// <summary>
+    /// Called when an external source (slicer, etc.) sends a camera stop command.
+    /// Immediately restart the camera to maintain the stream.
+    /// </summary>
+    private async void OnExternalCameraStopDetected(object? sender, EventArgs e)
+    {
+        LogStatus("External camera stop detected! Immediately restarting camera...");
+
+        // Small delay to let the stop command take effect
+        await Task.Delay(500);
+
+        // Restart the camera immediately
+        if (_mqttController != null && _mqttController.IsConnected &&
+            !string.IsNullOrEmpty(Config.DeviceId) && !string.IsNullOrEmpty(Config.ModelCode))
+        {
+            try
+            {
+                var started = await _mqttController.TryStartCameraAsync(
+                    Config.DeviceId, Config.ModelCode, CancellationToken.None);
+
+                if (started)
+                {
+                    LogStatus("Camera restarted successfully after external stop");
+                    _mqttStatus.CameraStarted = true;
+                }
+                else
+                {
+                    LogStatus("Failed to restart camera after external stop");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogStatus($"Error restarting camera after external stop: {ex.Message}");
+            }
+        }
+        else
+        {
+            LogStatus("Cannot restart camera - MQTT not connected or missing config");
+        }
+    }
+
+    /// <summary>
+    /// Called when a snapshot is requested but no frame is available.
+    /// Tries to quickly restart the camera.
+    /// </summary>
+    private async void OnSnapshotRequested(object? sender, EventArgs e)
+    {
+        if (_state != PrinterState.Running || _streamStatus.Connected)
+            return; // Camera is either not ready or already streaming
+
+        LogStatus("Snapshot requested, attempting to restart camera...");
+        try
+        {
+            await TryQuickCameraRestartAsync(CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            LogStatus($"Failed to restart camera for snapshot: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Try to quickly restart the camera via MQTT using existing connection.
+    /// </summary>
+    private async Task<bool> TryQuickCameraRestartAsync(CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(Config.DeviceId) || string.IsNullOrEmpty(Config.ModelCode))
+        {
+            LogStatus("Quick restart: Missing device ID or model code");
+            return false;
+        }
+
+        try
+        {
+            // Use existing MQTT controller if connected
+            if (_mqttController != null && _mqttController.IsConnected)
+            {
+                LogStatus("Quick restart: Sending camera start command via existing MQTT connection...");
+                var started = await _mqttController.TryStartCameraAsync(Config.DeviceId, Config.ModelCode, ct);
+
+                if (started)
+                {
+                    LogStatus("Quick restart: Camera start command sent");
+                    _mqttStatus.CameraStarted = true;
+                    return true;
+                }
+            }
+            else
+            {
+                // MQTT disconnected - try to reconnect
+                LogStatus("Quick restart: MQTT disconnected, reconnecting...");
+
+                if (string.IsNullOrEmpty(Config.MqttUsername) || string.IsNullOrEmpty(Config.MqttPassword))
+                {
+                    LogStatus("Quick restart: No MQTT credentials available");
+                    return false;
+                }
+
+                if (_mqttController == null)
+                {
+                    _mqttController = new MqttCameraController();
+                    _mqttController.MqttPort = Config.MqttPort;
+                    _mqttController.StatusChanged += (s, msg) => LogStatus($"MQTT: {msg}");
+                    _mqttController.ErrorOccurred += (s, ex) => LogStatus($"MQTT Error: {ex.Message}");
+                    _mqttController.CameraStopDetected += OnExternalCameraStopDetected;
+                }
+
+                await _mqttController.ConnectAsync(Config.Ip, Config.MqttUsername, Config.MqttPassword, ct);
+                await _mqttController.SubscribeToAllAsync(ct); // Subscribe to detect stop commands
+                _mqttStatus.Connected = true;
+
+                LogStatus("Quick restart: Sending camera start command...");
+                var started = await _mqttController.TryStartCameraAsync(Config.DeviceId, Config.ModelCode, ct);
+
+                if (started)
+                {
+                    LogStatus("Quick restart: Camera start command sent");
+                    _mqttStatus.CameraStarted = true;
+                    return true;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogStatus($"Quick restart failed: {ex.Message}");
+            _mqttStatus.Connected = false;
+        }
+
+        return false;
     }
 
     private async Task<bool> IsHostRespondingAsync()
@@ -440,21 +679,34 @@ public class PrinterThread : IDisposable
             _mjpegServer = null;
         }
 
-        // Stop camera and disconnect MQTT
+        // Cleanup MQTT controller
         if (_mqttController != null)
         {
+            // Unsubscribe from events first
+            _mqttController.CameraStopDetected -= OnExternalCameraStopDetected;
+
+            // Stop camera via MQTT only if SendStopCommand is enabled
+            if (Config.SendStopCommand &&
+                !string.IsNullOrEmpty(Config.DeviceId) && !string.IsNullOrEmpty(Config.ModelCode))
+            {
+                try
+                {
+                    if (_mqttController.IsConnected)
+                    {
+                        await _mqttController.TryStopCameraAsync(Config.DeviceId, Config.ModelCode);
+                    }
+                }
+                catch
+                {
+                    // Ignore cleanup errors
+                }
+            }
+
             try
             {
-                if (_mqttController.IsConnected && !string.IsNullOrEmpty(Config.DeviceId))
-                {
-                    await _mqttController.TryStopCameraAsync(Config.DeviceId, Config.ModelCode);
-                }
                 await _mqttController.DisconnectAsync();
             }
-            catch
-            {
-                // Ignore cleanup errors
-            }
+            catch { }
             await _mqttController.DisposeAsync();
             _mqttController = null;
         }

@@ -14,10 +14,14 @@ public class Program
 
     public static async Task<int> Main(string[] args)
     {
+        // Check for --simple-ui flag (hidden option for automation)
+        var useSimpleUi = args.Contains("--simple-ui");
+        var filteredArgs = args.Where(a => a != "--simple-ui").ToArray();
+
         // Parse command line arguments
-        if (args.Length > 0)
+        if (filteredArgs.Length > 0)
         {
-            switch (args[0].ToLower())
+            switch (filteredArgs[0].ToLower())
             {
                 case "-v":
                 case "--version":
@@ -31,17 +35,27 @@ public class Program
 
                 case "--daemon":
                     // Run as daemon (called by systemd)
-                    return await RunDaemonAsync(args);
+                    return await RunDaemonAsync(filteredArgs);
+
+                case "--install":
+                    // Installation (uses simple UI by default for scripting)
+                    return await RunInstallAsync(useSimpleUi || !Console.IsInputRedirected);
+
+                case "--uninstall":
+                    // Uninstallation (uses simple UI by default for scripting)
+                    return await RunUninstallAsync(
+                        filteredArgs.Contains("--keep-config"),
+                        useSimpleUi || !Console.IsInputRedirected);
 
                 default:
-                    Console.WriteLine($"Unknown argument: {args[0]}");
+                    Console.WriteLine($"Unknown argument: {filteredArgs[0]}");
                     PrintHelp();
                     return 1;
             }
         }
 
         // No arguments - enter management interface
-        return await RunManagementAsync();
+        return await RunManagementAsync(useSimpleUi);
     }
 
     private static void PrintHelp()
@@ -54,6 +68,9 @@ public class Program
         Console.WriteLine("  -v, --version    Show version information");
         Console.WriteLine("  -h, --help       Show this help message");
         Console.WriteLine("  --daemon         Run as daemon (used by systemd)");
+        Console.WriteLine("  --install        Install service");
+        Console.WriteLine("  --uninstall      Uninstall service");
+        Console.WriteLine("    --keep-config  Keep config files when uninstalling");
         Console.WriteLine();
         Console.WriteLine("Without arguments, enters the interactive management interface.");
         Console.WriteLine();
@@ -75,12 +92,43 @@ public class Program
         }
     }
 
-    private static async Task<int> RunManagementAsync()
+    private static async Task<int> RunManagementAsync(bool useSimpleUi)
     {
         try
         {
-            var cli = new ManagementCli();
+            IConsoleUI ui = useSimpleUi ? new SimpleConsoleUI() : new SpectreConsoleUI();
+            var cli = new ManagementCli(ui);
             return await cli.RunAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error: {ex.Message}");
+            return 1;
+        }
+    }
+
+    private static async Task<int> RunInstallAsync(bool useSimpleUi)
+    {
+        try
+        {
+            IConsoleUI ui = useSimpleUi ? new SimpleConsoleUI() : new SpectreConsoleUI();
+            var cli = new ManagementCli(ui);
+            return await cli.InstallAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error: {ex.Message}");
+            return 1;
+        }
+    }
+
+    private static async Task<int> RunUninstallAsync(bool keepConfig, bool useSimpleUi)
+    {
+        try
+        {
+            IConsoleUI ui = useSimpleUi ? new SimpleConsoleUI() : new SpectreConsoleUI();
+            var cli = new ManagementCli(ui);
+            return await cli.UninstallAsync(keepConfig);
         }
         catch (Exception ex)
         {

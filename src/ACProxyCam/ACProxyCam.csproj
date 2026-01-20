@@ -8,11 +8,13 @@
     <AssemblyName>acproxycam</AssemblyName>
     <RootNamespace>ACProxyCam</RootNamespace>
 
-    <!-- Version info -->
+    <!-- Version info - timestamp appended at build time -->
     <Version>1.0.0</Version>
     <AssemblyVersion>1.0.0.0</AssemblyVersion>
     <FileVersion>1.0.0.0</FileVersion>
-    <InformationalVersion>1.0.0</InformationalVersion>
+    <InformationalVersion>1.0.0.$([System.DateTime]::UtcNow.ToString("yyyyMMddHHmm"))</InformationalVersion>
+    <!-- Disable automatic git hash in version -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 
     <!-- Linux-only target platforms -->
     <RuntimeIdentifiers>linux-x64;linux-arm64</RuntimeIdentifiers>
@@ -40,7 +42,7 @@
     <PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="2.88.7" />
 
     <!-- FFmpeg for video decoding -->
-    <PackageReference Include="FFmpeg.AutoGen" Version="4.4.1" />
+    <PackageReference Include="FFmpeg.AutoGen" Version="7.0.0" />
 
     <!-- SSH.NET for credential retrieval -->
     <PackageReference Include="SSH.NET" Version="2024.2.0" />
@@ -64,5 +66,6 @@
   <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-arm64'">
     <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="2.88.7" />
   </ItemGroup>
+
 
 </Project>

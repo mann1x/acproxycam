@@ -1,6 +1,7 @@
 // PrinterManager.cs - Manages all printer threads
 
 using ACProxyCam.Models;
+using ACProxyCam.Services;
 
 namespace ACProxyCam.Daemon;
 
@@ -25,9 +26,21 @@ public class PrinterManager
 
     public async Task StartAllAsync()
     {
-        foreach (var printerConfig in _config.Printers)
+        // Calculate CPU affinity assignments
+        var cpuAssignments = CpuAffinityService.CalculateCpuAssignments(_config.Printers.Count);
+        var availableCpus = CpuAffinityService.GetAvailableCpus();
+
+        if (cpuAssignments.Length > 0)
         {
-            await StartPrinterAsync(printerConfig);
+            Console.WriteLine($"[PrinterManager] Available CPUs: {string.Join(", ", availableCpus)}");
+            Console.WriteLine($"[PrinterManager] CPU assignments: {CpuAffinityService.FormatAssignments(cpuAssignments)}");
+        }
+
+        for (int i = 0; i < _config.Printers.Count; i++)
+        {
+            var printerConfig = _config.Printers[i];
+            var cpuAffinity = i < cpuAssignments.Length ? cpuAssignments[i] : -1;
+            await StartPrinterAsync(printerConfig, cpuAffinity);
         }
     }
 
@@ -37,11 +50,13 @@ public class PrinterManager
         lock (_lock)
         {
             toStop = _printers.Values.ToList();
+            _printers.Clear();
         }
 
         foreach (var printer in toStop)
         {
             await printer.StopAsync();
+            printer.Dispose();
         }
     }
 
@@ -51,7 +66,7 @@ public class PrinterManager
         await StartAllAsync();
     }
 
-    private async Task StartPrinterAsync(PrinterConfig config)
+    private async Task StartPrinterAsync(PrinterConfig config, int cpuAffinity = -1)
     {
         lock (_lock)
         {
@@ -62,6 +77,13 @@ public class PrinterManager
         }
 
         var thread = new PrinterThread(config, _config.ListenInterfaces);
+
+        // Set CPU affinity before starting
+        if (cpuAffinity >= 0)
+        {
+            thread.SetCpuAffinity(cpuAffinity);
+        }
+
         lock (_lock)
         {
             _printers[config.Name] = thread;
@@ -153,8 +175,13 @@ public class PrinterManager
         _config.Printers.Add(config);
         await ConfigManager.SaveAsync(_config);
 
+        // Calculate CPU affinity for the new printer
+        // New printers get assigned based on total count
+        var cpuAssignments = CpuAffinityService.CalculateCpuAssignments(_config.Printers.Count);
+        var cpuAffinity = cpuAssignments.Length > 0 ? cpuAssignments[_config.Printers.Count - 1] : -1;
+
         // Start the printer thread
-        await StartPrinterAsync(config);
+        await StartPrinterAsync(config, cpuAffinity);
 
         return IpcResponse.Ok();
     }
@@ -195,22 +222,39 @@ public class PrinterManager
         return IpcResponse.Ok();
     }
 
-    public async Task<IpcResponse> ModifyPrinterAsync(PrinterConfig newConfig)
+    public async Task<IpcResponse> ModifyPrinterAsync(string originalName, PrinterConfig newConfig)
     {
-        // Find existing printer by name
+        // Find existing printer by original name
         PrinterThread? existingThread;
         PrinterConfig? existingConfig;
 
         lock (_lock)
         {
-            _printers.TryGetValue(newConfig.Name, out existingThread);
+            _printers.TryGetValue(originalName, out existingThread);
         }
 
-        existingConfig = _config.Printers.FirstOrDefault(p => p.Name == newConfig.Name);
+        existingConfig = _config.Printers.FirstOrDefault(p => p.Name == originalName);
 
         if (existingThread == null && existingConfig == null)
         {
-            return IpcResponse.Fail($"Printer '{newConfig.Name}' not found");
+            return IpcResponse.Fail($"Printer '{originalName}' not found");
+        }
+
+        // Check if name is being changed and validate new name is unique
+        if (originalName != newConfig.Name)
+        {
+            lock (_lock)
+            {
+                if (_printers.ContainsKey(newConfig.Name))
+                {
+                    return IpcResponse.Fail($"Printer with name '{newConfig.Name}' already exists");
+                }
+            }
+
+            if (_config.Printers.Any(p => p.Name == newConfig.Name))
+            {
+                return IpcResponse.Fail($"Printer with name '{newConfig.Name}' already exists");
+            }
         }
 
         // Check if port is changing and validate new port
@@ -220,13 +264,13 @@ public class PrinterManager
             // Check if new port is already in use by another printer
             lock (_lock)
             {
-                if (_printers.Values.Any(p => p.Config.Name != newConfig.Name && p.Config.MjpegPort == newConfig.MjpegPort))
+                if (_printers.Values.Any(p => p.Config.Name != originalName && p.Config.MjpegPort == newConfig.MjpegPort))
                 {
                     return IpcResponse.Fail($"MJPEG port {newConfig.MjpegPort} is already in use");
                 }
             }
 
-            if (_config.Printers.Any(p => p.Name != newConfig.Name && p.MjpegPort == newConfig.MjpegPort))
+            if (_config.Printers.Any(p => p.Name != originalName && p.MjpegPort == newConfig.MjpegPort))
             {
                 return IpcResponse.Fail($"MJPEG port {newConfig.MjpegPort} is already in use");
             }
@@ -245,33 +289,41 @@ public class PrinterManager
 
             lock (_lock)
             {
-                _printers.Remove(newConfig.Name);
+                _printers.Remove(originalName);
             }
         }
 
-        // Update config
-        _config.Printers.RemoveAll(p => p.Name == newConfig.Name);
+        // Update config (remove by original name, add with new config)
+        _config.Printers.RemoveAll(p => p.Name == originalName);
         _config.Printers.Add(newConfig);
         await ConfigManager.SaveAsync(_config);
 
+        // Calculate CPU affinity for the restarted printer
+        var printerIndex = _config.Printers.FindIndex(p => p.Name == newConfig.Name);
+        var cpuAssignments = CpuAffinityService.CalculateCpuAssignments(_config.Printers.Count);
+        var cpuAffinity = printerIndex >= 0 && printerIndex < cpuAssignments.Length
+            ? cpuAssignments[printerIndex]
+            : -1;
+
         // Start with new config
-        await StartPrinterAsync(newConfig);
+        await StartPrinterAsync(newConfig, cpuAffinity);
 
         return IpcResponse.Ok();
     }
 
-    public IpcResponse PausePrinter(string name)
+    public async Task<IpcResponse> PausePrinterAsync(string name)
     {
+        PrinterThread? printer;
         lock (_lock)
         {
-            if (!_printers.TryGetValue(name, out var printer))
+            if (!_printers.TryGetValue(name, out printer))
             {
                 return IpcResponse.Fail($"Printer '{name}' not found");
             }
-
-            printer.Pause();
-            return IpcResponse.Ok();
         }
+
+        await printer.PauseAsync();
+        return IpcResponse.Ok();
     }
 
     public async Task<IpcResponse> ResumePrinterAsync(string name)

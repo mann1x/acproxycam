@@ -26,6 +26,10 @@ public class MqttCameraController : IAsyncDisposable
     public event EventHandler<MqttMessageEventArgs>? MqttMessageReceived;
     public event EventHandler<Exception>? ErrorOccurred;
     public event EventHandler<string>? ModelCodeDetected;
+    /// <summary>
+    /// Raised when a camera stop command is detected from another source (slicer, etc.)
+    /// </summary>
+    public event EventHandler? CameraStopDetected;
 
     public bool IsConnected => _mqttClient?.IsConnected ?? false;
     public string? DetectedModelCode => _detectedModelCode;
@@ -73,6 +77,9 @@ public class MqttCameraController : IAsyncDisposable
 
             // Try to detect model code from topic
             TryDetectModelCode(topic);
+
+            // Detect camera stop commands from other sources (slicer, etc.)
+            TryDetectStopCommand(topic, payload);
 
             return Task.CompletedTask;
         };
@@ -156,6 +163,79 @@ public class MqttCameraController : IAsyncDisposable
         }
     }
 
+    // Track our own message IDs to avoid reacting to our own commands
+    private readonly HashSet<string> _ownMessageIds = new();
+    private readonly object _ownMessageIdsLock = new();
+
+    /// <summary>
+    /// Try to detect camera stop commands from other sources.
+    /// </summary>
+    private void TryDetectStopCommand(string topic, string payload)
+    {
+        // Only check video topics
+        if (!topic.Contains("/video"))
+            return;
+
+        try
+        {
+            // Parse the JSON payload
+            using var doc = JsonDocument.Parse(payload);
+            var root = doc.RootElement;
+
+            // Check if it's a video command
+            if (root.TryGetProperty("type", out var typeElement) &&
+                typeElement.GetString() == "video" &&
+                root.TryGetProperty("action", out var actionElement))
+            {
+                var action = actionElement.GetString();
+
+                // Check if this is our own message
+                if (root.TryGetProperty("msgid", out var msgIdElement))
+                {
+                    var msgId = msgIdElement.GetString();
+                    if (msgId != null)
+                    {
+                        lock (_ownMessageIdsLock)
+                        {
+                            if (_ownMessageIds.Contains(msgId))
+                            {
+                                // This is our own message, ignore it
+                                _ownMessageIds.Remove(msgId);
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                if (action == "stopCapture")
+                {
+                    StatusChanged?.Invoke(this, "Detected camera STOP command from external source!");
+                    CameraStopDetected?.Invoke(this, EventArgs.Empty);
+                }
+            }
+        }
+        catch
+        {
+            // Not valid JSON or doesn't have expected fields - ignore
+        }
+    }
+
+    /// <summary>
+    /// Register a message ID as our own to avoid reacting to it.
+    /// </summary>
+    private void RegisterOwnMessageId(string msgId)
+    {
+        lock (_ownMessageIdsLock)
+        {
+            _ownMessageIds.Add(msgId);
+            // Cleanup old entries (keep max 100)
+            if (_ownMessageIds.Count > 100)
+            {
+                _ownMessageIds.Clear();
+            }
+        }
+    }
+
     /// <summary>
     /// Wait for model code to be detected from MQTT messages.
     /// </summary>
@@ -203,17 +283,18 @@ public class MqttCameraController : IAsyncDisposable
     /// <summary>
     /// Build the camera command payload.
     /// </summary>
-    private static string BuildVideoCommand(string action)
+    private static (string Payload, string MsgId) BuildVideoCommand(string action)
     {
+        var msgId = Guid.NewGuid().ToString();
         var command = new Dictionary<string, object?>
         {
             ["type"] = "video",
             ["action"] = action,
             ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            ["msgid"] = Guid.NewGuid().ToString(),
+            ["msgid"] = msgId,
             ["data"] = null
         };
-        return JsonSerializer.Serialize(command);
+        return (JsonSerializer.Serialize(command), msgId);
     }
 
     /// <summary>
@@ -237,7 +318,10 @@ public class MqttCameraController : IAsyncDisposable
         }
 
         var topic = BuildVideoTopic(effectiveModelCode, deviceId);
-        var payload = BuildVideoCommand("startCapture");
+        var (payload, msgId) = BuildVideoCommand("startCapture");
+
+        // Register our message ID to avoid reacting to our own command
+        RegisterOwnMessageId(msgId);
 
         StatusChanged?.Invoke(this, "Sending camera START command...");
 
@@ -281,7 +365,10 @@ public class MqttCameraController : IAsyncDisposable
         }
 
         var topic = BuildVideoTopic(effectiveModelCode, deviceId);
-        var payload = BuildVideoCommand("stopCapture");
+        var (payload, msgId) = BuildVideoCommand("stopCapture");
+
+        // Register our message ID to avoid reacting to our own command
+        RegisterOwnMessageId(msgId);
 
         StatusChanged?.Invoke(this, "Sending camera STOP command...");
 

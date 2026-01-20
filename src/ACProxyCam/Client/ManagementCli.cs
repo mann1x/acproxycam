@@ -1,30 +1,34 @@
 // ManagementCli.cs - Interactive terminal management interface
 
-using Spectre.Console;
 using ACProxyCam.Daemon;
 using ACProxyCam.Models;
+using Spectre.Console;
 
 namespace ACProxyCam.Client;
 
 /// <summary>
-/// Interactive terminal management interface using Spectre.Console.
+/// Interactive terminal management interface using IConsoleUI abstraction.
 /// </summary>
 public class ManagementCli
 {
+    private readonly IConsoleUI _ui;
     private IpcClient? _ipcClient;
+
+    public ManagementCli(IConsoleUI ui)
+    {
+        _ui = ui;
+    }
 
     public async Task<int> RunAsync()
     {
         // Display header
-        AnsiConsole.Write(new FigletText("ACProxyCam").Color(Color.Purple));
-        AnsiConsole.MarkupLine($"[grey]Version {Program.Version}[/]");
-        AnsiConsole.WriteLine();
+        _ui.WriteHeader(Program.Version);
 
         // Check if running as root/sudo
         if (!IsRunningAsRoot())
         {
-            AnsiConsole.MarkupLine("[red]Error: This application requires root privileges.[/]");
-            AnsiConsole.MarkupLine("[yellow]Please run with sudo: sudo acproxycam[/]");
+            _ui.WriteError("Error: This application requires root privileges.");
+            _ui.WriteWarning("Please run with sudo: sudo acproxycam");
             return 1;
         }
 
@@ -43,11 +47,32 @@ public class ManagementCli
             else
             {
                 // Service installed but not running
-                AnsiConsole.MarkupLine("[yellow]Service is installed but not running.[/]");
-                var startService = AnsiConsole.Confirm("Would you like to start the service?");
+                _ui.WriteWarning("Service is installed but not running.");
+                var startService = _ui.Confirm("Would you like to start the service?");
                 if (startService)
                 {
-                    await StartServiceAsync();
+                    var startError = await StartServiceAsync();
+                    if (startError != null)
+                    {
+                        _ui.WriteError($"Error: {startError}");
+                        _ui.WriteLine();
+
+                        // Offer recovery options
+                        var choice = _ui.SelectOne(
+                            "What would you like to do?",
+                            new[] { "Reinstall service", "Uninstall service", "Exit" });
+
+                        switch (choice)
+                        {
+                            case "Reinstall service":
+                                await UninstallServiceFilesAsync();
+                                return await InstallAsync();
+                            case "Uninstall service":
+                                return await UninstallAsync(false);
+                            default:
+                                return 1;
+                        }
+                    }
                 }
                 else
                 {
@@ -60,7 +85,7 @@ public class ManagementCli
         _ipcClient = new IpcClient();
         if (!_ipcClient.Connect())
         {
-            AnsiConsole.MarkupLine("[red]Error: Cannot connect to daemon.[/]");
+            _ui.WriteError("Error: Cannot connect to daemon.");
             return 1;
         }
 
@@ -68,9 +93,277 @@ public class ManagementCli
         return await ManagementLoopAsync();
     }
 
+    public async Task<int> InstallAsync()
+    {
+        _ui.WriteHeader(Program.Version);
+
+        // Check if running as root/sudo
+        if (!IsRunningAsRoot())
+        {
+            _ui.WriteError("Error: This application requires root privileges.");
+            _ui.WriteWarning("Please run with sudo: sudo acproxycam --install");
+            return 1;
+        }
+
+        // Check if already installed and running
+        if (IpcClient.IsDaemonRunning())
+        {
+            _ui.WriteSuccess("Service is already installed and running.");
+            return 0;
+        }
+
+        // Check if service file exists
+        if (IsServiceInstalled())
+        {
+            _ui.WriteLine("Service is installed but not running. Starting...");
+            var startError = await StartServiceAsync();
+            if (startError != null)
+            {
+                _ui.WriteError($"Error starting service: {startError}");
+                return 1;
+            }
+            _ui.WriteSuccess("Service started successfully.");
+            return 0;
+        }
+
+        // Full installation
+        _ui.WriteLine("Installing ACProxyCam...");
+        _ui.WriteLine();
+
+        // Step 1: Check FFmpeg
+        _ui.WriteInfo("[1/5] Checking FFmpeg...");
+        if (!await CheckAndInstallFfmpegAsync())
+        {
+            return 1;
+        }
+
+        // Step 2: Select listening interfaces
+        _ui.WriteInfo("[2/5] Selecting listening interfaces...");
+        var interfaces = await SelectInterfacesAsync();
+        if (interfaces == null)
+        {
+            return 0; // User cancelled
+        }
+
+        // Step 3: Create user and directories
+        _ui.WriteInfo("[3/5] Creating user and directories...");
+        string? installError = await CreateUserAndDirectoriesAsync();
+        if (installError != null)
+        {
+            _ui.WriteError($"Error creating user/directories: {installError}");
+            _ui.WaitForKey("Press any key to exit...");
+            return 1;
+        }
+
+        // Step 4: Create configuration
+        _ui.WriteInfo("[4/5] Creating configuration file...");
+        try
+        {
+            var config = new AppConfig
+            {
+                ListenInterfaces = interfaces
+            };
+            await ConfigManager.SaveAsync(config);
+            _ui.WriteSuccess("  Created /etc/acproxycam/config.json");
+
+            // Set ownership of config file to acproxycam user
+            var chownProcess = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/chown",
+                Arguments = "acproxycam:acproxycam /etc/acproxycam/config.json",
+                UseShellExecute = false
+            });
+            await chownProcess!.WaitForExitAsync();
+            _ui.WriteSuccess("  Set config file ownership to acproxycam");
+        }
+        catch (Exception ex)
+        {
+            _ui.WriteError($"Error creating configuration: {ex.Message}");
+            _ui.WaitForKey("Press any key to exit...");
+            return 1;
+        }
+
+        // Step 5: Install systemd service
+        _ui.WriteInfo("[5/5] Installing systemd service...");
+        installError = await InstallSystemdServiceAsync();
+        if (installError != null)
+        {
+            _ui.WriteError($"Error installing service: {installError}");
+            _ui.WaitForKey("Press any key to exit...");
+            return 1;
+        }
+
+        // Start service
+        _ui.WriteInfo("Starting service...");
+        installError = await StartServiceAsync();
+
+        if (installError != null)
+        {
+            _ui.WriteError($"Error starting service: {installError}");
+            _ui.WriteLine();
+
+            // Offer recovery options
+            var choice = _ui.SelectOne(
+                "What would you like to do?",
+                new[] { "Retry starting service", "Uninstall service", "Exit" });
+
+            switch (choice)
+            {
+                case "Retry starting service":
+                    var retryError = await StartServiceAsync();
+                    if (retryError != null)
+                    {
+                        _ui.WriteError($"Error: {retryError}");
+                        _ui.WaitForKey("Press any key to exit...");
+                        return 1;
+                    }
+                    break;
+                case "Uninstall service":
+                    await UninstallServiceFilesAsync();
+                    _ui.WriteSuccess("Service uninstalled.");
+                    return 0;
+                default:
+                    return 1;
+            }
+        }
+
+        _ui.WriteSuccess("Installation complete!");
+        _ui.WriteLine();
+
+        // Continue to management
+        await Task.Delay(1000);
+        _ipcClient = new IpcClient();
+        _ipcClient.Connect();
+
+        return await ManagementLoopAsync();
+    }
+
+    public async Task<int> UninstallAsync(bool keepConfig)
+    {
+        _ui.WriteHeader(Program.Version);
+
+        // Check if running as root/sudo
+        if (!IsRunningAsRoot())
+        {
+            _ui.WriteError("Error: This application requires root privileges.");
+            _ui.WriteWarning("Please run with sudo: sudo acproxycam --uninstall");
+            return 1;
+        }
+
+        if (!_ui.Confirm("Are you sure you want to uninstall ACProxyCam?", false))
+        {
+            return 0;
+        }
+
+        if (!keepConfig)
+        {
+            keepConfig = _ui.Confirm("Keep configuration files?", true);
+        }
+
+        _ui.WriteLine("Uninstalling ACProxyCam...");
+
+        await _ui.WithStatusAsync("Stopping service...", async () =>
+        {
+            var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/systemctl",
+                Arguments = "stop acproxycam",
+                UseShellExecute = false
+            });
+            await process!.WaitForExitAsync();
+        });
+
+        await _ui.WithStatusAsync("Disabling service...", async () =>
+        {
+            var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/systemctl",
+                Arguments = "disable acproxycam",
+                UseShellExecute = false
+            });
+            await process!.WaitForExitAsync();
+        });
+
+        await _ui.WithStatusAsync("Removing service file...", async () =>
+        {
+            if (File.Exists("/etc/systemd/system/acproxycam.service"))
+            {
+                File.Delete("/etc/systemd/system/acproxycam.service");
+            }
+            await Task.CompletedTask;
+        });
+
+        await _ui.WithStatusAsync("Reloading systemd...", async () =>
+        {
+            var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/systemctl",
+                Arguments = "daemon-reload",
+                UseShellExecute = false
+            });
+            await process!.WaitForExitAsync();
+        });
+
+        await _ui.WithStatusAsync("Removing binary...", async () =>
+        {
+            if (File.Exists("/usr/local/bin/acproxycam"))
+            {
+                File.Delete("/usr/local/bin/acproxycam");
+            }
+            await Task.CompletedTask;
+        });
+
+        if (!keepConfig)
+        {
+            await _ui.WithStatusAsync("Removing configuration...", async () =>
+            {
+                if (Directory.Exists("/etc/acproxycam"))
+                {
+                    Directory.Delete("/etc/acproxycam", true);
+                }
+                await Task.CompletedTask;
+            });
+        }
+        else
+        {
+            _ui.WriteLine("Keeping configuration files.");
+        }
+
+        await _ui.WithStatusAsync("Removing logs...", async () =>
+        {
+            if (Directory.Exists("/var/log/acproxycam"))
+            {
+                Directory.Delete("/var/log/acproxycam", true);
+            }
+            if (Directory.Exists("/var/lib/acproxycam"))
+            {
+                Directory.Delete("/var/lib/acproxycam", true);
+            }
+            if (File.Exists("/etc/logrotate.d/acproxycam"))
+            {
+                File.Delete("/etc/logrotate.d/acproxycam");
+            }
+            await Task.CompletedTask;
+        });
+
+        await _ui.WithStatusAsync("Removing user...", async () =>
+        {
+            var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/bash",
+                Arguments = "-c \"userdel acproxycam 2>/dev/null || true\"",
+                UseShellExecute = false
+            });
+            await process!.WaitForExitAsync();
+        });
+
+        _ui.WriteLine();
+        _ui.WriteSuccess("ACProxyCam has been uninstalled.");
+        return 0;
+    }
+
     private bool IsRunningAsRoot()
     {
-        // Check if running as root (UID 0)
         try
         {
             return Environment.GetEnvironmentVariable("EUID") == "0" ||
@@ -90,97 +383,32 @@ public class ManagementCli
 
     private async Task<int> HandleInstallationAsync()
     {
-        AnsiConsole.MarkupLine("[yellow]ACProxyCam is not installed.[/]");
-        AnsiConsole.WriteLine();
+        _ui.WriteWarning("ACProxyCam is not installed.");
+        _ui.WriteLine();
 
-        var choices = new[] { "Install ACProxyCam", "Quit" };
-        var choice = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("What would you like to do?")
-                .AddChoices(choices));
+        var choice = _ui.SelectOne(
+            "What would you like to do?",
+            new[] { "Install ACProxyCam", "Quit" });
 
         if (choice == "Quit")
         {
             return 0;
         }
 
-        // Installation flow
-        return await InstallServiceAsync();
-    }
-
-    private async Task<int> InstallServiceAsync()
-    {
-        AnsiConsole.MarkupLine("[blue]Installing ACProxyCam...[/]");
-        AnsiConsole.WriteLine();
-
-        // Step 1: Check FFmpeg
-        if (!await CheckAndInstallFfmpegAsync())
-        {
-            return 1;
-        }
-
-        // Step 2: Select listening interfaces
-        var interfaces = await SelectInterfacesAsync();
-        if (interfaces == null)
-        {
-            return 0; // User cancelled
-        }
-
-        // Step 3: Create user and directories
-        await AnsiConsole.Status()
-            .StartAsync("Creating acproxycam user...", async ctx =>
-            {
-                await CreateUserAndDirectoriesAsync();
-            });
-
-        // Step 4: Create configuration
-        await AnsiConsole.Status()
-            .StartAsync("Creating configuration...", async ctx =>
-            {
-                var config = new AppConfig
-                {
-                    ListenInterfaces = interfaces
-                };
-                await ConfigManager.SaveAsync(config);
-            });
-
-        // Step 5: Install systemd service
-        await AnsiConsole.Status()
-            .StartAsync("Installing systemd service...", async ctx =>
-            {
-                await InstallSystemdServiceAsync();
-            });
-
-        // Step 6: Start service
-        await AnsiConsole.Status()
-            .StartAsync("Starting service...", async ctx =>
-            {
-                await StartServiceAsync();
-            });
-
-        AnsiConsole.MarkupLine("[green]Installation complete![/]");
-        AnsiConsole.WriteLine();
-
-        // Continue to management
-        await Task.Delay(1000);
-        _ipcClient = new IpcClient();
-        _ipcClient.Connect();
-
-        return await ManagementLoopAsync();
+        return await InstallAsync();
     }
 
     private async Task<bool> CheckAndInstallFfmpegAsync()
     {
-        // Check if FFmpeg is installed
         var ffmpegInstalled = File.Exists("/usr/bin/ffmpeg") || File.Exists("/usr/local/bin/ffmpeg");
 
         if (ffmpegInstalled)
         {
-            AnsiConsole.MarkupLine("[green]FFmpeg is installed.[/]");
+            _ui.WriteSuccess("FFmpeg is installed.");
             return true;
         }
 
-        AnsiConsole.MarkupLine("[yellow]FFmpeg is not installed.[/]");
+        _ui.WriteWarning("FFmpeg is not installed.");
 
         // Detect package manager
         string? packageManager = null;
@@ -204,78 +432,76 @@ public class ManagementCli
 
         if (packageManager != null)
         {
-            var install = AnsiConsole.Confirm($"Would you like to install FFmpeg using {packageManager}?");
+            var install = _ui.Confirm($"Would you like to install FFmpeg using {packageManager}?");
             if (install)
             {
-                await AnsiConsole.Status()
-                    .StartAsync("Installing FFmpeg...", async ctx =>
+                await _ui.WithStatusAsync("Installing FFmpeg...", async () =>
+                {
+                    var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
                     {
-                        var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                        {
-                            FileName = "/bin/bash",
-                            Arguments = $"-c \"{installCommand}\"",
-                            UseShellExecute = false
-                        });
-                        await process!.WaitForExitAsync();
+                        FileName = "/bin/bash",
+                        Arguments = $"-c \"{installCommand}\"",
+                        UseShellExecute = false
                     });
+                    await process!.WaitForExitAsync();
+                });
 
                 return true;
             }
         }
 
-        AnsiConsole.MarkupLine("[red]FFmpeg is required for ACProxyCam to function.[/]");
-        AnsiConsole.MarkupLine("[yellow]Please install FFmpeg manually and try again.[/]");
+        _ui.WriteError("FFmpeg is required for ACProxyCam to function.");
+        _ui.WriteWarning("Please install FFmpeg manually and try again.");
         return false;
     }
 
     private async Task<List<string>?> SelectInterfacesAsync()
     {
-        AnsiConsole.MarkupLine("[blue]Select listening interfaces for MJPEG streams:[/]");
-        AnsiConsole.WriteLine();
-
-        // Get available interfaces
         var interfaces = GetNetworkInterfaces();
 
-        var choices = new List<string> { "All interfaces (0.0.0.0)", "localhost (127.0.0.1)" };
-        choices.AddRange(interfaces.Select(i => $"{i.Name} ({i.Address})"));
-        choices.Add("Cancel");
+        // First, ask what to do with a single-select prompt
+        var actionChoices = new List<string> { "All interfaces (0.0.0.0)", "Select specific interfaces", "Cancel" };
+        var action = _ui.SelectOne("Select listening interfaces for MJPEG streams:", actionChoices);
 
-        var selected = AnsiConsole.Prompt(
-            new MultiSelectionPrompt<string>()
-                .Title("Select interfaces (Space to toggle, Enter to confirm):")
-                .AddChoices(choices)
-                .InstructionsText("[grey](Press space to toggle, enter to accept)[/]"));
-
-        if (selected.Contains("Cancel"))
+        if (action == "Cancel")
         {
+            return null;
+        }
+
+        if (action == "All interfaces (0.0.0.0)")
+        {
+            return new List<string> { "0.0.0.0" };
+        }
+
+        // Show multi-select for specific interfaces (without Cancel)
+        var choices = new List<string> { "localhost (127.0.0.1)" };
+        choices.AddRange(interfaces.Select(i => $"{i.Name} ({i.Address})"));
+
+        var selected = _ui.SelectMany(
+            "Select interfaces (Space to toggle, Enter to confirm):",
+            choices,
+            "(Press space to toggle, enter to accept)");
+
+        if (selected.Count == 0)
+        {
+            _ui.WriteWarning("No interfaces selected. Operation cancelled.");
+            await Task.Delay(1500);
             return null;
         }
 
         var result = new List<string>();
 
-        if (selected.Contains("All interfaces (0.0.0.0)"))
+        if (selected.Contains("localhost (127.0.0.1)"))
         {
-            result.Add("0.0.0.0");
-        }
-        else
-        {
-            if (selected.Contains("localhost (127.0.0.1)"))
-            {
-                result.Add("127.0.0.1");
-            }
-
-            foreach (var iface in interfaces)
-            {
-                if (selected.Contains($"{iface.Name} ({iface.Address})"))
-                {
-                    result.Add(iface.Address);
-                }
-            }
+            result.Add("127.0.0.1");
         }
 
-        if (result.Count == 0)
+        foreach (var iface in interfaces)
         {
-            result.Add("127.0.0.1"); // Default to localhost
+            if (selected.Contains($"{iface.Name} ({iface.Address})"))
+            {
+                result.Add(iface.Address);
+            }
         }
 
         return result;
@@ -308,86 +534,156 @@ public class ManagementCli
         return result;
     }
 
-    private async Task CreateUserAndDirectoriesAsync()
+    private async Task<string?> CreateUserAndDirectoriesAsync()
     {
-        // Create acproxycam user if doesn't exist
-        var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        try
         {
-            FileName = "/bin/bash",
-            Arguments = "-c \"id acproxycam &>/dev/null || useradd -r -s /bin/false acproxycam\"",
-            UseShellExecute = false
-        });
-        await process!.WaitForExitAsync();
+            // Create acproxycam user if doesn't exist
+            _ui.WriteInfo("Creating system user...");
+            var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/bash",
+                Arguments = "-c \"id acproxycam &>/dev/null || useradd -r -s /bin/false acproxycam\"",
+                UseShellExecute = false,
+                RedirectStandardError = true
+            });
+            await process!.WaitForExitAsync();
+            if (process.ExitCode != 0)
+            {
+                var error = await process.StandardError.ReadToEndAsync();
+                return $"Failed to create user: {error}";
+            }
+            _ui.WriteSuccess("  Created user 'acproxycam'");
 
-        // Create directories
-        Directory.CreateDirectory("/etc/acproxycam");
-        Directory.CreateDirectory("/var/log/acproxycam");
+            // Create directories
+            _ui.WriteInfo("Creating directories...");
+            Directory.CreateDirectory("/etc/acproxycam");
+            _ui.WriteSuccess("  Created /etc/acproxycam");
+            Directory.CreateDirectory("/var/log/acproxycam");
+            _ui.WriteSuccess("  Created /var/log/acproxycam");
+            Directory.CreateDirectory("/var/lib/acproxycam");
+            _ui.WriteSuccess("  Created /var/lib/acproxycam");
 
-        // Set ownership
-        process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            // Set ownership
+            _ui.WriteInfo("Setting directory ownership...");
+            process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/bash",
+                Arguments = "-c \"chown acproxycam:acproxycam /etc/acproxycam /var/log/acproxycam /var/lib/acproxycam\"",
+                UseShellExecute = false,
+                RedirectStandardError = true
+            });
+            await process!.WaitForExitAsync();
+            if (process.ExitCode != 0)
+            {
+                var error = await process.StandardError.ReadToEndAsync();
+                return $"Failed to set ownership: {error}";
+            }
+            _ui.WriteSuccess("  Set ownership to acproxycam:acproxycam");
+
+            return null; // Success
+        }
+        catch (Exception ex)
         {
-            FileName = "/bin/bash",
-            Arguments = "-c \"chown acproxycam:acproxycam /etc/acproxycam /var/log/acproxycam\"",
-            UseShellExecute = false
-        });
-        await process!.WaitForExitAsync();
+            return ex.Message;
+        }
     }
 
-    private async Task InstallSystemdServiceAsync()
+    private async Task<string?> InstallSystemdServiceAsync()
     {
-        var serviceContent = @"[Unit]
+        try
+        {
+            var serviceContent = @"[Unit]
 Description=ACProxyCam - Anycubic Camera Proxy
+# Soft ordering only - no Requires/Wants/BindsTo that could block boot
 After=network.target
 
 [Service]
-Type=notify
+Type=simple
 User=acproxycam
 Group=acproxycam
+Environment=DOTNET_BUNDLE_EXTRACT_BASE_DIR=/var/lib/acproxycam
+RuntimeDirectory=acproxycam
+RuntimeDirectoryMode=0755
 ExecStart=/usr/local/bin/acproxycam --daemon
+
+# Short timeouts - never hang
+TimeoutStartSec=30
+TimeoutStopSec=10
+
+# Rate-limited restarts - max 3 attempts per 5 minutes, then give up
 Restart=on-failure
-RestartSec=5
-WatchdogSec=30
+RestartSec=60
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Install]
+# Only multi-user target - never blocks boot
 WantedBy=multi-user.target
 ";
 
-        await File.WriteAllTextAsync("/etc/systemd/system/acproxycam.service", serviceContent);
+            await File.WriteAllTextAsync("/etc/systemd/system/acproxycam.service", serviceContent);
+            _ui.WriteSuccess("  Created /etc/systemd/system/acproxycam.service");
 
-        // Copy binary
-        var currentExe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName;
-        if (currentExe != null && currentExe != "/usr/local/bin/acproxycam")
-        {
-            File.Copy(currentExe, "/usr/local/bin/acproxycam", true);
-            var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            // Copy binary
+            _ui.WriteInfo("Installing binary...");
+            var currentExe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName;
+            if (currentExe != null && currentExe != "/usr/local/bin/acproxycam")
             {
-                FileName = "/bin/chmod",
-                Arguments = "+x /usr/local/bin/acproxycam",
-                UseShellExecute = false
+                File.Copy(currentExe, "/usr/local/bin/acproxycam", true);
+                _ui.WriteSuccess("  Copied binary to /usr/local/bin/acproxycam");
+                var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "/bin/chmod",
+                    Arguments = "+x /usr/local/bin/acproxycam",
+                    UseShellExecute = false,
+                    RedirectStandardError = true
+                });
+                await process!.WaitForExitAsync();
+                if (process.ExitCode != 0)
+                {
+                    var error = await process.StandardError.ReadToEndAsync();
+                    return $"Failed to set executable permission: {error}";
+                }
+                _ui.WriteSuccess("  Set executable permission");
+            }
+
+            // Reload systemd
+            _ui.WriteInfo("Configuring systemd...");
+            var reloadProcess = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/systemctl",
+                Arguments = "daemon-reload",
+                UseShellExecute = false,
+                RedirectStandardError = true
             });
-            await process!.WaitForExitAsync();
-        }
+            await reloadProcess!.WaitForExitAsync();
+            if (reloadProcess.ExitCode != 0)
+            {
+                var error = await reloadProcess.StandardError.ReadToEndAsync();
+                return $"Failed to reload systemd: {error}";
+            }
+            _ui.WriteSuccess("  Reloaded systemd daemon");
 
-        // Reload systemd
-        var reloadProcess = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-        {
-            FileName = "/bin/systemctl",
-            Arguments = "daemon-reload",
-            UseShellExecute = false
-        });
-        await reloadProcess!.WaitForExitAsync();
+            // Enable service
+            var enableProcess = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/systemctl",
+                Arguments = "enable acproxycam",
+                UseShellExecute = false,
+                RedirectStandardError = true
+            });
+            await enableProcess!.WaitForExitAsync();
+            if (enableProcess.ExitCode != 0)
+            {
+                var error = await enableProcess.StandardError.ReadToEndAsync();
+                return $"Failed to enable service: {error}";
+            }
+            _ui.WriteSuccess("  Enabled service for autostart");
 
-        // Enable service
-        var enableProcess = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-        {
-            FileName = "/bin/systemctl",
-            Arguments = "enable acproxycam",
-            UseShellExecute = false
-        });
-        await enableProcess!.WaitForExitAsync();
-
-        // Install logrotate configuration
-        var logrotateContent = @"/var/log/acproxycam/*.log {
+            // Install logrotate configuration
+            _ui.WriteInfo("Installing logrotate configuration...");
+            var logrotateContent = @"/var/log/acproxycam/*.log {
     daily
     missingok
     rotate 7
@@ -401,158 +697,288 @@ WantedBy=multi-user.target
     endscript
 }
 ";
-        await File.WriteAllTextAsync("/etc/logrotate.d/acproxycam", logrotateContent);
+            await File.WriteAllTextAsync("/etc/logrotate.d/acproxycam", logrotateContent);
+            _ui.WriteSuccess("  Created /etc/logrotate.d/acproxycam");
+
+            return null; // Success
+        }
+        catch (Exception ex)
+        {
+            return ex.Message;
+        }
     }
 
-    private async Task StartServiceAsync()
+    private async Task<string?> StartServiceAsync()
     {
-        var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        try
         {
-            FileName = "/bin/systemctl",
-            Arguments = "start acproxycam",
-            UseShellExecute = false
-        });
-        await process!.WaitForExitAsync();
+            var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/systemctl",
+                Arguments = "start acproxycam",
+                UseShellExecute = false,
+                RedirectStandardError = true
+            });
+            await process!.WaitForExitAsync();
+            if (process.ExitCode != 0)
+            {
+                var error = await process.StandardError.ReadToEndAsync();
+                return $"Failed to start service: {error}";
+            }
+            _ui.WriteSuccess("  Service started");
 
-        // Wait for daemon to be ready
-        for (int i = 0; i < 10; i++)
-        {
-            await Task.Delay(500);
-            if (IpcClient.IsDaemonRunning())
-                break;
+            // Wait for daemon to be ready
+            _ui.WriteInfo("Waiting for daemon to be ready...");
+            for (int i = 0; i < 10; i++)
+            {
+                await Task.Delay(500);
+                if (IpcClient.IsDaemonRunning())
+                {
+                    _ui.WriteSuccess("  Daemon is ready");
+                    return null; // Success
+                }
+            }
+
+            return "Service started but daemon not responding";
         }
+        catch (Exception ex)
+        {
+            return ex.Message;
+        }
+    }
+
+    // Auto-refresh interval in milliseconds
+    private const int RefreshIntervalMs = 2000;
+
+    private enum MenuAction
+    {
+        None,
+        Quit,
+        ToggleService,
+        RestartService,
+        Uninstall,
+        ChangeInterfaces,
+        AddPrinter,
+        DeletePrinter,
+        ModifyPrinter,
+        TogglePause,
+        ShowDetails
     }
 
     private async Task<int> ManagementLoopAsync()
     {
         while (true)
         {
-            Console.Clear();
-            await DisplayHeaderAsync();
-            await DisplayPrinterListAsync();
-            DisplayKeyHelp();
+            // Clear and render dashboard using Live display
+            AnsiConsole.Clear();
 
-            var key = Console.ReadKey(true);
+            MenuAction action = MenuAction.None;
 
-            switch (char.ToUpper(key.KeyChar))
+            await AnsiConsole.Live(Text.Empty)
+                .AutoClear(false)
+                .StartAsync(async ctx =>
+                {
+                    var lastRefresh = DateTime.MinValue;
+
+                    while (action == MenuAction.None)
+                    {
+                        // Build and render dashboard
+                        var dashboard = await BuildDashboardAsync();
+                        ctx.UpdateTarget(dashboard);
+                        lastRefresh = DateTime.UtcNow;
+
+                        // Wait for key input with timeout for auto-refresh
+                        while (action == MenuAction.None)
+                        {
+                            // Check for timeout - need to refresh
+                            if ((DateTime.UtcNow - lastRefresh).TotalMilliseconds >= RefreshIntervalMs)
+                                break;
+
+                            // Check for key input (non-blocking)
+                            if (Console.KeyAvailable)
+                            {
+                                var key = Console.ReadKey(true).Key;
+                                action = key switch
+                                {
+                                    ConsoleKey.Q => MenuAction.Quit,
+                                    ConsoleKey.S => MenuAction.ToggleService,
+                                    ConsoleKey.R => MenuAction.RestartService,
+                                    ConsoleKey.U => MenuAction.Uninstall,
+                                    ConsoleKey.L => MenuAction.ChangeInterfaces,
+                                    ConsoleKey.A => MenuAction.AddPrinter,
+                                    ConsoleKey.D => MenuAction.DeletePrinter,
+                                    ConsoleKey.M => MenuAction.ModifyPrinter,
+                                    ConsoleKey.Spacebar => MenuAction.TogglePause,
+                                    ConsoleKey.Enter => MenuAction.ShowDetails,
+                                    _ => MenuAction.None
+                                };
+                                break; // Exit inner loop to refresh or handle action
+                            }
+
+                            // Small sleep to avoid busy-waiting
+                            await Task.Delay(50);
+                        }
+                    }
+                });
+
+            // Now outside Live context - handle actions that need interactive prompts
+            switch (action)
             {
-                case 'Q':
+                case MenuAction.Quit:
                     return 0;
 
-                case 'S':
+                case MenuAction.ToggleService:
                     await ToggleServiceAsync();
                     break;
 
-                case 'R':
+                case MenuAction.RestartService:
                     await RestartServiceAsync();
                     break;
 
-                case 'U':
-                    var result = await UninstallAsync();
+                case MenuAction.Uninstall:
+                    AnsiConsole.Clear();
+                    var result = await UninstallFromMenuAsync();
                     if (result == 0) return 0;
                     break;
 
-                case 'L':
+                case MenuAction.ChangeInterfaces:
+                    AnsiConsole.Clear();
                     await ChangeInterfacesAsync();
                     break;
 
-                case 'A':
+                case MenuAction.AddPrinter:
+                    AnsiConsole.Clear();
                     await AddPrinterAsync();
                     break;
 
-                case 'D':
+                case MenuAction.DeletePrinter:
+                    AnsiConsole.Clear();
                     await DeletePrinterAsync();
                     break;
 
-                case 'M':
+                case MenuAction.ModifyPrinter:
+                    AnsiConsole.Clear();
                     await ModifyPrinterAsync();
                     break;
 
-                case ' ':
+                case MenuAction.TogglePause:
+                    AnsiConsole.Clear();
                     await TogglePrinterPauseAsync();
                     break;
 
-                case '\r': // Enter
+                case MenuAction.ShowDetails:
+                    AnsiConsole.Clear();
                     await ShowPrinterDetailsAsync();
                     break;
             }
         }
     }
 
-    private async Task DisplayHeaderAsync()
+    private async Task<Rows> BuildDashboardAsync()
     {
-        var (success, status, _) = await _ipcClient!.GetStatusAsync();
+        // Fetch all data first
+        var (statusSuccess, status, _) = await _ipcClient!.GetStatusAsync();
+        var (printersSuccess, printers, _) = await _ipcClient!.ListPrintersAsync();
 
-        var statusColor = success && status?.Running == true ? "green" : "red";
-        var statusText = success && status?.Running == true ? "Running" : "Stopped";
+        var renderables = new List<Spectre.Console.Rendering.IRenderable>();
 
-        var header = new Panel(
-            $"[bold]ACProxyCam[/] v{Program.Version}  |  Service: [{statusColor}]● {statusText}[/]  |  " +
-            $"Printers: {status?.PrinterCount ?? 0}  |  Active: {status?.ActiveStreamers ?? 0}  |  " +
-            $"Inactive: {status?.InactiveStreamers ?? 0}  |  Clients: {status?.TotalClients ?? 0}")
-        {
-            Border = BoxBorder.Rounded
-        };
+        // === HEADER TABLE ===
+        var serviceRunning = statusSuccess && status?.Running == true;
+        var serviceStatus = serviceRunning ? "[green]● Running[/]" : "[red]● Stopped[/]";
 
-        AnsiConsole.Write(header);
-        AnsiConsole.WriteLine();
-    }
-
-    private async Task DisplayPrinterListAsync()
-    {
-        var (success, printers, _) = await _ipcClient!.ListPrintersAsync();
-
-        if (!success || printers == null || printers.Count == 0)
-        {
-            AnsiConsole.MarkupLine("[grey]No printers configured. Press [A] to add a printer.[/]");
-            AnsiConsole.WriteLine();
-            return;
-        }
-
-        var table = new Table()
+        var headerTable = new Table()
             .Border(TableBorder.Rounded)
-            .AddColumn("Name")
-            .AddColumn("IP")
-            .AddColumn("Port")
-            .AddColumn("Status")
-            .AddColumn("Clients");
+            .BorderColor(Color.Purple)
+            .AddColumn(new TableColumn("[bold purple]ACProxyCam[/]").Centered())
+            .AddColumn(new TableColumn("Service").Centered())
+            .AddColumn(new TableColumn("Printers").Centered())
+            .AddColumn(new TableColumn("Active").Centered())
+            .AddColumn(new TableColumn("Clients").Centered());
 
-        foreach (var printer in printers)
+        headerTable.AddRow(
+            $"[grey]v{Program.Version}[/]",
+            serviceStatus,
+            $"[bold]{status?.PrinterCount ?? 0}[/]",
+            $"[green]{status?.ActiveStreamers ?? 0}[/] / [grey]{status?.InactiveStreamers ?? 0}[/]",
+            $"[cyan]{status?.TotalClients ?? 0}[/]"
+        );
+
+        renderables.Add(headerTable);
+
+        // === SERVICE CONTROLS ===
+        renderables.Add(new Markup(
+            "[grey]Service:[/] [white][[S]][/][grey]top/Start[/]  [white][[R]][/][grey]estart[/]  [white][[U]][/][grey]ninstall[/]  [white][[L]][/][grey]isten[/]  [white][[Q]][/][grey]uit[/]"
+        ));
+        renderables.Add(Text.Empty);
+
+        // === PRINTERS TABLE ===
+        if (!printersSuccess || printers == null || printers.Count == 0)
         {
-            var statusColor = printer.State switch
-            {
-                PrinterState.Running => "green",
-                PrinterState.Paused => "yellow",
-                PrinterState.Failed => "red",
-                PrinterState.Retrying => "orange3",
-                _ => "grey"
-            };
+            renderables.Add(new Panel("[grey]No printers configured. Press [white][[A]][/] to add.[/]")
+                .Border(BoxBorder.Rounded)
+                .BorderColor(Color.Grey)
+                .Header("[bold]Printers[/]"));
+        }
+        else
+        {
+            var printerTable = new Table()
+                .Border(TableBorder.Rounded)
+                .BorderColor(Color.Blue)
+                .Title("[bold blue]Printers[/]")
+                .AddColumn(new TableColumn("[bold]Name[/]"))
+                .AddColumn(new TableColumn("[bold]IP Address[/]"))
+                .AddColumn(new TableColumn("[bold]Port[/]").Centered())
+                .AddColumn(new TableColumn("[bold]Resolution[/]").Centered())
+                .AddColumn(new TableColumn("[bold]FPS[/]").Centered())
+                .AddColumn(new TableColumn("[bold]CPU[/]").Centered())
+                .AddColumn(new TableColumn("[bold]Status[/]").Centered())
+                .AddColumn(new TableColumn("[bold]Clients[/]").Centered());
 
-            var statusSymbol = printer.State switch
+            foreach (var p in printers)
             {
-                PrinterState.Running => "●",
-                PrinterState.Paused => "◐",
-                PrinterState.Failed => "○",
-                PrinterState.Retrying => "◌",
-                _ => "○"
-            };
+                var (statusColor, statusIcon) = p.State switch
+                {
+                    PrinterState.Running => ("green", "●"),
+                    PrinterState.Paused => ("yellow", "◐"),
+                    PrinterState.Failed => ("red", "✗"),
+                    PrinterState.Retrying => ("orange3", "↻"),
+                    PrinterState.Connecting => ("blue", "◌"),
+                    _ => ("grey", "○")
+                };
 
-            table.AddRow(
-                printer.Name,
-                printer.Ip,
-                printer.MjpegPort.ToString(),
-                $"[{statusColor}]{statusSymbol} {printer.State}[/]",
-                printer.ConnectedClients.ToString()
-            );
+                var resolution = p.StreamStatus.Width > 0 && p.StreamStatus.Height > 0
+                    ? $"{p.StreamStatus.Width}x{p.StreamStatus.Height}"
+                    : "[grey]-[/]";
+
+                var fpsDisplay = p.IsIdle
+                    ? (p.CurrentFps == 0 ? "[grey]off[/]" : $"[grey]{p.CurrentFps}[/]")
+                    : (p.CurrentFps == 0 ? "[green]max[/]" : $"[green]{p.CurrentFps}[/]");
+                var cpuDisplay = p.CpuAffinity >= 0 ? $"[cyan]{p.CpuAffinity}[/]" : "[grey]-[/]";
+                var clientsDisplay = p.ConnectedClients > 0
+                    ? $"[green]{p.ConnectedClients}[/]"
+                    : "[grey]0[/]";
+
+                printerTable.AddRow(
+                    $"[white]{Markup.Escape(p.Name)}[/]",
+                    $"[grey]{Markup.Escape(p.Ip)}[/]",
+                    $"[cyan]{p.MjpegPort}[/]",
+                    resolution,
+                    fpsDisplay,
+                    cpuDisplay,
+                    $"[{statusColor}]{statusIcon} {p.State}[/]",
+                    clientsDisplay
+                );
+            }
+
+            renderables.Add(printerTable);
         }
 
-        AnsiConsole.Write(table);
-        AnsiConsole.WriteLine();
-    }
+        // === PRINTER CONTROLS ===
+        renderables.Add(new Markup(
+            "[grey]Printers:[/] [white][[A]][/][grey]dd[/]  [white][[D]][/][grey]elete[/]  [white][[M]][/][grey]odify[/]  [white][[Space]][/][grey]Pause[/]  [white][[Enter]][/][grey]Details[/]  [white][[F]][/][grey]Refresh[/]"
+        ));
 
-    private void DisplayKeyHelp()
-    {
-        AnsiConsole.MarkupLine("[grey]Service: [S]top/Start  [R]estart  [U]ninstall  [L]isten  |  Printers: [A]dd  [D]elete  [M]odify  [Space]Pause  [Enter]Details  |  [Q]uit[/]");
+        return new Rows(renderables);
     }
 
     private async Task ToggleServiceAsync()
@@ -562,7 +988,7 @@ WantedBy=multi-user.target
         if (success && status?.Running == true)
         {
             // Stop service
-            AnsiConsole.MarkupLine("[yellow]Stopping service...[/]");
+            _ui.WriteWarning("Stopping service...");
             var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
             {
                 FileName = "/bin/systemctl",
@@ -571,13 +997,19 @@ WantedBy=multi-user.target
             });
             await process!.WaitForExitAsync();
             _ipcClient = null;
-            AnsiConsole.MarkupLine("[green]Service stopped.[/]");
+            _ui.WriteSuccess("Service stopped.");
             await Task.Delay(1000);
         }
         else
         {
             // Start service
-            await StartServiceAsync();
+            var startError = await StartServiceAsync();
+            if (startError != null)
+            {
+                _ui.WriteError($"Error: {startError}");
+                await Task.Delay(2000);
+                return;
+            }
             _ipcClient = new IpcClient();
             _ipcClient.Connect();
         }
@@ -585,25 +1017,24 @@ WantedBy=multi-user.target
 
     private async Task RestartServiceAsync()
     {
-        await AnsiConsole.Status()
-            .StartAsync("Restarting service...", async ctx =>
+        await _ui.WithStatusAsync("Restarting service...", async () =>
+        {
+            var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
             {
-                var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "/bin/systemctl",
-                    Arguments = "restart acproxycam",
-                    UseShellExecute = false
-                });
-                await process!.WaitForExitAsync();
-
-                // Wait for daemon to be ready
-                for (int i = 0; i < 10; i++)
-                {
-                    await Task.Delay(500);
-                    if (IpcClient.IsDaemonRunning())
-                        break;
-                }
+                FileName = "/bin/systemctl",
+                Arguments = "restart acproxycam",
+                UseShellExecute = false
             });
+            await process!.WaitForExitAsync();
+
+            // Wait for daemon to be ready
+            for (int i = 0; i < 10; i++)
+            {
+                await Task.Delay(500);
+                if (IpcClient.IsDaemonRunning())
+                    break;
+            }
+        });
 
         // Reconnect
         _ipcClient?.Disconnect();
@@ -611,90 +1042,133 @@ WantedBy=multi-user.target
         _ipcClient.Connect();
     }
 
-    private async Task<int> UninstallAsync()
+    private async Task UninstallServiceFilesAsync()
     {
-        if (!AnsiConsole.Confirm("[red]Are you sure you want to uninstall ACProxyCam?[/]", false))
+        await _ui.WithStatusAsync("Removing service...", async () =>
+        {
+            // Stop service
+            var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/systemctl",
+                Arguments = "stop acproxycam",
+                UseShellExecute = false
+            });
+            await process!.WaitForExitAsync();
+
+            // Disable service
+            process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/systemctl",
+                Arguments = "disable acproxycam",
+                UseShellExecute = false
+            });
+            await process!.WaitForExitAsync();
+
+            // Remove service file
+            if (File.Exists("/etc/systemd/system/acproxycam.service"))
+            {
+                File.Delete("/etc/systemd/system/acproxycam.service");
+            }
+
+            // Reload systemd
+            process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/systemctl",
+                Arguments = "daemon-reload",
+                UseShellExecute = false
+            });
+            await process!.WaitForExitAsync();
+
+            // Remove binary
+            if (File.Exists("/usr/local/bin/acproxycam"))
+            {
+                File.Delete("/usr/local/bin/acproxycam");
+            }
+
+            // Remove logrotate config
+            if (File.Exists("/etc/logrotate.d/acproxycam"))
+            {
+                File.Delete("/etc/logrotate.d/acproxycam");
+            }
+        });
+    }
+
+    private async Task<int> UninstallFromMenuAsync()
+    {
+        if (!_ui.Confirm("Are you sure you want to uninstall ACProxyCam?", false))
         {
             return 1;
         }
 
-        var keepConfig = AnsiConsole.Confirm("Keep configuration files?", true);
+        var keepConfig = _ui.Confirm("Keep configuration files?", true);
 
-        await AnsiConsole.Status()
-            .StartAsync("Uninstalling...", async ctx =>
+        await _ui.WithStatusAsync("Uninstalling...", async () =>
+        {
+            // Stop service
+            var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
             {
-                // Stop service
-                ctx.Status("Stopping service...");
-                var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "/bin/systemctl",
-                    Arguments = "stop acproxycam",
-                    UseShellExecute = false
-                });
-                await process!.WaitForExitAsync();
-
-                // Disable service
-                ctx.Status("Disabling service...");
-                process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "/bin/systemctl",
-                    Arguments = "disable acproxycam",
-                    UseShellExecute = false
-                });
-                await process!.WaitForExitAsync();
-
-                // Remove service file
-                ctx.Status("Removing service file...");
-                if (File.Exists("/etc/systemd/system/acproxycam.service"))
-                {
-                    File.Delete("/etc/systemd/system/acproxycam.service");
-                }
-
-                // Reload systemd
-                process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "/bin/systemctl",
-                    Arguments = "daemon-reload",
-                    UseShellExecute = false
-                });
-                await process!.WaitForExitAsync();
-
-                // Remove binary
-                ctx.Status("Removing binary...");
-                if (File.Exists("/usr/local/bin/acproxycam"))
-                {
-                    File.Delete("/usr/local/bin/acproxycam");
-                }
-
-                // Remove config if requested
-                if (!keepConfig)
-                {
-                    ctx.Status("Removing configuration...");
-                    if (Directory.Exists("/etc/acproxycam"))
-                    {
-                        Directory.Delete("/etc/acproxycam", true);
-                    }
-                }
-
-                // Remove log directory
-                ctx.Status("Removing logs...");
-                if (Directory.Exists("/var/log/acproxycam"))
-                {
-                    Directory.Delete("/var/log/acproxycam", true);
-                }
-
-                // Remove user
-                ctx.Status("Removing user...");
-                process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "/bin/bash",
-                    Arguments = "-c \"userdel acproxycam 2>/dev/null || true\"",
-                    UseShellExecute = false
-                });
-                await process!.WaitForExitAsync();
+                FileName = "/bin/systemctl",
+                Arguments = "stop acproxycam",
+                UseShellExecute = false
             });
+            await process!.WaitForExitAsync();
 
-        AnsiConsole.MarkupLine("[green]ACProxyCam has been uninstalled.[/]");
+            // Disable service
+            process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/systemctl",
+                Arguments = "disable acproxycam",
+                UseShellExecute = false
+            });
+            await process!.WaitForExitAsync();
+
+            // Remove service file
+            if (File.Exists("/etc/systemd/system/acproxycam.service"))
+            {
+                File.Delete("/etc/systemd/system/acproxycam.service");
+            }
+
+            // Reload systemd
+            process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/systemctl",
+                Arguments = "daemon-reload",
+                UseShellExecute = false
+            });
+            await process!.WaitForExitAsync();
+
+            // Remove binary
+            if (File.Exists("/usr/local/bin/acproxycam"))
+            {
+                File.Delete("/usr/local/bin/acproxycam");
+            }
+
+            // Remove config if requested
+            if (!keepConfig)
+            {
+                if (Directory.Exists("/etc/acproxycam"))
+                {
+                    Directory.Delete("/etc/acproxycam", true);
+                }
+            }
+
+            // Remove log directory
+            if (Directory.Exists("/var/log/acproxycam"))
+            {
+                Directory.Delete("/var/log/acproxycam", true);
+            }
+
+            // Remove user
+            process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/bash",
+                Arguments = "-c \"userdel acproxycam 2>/dev/null || true\"",
+                UseShellExecute = false
+            });
+            await process!.WaitForExitAsync();
+        });
+
+        _ui.WriteSuccess("ACProxyCam has been uninstalled.");
         return 0;
     }
 
@@ -708,12 +1182,12 @@ WantedBy=multi-user.target
 
         if (success)
         {
-            AnsiConsole.MarkupLine("[green]Listening interfaces updated.[/]");
-            AnsiConsole.MarkupLine("[yellow]Restart service for changes to take effect.[/]");
+            _ui.WriteSuccess("Listening interfaces updated.");
+            _ui.WriteWarning("Restart service for changes to take effect.");
         }
         else
         {
-            AnsiConsole.MarkupLine($"[red]Error: {error}[/]");
+            _ui.WriteError($"Error: {error ?? "Unknown error"}");
         }
 
         await Task.Delay(2000);
@@ -721,60 +1195,85 @@ WantedBy=multi-user.target
 
     private async Task AddPrinterAsync()
     {
-        Console.Clear();
-        AnsiConsole.Write(new Rule("[blue]Add Printer[/]"));
-        AnsiConsole.WriteLine();
+        _ui.Clear();
+        _ui.WriteRule("Add Printer");
+        _ui.WriteLine();
 
-        // Get printer name
-        var name = AnsiConsole.Ask<string>("Printer name (unique identifier):");
-        if (string.IsNullOrWhiteSpace(name))
-            return;
+        // Get printer name (validated)
+        var name = AskValidatedString("Printer name (unique identifier):", ValidatePrinterName);
+        if (name == null) return;
 
-        // Get printer IP
-        var ip = AnsiConsole.Ask<string>("Printer IP address:");
-        if (string.IsNullOrWhiteSpace(ip))
-            return;
+        // Get printer IP (validated)
+        var ip = AskValidatedString("Printer IP address:", ValidateIpAddress);
+        if (ip == null) return;
 
-        // Get MJPEG port
-        var mjpegPort = AnsiConsole.Ask("MJPEG listening port:", 8080);
+        // Get MJPEG port (validated, with retry on conflict)
+        var mjpegPort = await AskPortWithRetryAsync("MJPEG listening port:", 8080, name);
+        if (mjpegPort == null) return;
 
         // SSH settings
-        var sshPort = AnsiConsole.Ask("SSH port:", 22);
-        var sshUser = AnsiConsole.Ask("SSH username:", "root");
-        var sshPassword = AnsiConsole.Prompt(
-            new TextPrompt<string>("SSH password:")
-                .DefaultValue("rockchip")
-                .Secret(null));
+        var sshPort = AskValidatedPort("SSH port:", 22);
+        if (sshPort == null) return;
+
+        var sshUser = AskValidatedString("SSH username:", ValidateUsername, "root");
+        if (sshUser == null) return;
+
+        var sshPassword = _ui.AskSecret("SSH password:", "rockchip");
 
         // MQTT settings
-        var mqttPort = AnsiConsole.Ask("MQTT port:", 9883);
+        var mqttPort = AskValidatedPort("MQTT port:", 9883);
+        if (mqttPort == null) return;
+
+        // Encoding settings (optional, show defaults)
+        _ui.WriteLine();
+        _ui.WriteInfo("Encoding settings (press Enter for defaults):");
+        var maxFps = AskValidatedInt("Max FPS (0=unlimited):", 0, 120, 10);
+        var idleFps = AskValidatedInt("Idle FPS (0=disabled):", 0, 30, 1);
+        var jpegQuality = AskValidatedInt("JPEG quality:", 1, 100, 80);
 
         // Create printer config
         var config = new PrinterConfig
         {
             Name = name,
             Ip = ip,
-            MjpegPort = mjpegPort,
-            SshPort = sshPort,
+            MjpegPort = mjpegPort.Value,
+            SshPort = sshPort.Value,
             SshUser = sshUser,
             SshPassword = sshPassword,
-            MqttPort = mqttPort
+            MqttPort = mqttPort.Value,
+            MaxFps = maxFps,
+            IdleFps = idleFps,
+            JpegQuality = jpegQuality
         };
+
+        // Pre-flight check
+        _ui.WriteLine();
+        if (_ui.Confirm("Run pre-flight check to verify printer connectivity?", true))
+        {
+            var checkPassed = await RunPreflightCheckAsync(config);
+            if (!checkPassed)
+            {
+                if (!_ui.Confirm("Pre-flight check failed. Add printer anyway?", false))
+                {
+                    return;
+                }
+            }
+        }
 
         // Add printer
         var (success, error) = await _ipcClient!.AddPrinterAsync(config);
 
         if (success)
         {
-            AnsiConsole.MarkupLine("[green]Printer added successfully![/]");
-            AnsiConsole.MarkupLine($"[grey]MJPEG stream will be available at: http://[server]:{mjpegPort}/stream[/]");
+            _ui.WriteSuccess("Printer added successfully!");
+            _ui.WriteInfo($"MJPEG stream will be available at: http://<server>:{mjpegPort}/stream");
         }
         else
         {
-            AnsiConsole.MarkupLine($"[red]Error: {error}[/]");
+            _ui.WriteError($"Error: {error ?? "Unknown error"}");
         }
 
-        await Task.Delay(2000);
+        _ui.WaitForKey("Press any key to continue...");
     }
 
     private async Task DeletePrinterAsync()
@@ -783,7 +1282,7 @@ WantedBy=multi-user.target
 
         if (!success || printers == null || printers.Count == 0)
         {
-            AnsiConsole.MarkupLine("[yellow]No printers to delete.[/]");
+            _ui.WriteWarning("No printers to delete.");
             await Task.Delay(1500);
             return;
         }
@@ -791,26 +1290,23 @@ WantedBy=multi-user.target
         var choices = printers.Select(p => p.Name).ToList();
         choices.Add("Cancel");
 
-        var selected = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("Select printer to delete:")
-                .AddChoices(choices));
+        var selected = _ui.SelectOne("Select printer to delete:", choices);
 
         if (selected == "Cancel")
             return;
 
-        if (!AnsiConsole.Confirm($"[red]Delete printer '{selected}'?[/]", false))
+        if (!_ui.Confirm($"Delete printer '{selected}'?", false))
             return;
 
         var (deleteSuccess, error) = await _ipcClient.DeletePrinterAsync(selected);
 
         if (deleteSuccess)
         {
-            AnsiConsole.MarkupLine("[green]Printer deleted.[/]");
+            _ui.WriteSuccess("Printer deleted.");
         }
         else
         {
-            AnsiConsole.MarkupLine($"[red]Error: {error}[/]");
+            _ui.WriteError($"Error: {error ?? "Unknown error"}");
         }
 
         await Task.Delay(1500);
@@ -822,7 +1318,7 @@ WantedBy=multi-user.target
 
         if (!success || printers == null || printers.Count == 0)
         {
-            AnsiConsole.MarkupLine("[yellow]No printers to modify.[/]");
+            _ui.WriteWarning("No printers to modify.");
             await Task.Delay(1500);
             return;
         }
@@ -830,56 +1326,78 @@ WantedBy=multi-user.target
         var choices = printers.Select(p => p.Name).ToList();
         choices.Add("Cancel");
 
-        var selected = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("Select printer to modify:")
-                .AddChoices(choices));
+        var selected = _ui.SelectOne("Select printer to modify:", choices);
 
         if (selected == "Cancel")
             return;
-
-        var printer = printers.First(p => p.Name == selected);
 
         // Get existing config
         var (configSuccess, existingConfig, _) = await _ipcClient.GetPrinterConfigAsync(selected);
         if (!configSuccess || existingConfig == null)
         {
-            AnsiConsole.MarkupLine("[red]Error: Could not get printer config.[/]");
+            _ui.WriteError("Error: Could not get printer config.");
             await Task.Delay(1500);
             return;
         }
 
-        Console.Clear();
-        AnsiConsole.Write(new Rule($"[blue]Modify Printer: {selected}[/]"));
-        AnsiConsole.MarkupLine("[grey]Press Enter to keep current value[/]");
-        AnsiConsole.WriteLine();
+        var originalName = existingConfig.Name;
+        var originalPort = existingConfig.MjpegPort;
 
-        // Modify settings
-        var ip = AnsiConsole.Ask($"IP address [{existingConfig.Ip}]:", existingConfig.Ip);
-        var mjpegPort = AnsiConsole.Ask($"MJPEG port [{existingConfig.MjpegPort}]:", existingConfig.MjpegPort);
-        var sshPort = AnsiConsole.Ask($"SSH port [{existingConfig.SshPort}]:", existingConfig.SshPort);
-        var sshUser = AnsiConsole.Ask($"SSH user [{existingConfig.SshUser}]:", existingConfig.SshUser);
-        var mqttPort = AnsiConsole.Ask($"MQTT port [{existingConfig.MqttPort}]:", existingConfig.MqttPort);
+        _ui.Clear();
+        _ui.WriteRule($"Modify Printer: {selected}");
+        _ui.WriteInfo("Press Enter to keep current value");
+        _ui.WriteLine();
+
+        // Allow name change with duplicate check
+        var newName = await AskPrinterNameWithRetryAsync($"Printer name [{existingConfig.Name}]:", existingConfig.Name, originalName);
+        if (newName == null) return;
+
+        // Modify settings with validation
+        var ip = AskValidatedString($"IP address [{existingConfig.Ip}]:", ValidateIpAddress, existingConfig.Ip);
+        if (ip == null) return;
+
+        var mjpegPort = await AskPortWithRetryAsync($"MJPEG port [{existingConfig.MjpegPort}]:", existingConfig.MjpegPort, originalName, originalPort);
+        if (mjpegPort == null) return;
+
+        var sshPort = AskValidatedPort($"SSH port [{existingConfig.SshPort}]:", existingConfig.SshPort);
+        if (sshPort == null) return;
+
+        var sshUser = AskValidatedString($"SSH user [{existingConfig.SshUser}]:", ValidateUsername, existingConfig.SshUser);
+        if (sshUser == null) return;
+
+        var mqttPort = AskValidatedPort($"MQTT port [{existingConfig.MqttPort}]:", existingConfig.MqttPort);
+        if (mqttPort == null) return;
+
+        // Encoding settings
+        _ui.WriteLine();
+        _ui.WriteInfo("Encoding settings:");
+        var maxFps = AskValidatedInt($"Max FPS [{existingConfig.MaxFps}]:", 0, 120, existingConfig.MaxFps);
+        var idleFps = AskValidatedInt($"Idle FPS [{existingConfig.IdleFps}]:", 0, 30, existingConfig.IdleFps);
+        var jpegQuality = AskValidatedInt($"JPEG quality [{existingConfig.JpegQuality}]:", 1, 100, existingConfig.JpegQuality);
 
         // Update config
+        existingConfig.Name = newName;
         existingConfig.Ip = ip;
-        existingConfig.MjpegPort = mjpegPort;
-        existingConfig.SshPort = sshPort;
+        existingConfig.MjpegPort = mjpegPort.Value;
+        existingConfig.SshPort = sshPort.Value;
         existingConfig.SshUser = sshUser;
-        existingConfig.MqttPort = mqttPort;
+        existingConfig.MqttPort = mqttPort.Value;
+        existingConfig.MaxFps = maxFps;
+        existingConfig.IdleFps = idleFps;
+        existingConfig.JpegQuality = jpegQuality;
 
-        var (modifySuccess, error) = await _ipcClient.ModifyPrinterAsync(existingConfig);
+        var (modifySuccess, error) = await _ipcClient.ModifyPrinterAsync(originalName, existingConfig);
 
         if (modifySuccess)
         {
-            AnsiConsole.MarkupLine("[green]Printer modified.[/]");
+            _ui.WriteSuccess("Printer modified.");
         }
         else
         {
-            AnsiConsole.MarkupLine($"[red]Error: {error}[/]");
+            _ui.WriteError($"Error: {error ?? "Unknown error"}");
         }
 
-        await Task.Delay(1500);
+        _ui.WaitForKey("Press any key to continue...");
     }
 
     private async Task TogglePrinterPauseAsync()
@@ -888,7 +1406,7 @@ WantedBy=multi-user.target
 
         if (!success || printers == null || printers.Count == 0)
         {
-            AnsiConsole.MarkupLine("[yellow]No printers available.[/]");
+            _ui.WriteWarning("No printers available.");
             await Task.Delay(1500);
             return;
         }
@@ -896,10 +1414,7 @@ WantedBy=multi-user.target
         var choices = printers.Select(p => $"{p.Name} ({(p.IsPaused ? "Paused" : "Running")})").ToList();
         choices.Add("Cancel");
 
-        var selected = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("Select printer to pause/resume:")
-                .AddChoices(choices));
+        var selected = _ui.SelectOne("Select printer to pause/resume:", choices);
 
         if (selected == "Cancel")
             return;
@@ -922,11 +1437,11 @@ WantedBy=multi-user.target
 
         if (toggleSuccess)
         {
-            AnsiConsole.MarkupLine($"[green]Printer {(printer.IsPaused ? "resumed" : "paused")}.[/]");
+            _ui.WriteSuccess($"Printer {(printer.IsPaused ? "resumed" : "paused")}.");
         }
         else
         {
-            AnsiConsole.MarkupLine($"[red]Error: {error}[/]");
+            _ui.WriteError($"Error: {error ?? "Unknown error"}");
         }
 
         await Task.Delay(1000);
@@ -938,7 +1453,7 @@ WantedBy=multi-user.target
 
         if (!success || printers == null || printers.Count == 0)
         {
-            AnsiConsole.MarkupLine("[yellow]No printers available.[/]");
+            _ui.WriteWarning("No printers available.");
             await Task.Delay(1500);
             return;
         }
@@ -946,17 +1461,14 @@ WantedBy=multi-user.target
         var choices = printers.Select(p => p.Name).ToList();
         choices.Add("Cancel");
 
-        var selected = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("Select printer to view:")
-                .AddChoices(choices));
+        var selected = _ui.SelectOne("Select printer to view:", choices);
 
         if (selected == "Cancel")
             return;
 
         var printer = printers.First(p => p.Name == selected);
 
-        Console.Clear();
+        _ui.Clear();
 
         // Get detailed status
         var (statusSuccess, detailedStatus, _) = await _ipcClient.GetPrinterStatusAsync(selected);
@@ -976,81 +1488,446 @@ WantedBy=multi-user.target
             _ => "grey"
         };
 
-        AnsiConsole.Write(new Rule($"[blue]{detailedStatus.Name}[/]"));
-        AnsiConsole.WriteLine();
+        _ui.WriteRule(detailedStatus.Name);
+        _ui.WriteLine();
 
-        var grid = new Grid()
-            .AddColumn()
-            .AddColumn();
-
-        grid.AddRow("[grey]IP Address:[/]", detailedStatus.Ip);
-        grid.AddRow("[grey]MJPEG Port:[/]", detailedStatus.MjpegPort.ToString());
-        grid.AddRow("[grey]Status:[/]", $"[{statusColor}]{detailedStatus.State}[/]");
-        grid.AddRow("[grey]Connected Clients:[/]", detailedStatus.ConnectedClients.ToString());
+        var details = new List<(string, string)>
+        {
+            ("IP Address", detailedStatus.Ip),
+            ("MJPEG Port", detailedStatus.MjpegPort.ToString()),
+            ("Status", $"[{statusColor}]{detailedStatus.State}[/]"),
+            ("Connected Clients", detailedStatus.ConnectedClients.ToString())
+        };
 
         if (detailedStatus.LastError != null)
         {
-            grid.AddRow("[grey]Last Error:[/]", $"[red]{detailedStatus.LastError}[/]");
+            details.Add(("Last Error", $"[red]{detailedStatus.LastError}[/]"));
         }
 
         if (detailedStatus.LastSeenOnline.HasValue)
         {
-            grid.AddRow("[grey]Last Online:[/]", detailedStatus.LastSeenOnline.Value.ToString("yyyy-MM-dd HH:mm:ss"));
+            details.Add(("Last Online", detailedStatus.LastSeenOnline.Value.ToString("yyyy-MM-dd HH:mm:ss")));
         }
 
         if (detailedStatus.NextRetryAt.HasValue && detailedStatus.State == PrinterState.Retrying)
         {
-            grid.AddRow("[grey]Next Retry:[/]", detailedStatus.NextRetryAt.Value.ToString("HH:mm:ss"));
+            details.Add(("Next Retry", detailedStatus.NextRetryAt.Value.ToString("HH:mm:ss")));
         }
 
-        AnsiConsole.Write(grid);
+        _ui.WriteGrid(details);
 
         // SSH Status
-        AnsiConsole.WriteLine();
-        AnsiConsole.Write(new Rule("[grey]SSH Status[/]"));
-        var sshGrid = new Grid().AddColumn().AddColumn();
-        sshGrid.AddRow("[grey]Connected:[/]", detailedStatus.SshStatus.Connected ? "[green]Yes[/]" : "[grey]No[/]");
-        sshGrid.AddRow("[grey]Credentials Retrieved:[/]", detailedStatus.SshStatus.CredentialsRetrieved ? "[green]Yes[/]" : "[grey]No[/]");
-        if (detailedStatus.SshStatus.Error != null)
+        _ui.WriteLine();
+        _ui.WriteRule("SSH Status");
+        _ui.WriteGrid(new[]
         {
-            sshGrid.AddRow("[grey]Error:[/]", $"[red]{detailedStatus.SshStatus.Error}[/]");
-        }
-        AnsiConsole.Write(sshGrid);
+            ("Connected", detailedStatus.SshStatus.Connected ? "[green]Yes[/]" : "[grey]No[/]"),
+            ("Credentials Retrieved", detailedStatus.SshStatus.CredentialsRetrieved ? "[green]Yes[/]" : "[grey]No[/]"),
+            ("Error", detailedStatus.SshStatus.Error ?? "-")
+        });
 
         // MQTT Status
-        AnsiConsole.WriteLine();
-        AnsiConsole.Write(new Rule("[grey]MQTT Status[/]"));
-        var mqttGrid = new Grid().AddColumn().AddColumn();
-        mqttGrid.AddRow("[grey]Connected:[/]", detailedStatus.MqttStatus.Connected ? "[green]Yes[/]" : "[grey]No[/]");
-        mqttGrid.AddRow("[grey]Model Code:[/]", detailedStatus.MqttStatus.DetectedModelCode ?? "[grey]Unknown[/]");
-        mqttGrid.AddRow("[grey]Camera Started:[/]", detailedStatus.MqttStatus.CameraStarted ? "[green]Yes[/]" : "[grey]No[/]");
-        AnsiConsole.Write(mqttGrid);
+        _ui.WriteLine();
+        _ui.WriteRule("MQTT Status");
+        _ui.WriteGrid(new[]
+        {
+            ("Connected", detailedStatus.MqttStatus.Connected ? "[green]Yes[/]" : "[grey]No[/]"),
+            ("Model Code", detailedStatus.MqttStatus.DetectedModelCode ?? "[grey]Unknown[/]"),
+            ("Camera Started", detailedStatus.MqttStatus.CameraStarted ? "[green]Yes[/]" : "[grey]No[/]")
+        });
 
         // Stream Status
-        AnsiConsole.WriteLine();
-        AnsiConsole.Write(new Rule("[grey]Stream Status[/]"));
-        var streamGrid = new Grid().AddColumn().AddColumn();
-        streamGrid.AddRow("[grey]Connected:[/]", detailedStatus.StreamStatus.Connected ? "[green]Yes[/]" : "[grey]No[/]");
+        _ui.WriteLine();
+        _ui.WriteRule("Stream Status");
+        var streamDetails = new List<(string, string)>
+        {
+            ("Connected", detailedStatus.StreamStatus.Connected ? "[green]Yes[/]" : "[grey]No[/]")
+        };
         if (detailedStatus.StreamStatus.Width > 0)
         {
-            streamGrid.AddRow("[grey]Resolution:[/]", $"{detailedStatus.StreamStatus.Width}x{detailedStatus.StreamStatus.Height}");
+            streamDetails.Add(("Resolution", $"{detailedStatus.StreamStatus.Width}x{detailedStatus.StreamStatus.Height}"));
         }
-        streamGrid.AddRow("[grey]Frames Decoded:[/]", detailedStatus.StreamStatus.FramesDecoded.ToString());
+        streamDetails.Add(("Frames Decoded", detailedStatus.StreamStatus.FramesDecoded.ToString()));
         if (detailedStatus.StreamStatus.DecoderStatus != null)
         {
-            streamGrid.AddRow("[grey]Decoder Status:[/]", detailedStatus.StreamStatus.DecoderStatus);
+            streamDetails.Add(("Decoder Status", detailedStatus.StreamStatus.DecoderStatus));
         }
-        AnsiConsole.Write(streamGrid);
+        _ui.WriteGrid(streamDetails);
+
+        // Encoding Settings
+        var (configSuccess, printerConfig, _) = await _ipcClient.GetPrinterConfigAsync(selected);
+        if (configSuccess && printerConfig != null)
+        {
+            _ui.WriteLine();
+            _ui.WriteRule("Encoding Settings");
+            _ui.WriteGrid(new[]
+            {
+                ("Max FPS", printerConfig.MaxFps.ToString()),
+                ("Idle FPS", printerConfig.IdleFps.ToString()),
+                ("JPEG Quality", printerConfig.JpegQuality.ToString())
+            });
+        }
 
         // URLs
-        AnsiConsole.WriteLine();
-        AnsiConsole.Write(new Rule("[grey]Stream URLs[/]"));
-        AnsiConsole.MarkupLine($"[grey]MJPEG Stream:[/] http://[server]:{detailedStatus.MjpegPort}/stream");
-        AnsiConsole.MarkupLine($"[grey]Snapshot:[/] http://[server]:{detailedStatus.MjpegPort}/snapshot");
-        AnsiConsole.MarkupLine($"[grey]Status:[/] http://[server]:{detailedStatus.MjpegPort}/status");
+        _ui.WriteLine();
+        _ui.WriteRule("Stream URLs");
+        _ui.WriteInfo($"MJPEG Stream: http://<server>:{detailedStatus.MjpegPort}/stream");
+        _ui.WriteInfo($"Snapshot: http://<server>:{detailedStatus.MjpegPort}/snapshot");
+        _ui.WriteInfo($"Status: http://<server>:{detailedStatus.MjpegPort}/status");
 
-        AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[grey]Press any key to return...[/]");
-        Console.ReadKey(true);
+        _ui.WriteLine();
+        _ui.WaitForKey("Press any key to return...");
     }
+
+    #region Input Validation Helpers
+
+    /// <summary>
+    /// Validates a printer name: non-empty, alphanumeric with dashes/underscores.
+    /// </summary>
+    private string? ValidatePrinterName(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "Printer name cannot be empty";
+        if (value.Length > 50)
+            return "Printer name too long (max 50 characters)";
+        if (!System.Text.RegularExpressions.Regex.IsMatch(value, @"^[a-zA-Z0-9_-]+$"))
+            return "Printer name can only contain letters, numbers, dashes and underscores";
+        return null; // Valid
+    }
+
+    /// <summary>
+    /// Validates an IP address.
+    /// </summary>
+    private string? ValidateIpAddress(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "IP address cannot be empty";
+        if (!System.Net.IPAddress.TryParse(value, out _))
+            return "Invalid IP address format";
+        return null; // Valid
+    }
+
+    /// <summary>
+    /// Validates a username: non-empty, reasonable characters.
+    /// </summary>
+    private string? ValidateUsername(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "Username cannot be empty";
+        if (value.Length > 32)
+            return "Username too long (max 32 characters)";
+        if (!System.Text.RegularExpressions.Regex.IsMatch(value, @"^[a-zA-Z0-9_.-]+$"))
+            return "Username contains invalid characters";
+        return null; // Valid
+    }
+
+    /// <summary>
+    /// Validates a TCP port (1-65535).
+    /// </summary>
+    private string? ValidatePort(int value)
+    {
+        if (value < 1 || value > 65535)
+            return "Port must be between 1 and 65535";
+        return null; // Valid
+    }
+
+    /// <summary>
+    /// Ask for a string with validation and retry.
+    /// </summary>
+    private string? AskValidatedString(string prompt, Func<string, string?> validator, string? defaultValue = null)
+    {
+        const int maxRetries = 5;
+        for (int i = 0; i < maxRetries; i++)
+        {
+            var value = defaultValue != null ? _ui.Ask(prompt, defaultValue) : _ui.Ask(prompt);
+
+            var error = validator(value);
+            if (error == null)
+                return value;
+
+            _ui.WriteError(error);
+            if (i < maxRetries - 1)
+                _ui.WriteWarning("Please try again.");
+        }
+
+        _ui.WriteError("Too many invalid attempts. Operation cancelled.");
+        return null;
+    }
+
+    /// <summary>
+    /// Ask for a validated TCP port.
+    /// </summary>
+    private int? AskValidatedPort(string prompt, int defaultValue)
+    {
+        const int maxRetries = 5;
+        for (int i = 0; i < maxRetries; i++)
+        {
+            var value = _ui.AskInt(prompt, defaultValue);
+
+            var error = ValidatePort(value);
+            if (error == null)
+                return value;
+
+            _ui.WriteError(error);
+            if (i < maxRetries - 1)
+                _ui.WriteWarning("Please try again.");
+        }
+
+        _ui.WriteError("Too many invalid attempts. Operation cancelled.");
+        return null;
+    }
+
+    /// <summary>
+    /// Ask for a port with retry if already in use.
+    /// </summary>
+    private Task<int?> AskPortWithRetryAsync(string prompt, int defaultValue, string printerName)
+    {
+        return AskPortWithRetryAsync(prompt, defaultValue, printerName, null);
+    }
+
+    /// <summary>
+    /// Ask for a port with retry if already in use.
+    /// When currentPort is provided, that port is considered valid (for modify operations).
+    /// </summary>
+    private async Task<int?> AskPortWithRetryAsync(string prompt, int defaultValue, string printerName, int? currentPort)
+    {
+        const int maxRetries = 5;
+        int currentDefault = defaultValue;
+
+        for (int i = 0; i < maxRetries; i++)
+        {
+            var value = _ui.AskInt(prompt, currentDefault);
+
+            // Validate port range
+            var portError = ValidatePort(value);
+            if (portError != null)
+            {
+                _ui.WriteError(portError);
+                continue;
+            }
+
+            // Check if port is in use by another printer via IPC
+            var (success, printers, _) = await _ipcClient!.ListPrintersAsync();
+            if (success && printers != null)
+            {
+                var conflict = printers.FirstOrDefault(p => p.MjpegPort == value && p.Name != printerName);
+                if (conflict != null)
+                {
+                    _ui.WriteError($"Port {value} is already in use by printer '{conflict.Name}'");
+                    _ui.WriteWarning("Please choose a different port.");
+                    currentDefault = value + 1; // Suggest next port
+                    continue;
+                }
+            }
+
+            // Check if port is available on the system
+            // Skip this check if the port is the current port (modify operation)
+            if (currentPort.HasValue && value == currentPort.Value)
+            {
+                // Port is already in use by this printer, no need to check system availability
+                return value;
+            }
+
+            if (!IsPortAvailable(value))
+            {
+                _ui.WriteError($"Port {value} is not available on the system (already bound by another application)");
+                _ui.WriteWarning("Please choose a different port.");
+                currentDefault = value + 1;
+                continue;
+            }
+
+            return value;
+        }
+
+        _ui.WriteError("Too many invalid attempts. Operation cancelled.");
+        return null;
+    }
+
+    /// <summary>
+    /// Ask for a printer name with retry if invalid or duplicate.
+    /// When originalName is provided, that name is excluded from duplicate check (for modify operations).
+    /// </summary>
+    private async Task<string?> AskPrinterNameWithRetryAsync(string prompt, string defaultValue, string? originalName = null)
+    {
+        const int maxRetries = 5;
+
+        for (int i = 0; i < maxRetries; i++)
+        {
+            var value = _ui.Ask(prompt, defaultValue);
+
+            // Validate name format
+            var nameError = ValidatePrinterName(value);
+            if (nameError != null)
+            {
+                _ui.WriteError(nameError);
+                if (i < maxRetries - 1)
+                    _ui.WriteWarning("Please try again.");
+                continue;
+            }
+
+            // Check if name is already used by another printer (unless it's the original name)
+            if (value != originalName)
+            {
+                var (success, printers, _) = await _ipcClient!.ListPrintersAsync();
+                if (success && printers != null)
+                {
+                    var conflict = printers.FirstOrDefault(p => p.Name.Equals(value, StringComparison.OrdinalIgnoreCase));
+                    if (conflict != null)
+                    {
+                        _ui.WriteError($"A printer named '{conflict.Name}' already exists");
+                        _ui.WriteWarning("Please choose a different name.");
+                        continue;
+                    }
+                }
+            }
+
+            return value;
+        }
+
+        _ui.WriteError("Too many invalid attempts. Operation cancelled.");
+        return null;
+    }
+
+    /// <summary>
+    /// Ask for an integer with min/max validation.
+    /// </summary>
+    private int AskValidatedInt(string prompt, int min, int max, int defaultValue)
+    {
+        const int maxRetries = 5;
+        for (int i = 0; i < maxRetries; i++)
+        {
+            var value = _ui.AskInt(prompt, defaultValue);
+
+            if (value >= min && value <= max)
+                return value;
+
+            _ui.WriteError($"Value must be between {min} and {max}");
+            if (i < maxRetries - 1)
+                _ui.WriteWarning("Please try again.");
+        }
+
+        _ui.WriteWarning($"Using default value: {defaultValue}");
+        return defaultValue;
+    }
+
+    /// <summary>
+    /// Check if a port is available on the system.
+    /// </summary>
+    private bool IsPortAvailable(int port)
+    {
+        try
+        {
+            using var socket = new System.Net.Sockets.Socket(
+                System.Net.Sockets.AddressFamily.InterNetwork,
+                System.Net.Sockets.SocketType.Stream,
+                System.Net.Sockets.ProtocolType.Tcp);
+            socket.Bind(new System.Net.IPEndPoint(System.Net.IPAddress.Any, port));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Run pre-flight connectivity check for a printer.
+    /// </summary>
+    private async Task<bool> RunPreflightCheckAsync(PrinterConfig config)
+    {
+        _ui.WriteInfo("Running pre-flight check...");
+        _ui.WriteLine();
+
+        var allPassed = true;
+
+        // Check 1: Ping
+        _ui.WriteInfo("  [1/4] Checking network connectivity...");
+        try
+        {
+            using var ping = new System.Net.NetworkInformation.Ping();
+            var reply = await ping.SendPingAsync(config.Ip, 3000);
+            if (reply.Status == System.Net.NetworkInformation.IPStatus.Success)
+            {
+                _ui.WriteSuccess($"    Ping OK ({reply.RoundtripTime}ms)");
+            }
+            else
+            {
+                _ui.WriteError($"    Ping failed: {reply.Status}");
+                allPassed = false;
+            }
+        }
+        catch (Exception ex)
+        {
+            _ui.WriteError($"    Ping failed: {ex.Message}");
+            allPassed = false;
+        }
+
+        // Check 2: SSH port
+        _ui.WriteInfo($"  [2/4] Checking SSH port ({config.SshPort})...");
+        if (await CheckTcpPortAsync(config.Ip, config.SshPort))
+        {
+            _ui.WriteSuccess("    SSH port is open");
+        }
+        else
+        {
+            _ui.WriteError("    SSH port is not reachable");
+            allPassed = false;
+        }
+
+        // Check 3: MQTT port
+        _ui.WriteInfo($"  [3/4] Checking MQTT port ({config.MqttPort})...");
+        if (await CheckTcpPortAsync(config.Ip, config.MqttPort))
+        {
+            _ui.WriteSuccess("    MQTT port is open");
+        }
+        else
+        {
+            _ui.WriteError("    MQTT port is not reachable");
+            allPassed = false;
+        }
+
+        // Check 4: HTTP stream port (18088)
+        _ui.WriteInfo("  [4/4] Checking camera stream port (18088)...");
+        if (await CheckTcpPortAsync(config.Ip, 18088))
+        {
+            _ui.WriteSuccess("    Camera stream port is open");
+        }
+        else
+        {
+            _ui.WriteWarning("    Camera stream port not reachable (camera may not be running yet)");
+            // Don't fail on this - camera might start after MQTT command
+        }
+
+        _ui.WriteLine();
+        if (allPassed)
+        {
+            _ui.WriteSuccess("Pre-flight check passed!");
+        }
+        else
+        {
+            _ui.WriteWarning("Pre-flight check had some failures.");
+        }
+
+        return allPassed;
+    }
+
+    /// <summary>
+    /// Check if a TCP port is reachable.
+    /// </summary>
+    private async Task<bool> CheckTcpPortAsync(string host, int port)
+    {
+        try
+        {
+            using var client = new System.Net.Sockets.TcpClient();
+            var connectTask = client.ConnectAsync(host, port);
+            var completed = await Task.WhenAny(connectTask, Task.Delay(3000));
+            return completed == connectTask && client.Connected;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    #endregion
 }

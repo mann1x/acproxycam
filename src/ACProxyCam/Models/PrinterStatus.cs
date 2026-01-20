@@ -14,6 +14,11 @@ public class PrinterStatus
     public int ConnectedClients { get; set; }
     public bool IsPaused { get; set; }
 
+    // Performance settings
+    public int CpuAffinity { get; set; } = -1;
+    public int CurrentFps { get; set; }  // Current target FPS (MaxFps or IdleFps based on clients)
+    public bool IsIdle { get; set; }     // True if running at IdleFps (no clients)
+
     // Detailed status
     public bool IsOnline { get; set; }
     public string? LastError { get; set; }

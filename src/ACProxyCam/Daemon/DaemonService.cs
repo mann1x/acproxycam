@@ -20,14 +20,16 @@ public class DaemonService
 
     public async Task RunAsync()
     {
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ACProxyCam daemon starting...");
+        // Initialize file logging
+        Logger.Initialize("/var/log/acproxycam");
+        Logger.Log("ACProxyCam daemon starting...");
 
         // Set up signal handlers for graceful shutdown
         SetupSignalHandlers();
 
         // Load configuration
         _config = await ConfigManager.LoadAsync();
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Configuration loaded: {_config.Printers.Count} printers");
+        Logger.Log($"Configuration loaded: {_config.Printers.Count} printers");
 
         // Initialize printer manager
         _printerManager = new PrinterManager(_config);
@@ -35,7 +37,7 @@ public class DaemonService
         // Start IPC server
         _ipcServer = new IpcServer(this, _printerManager);
         await _ipcServer.StartAsync();
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] IPC server started");
+        Logger.Log("IPC server started");
 
         // Start all configured printers
         await _printerManager.StartAllAsync();
@@ -43,7 +45,7 @@ public class DaemonService
         // Notify systemd we're ready (if running under systemd)
         NotifySystemdReady();
 
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Daemon ready");
+        Logger.Log("Daemon ready");
 
         // Main loop - wait for cancellation
         try
@@ -56,12 +58,13 @@ public class DaemonService
         }
 
         // Graceful shutdown
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Shutting down...");
+        Logger.Log("Shutting down...");
 
         await _printerManager.StopAllAsync();
         _ipcServer.Stop();
 
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Daemon stopped");
+        Logger.Log("Daemon stopped");
+        Logger.Shutdown();
     }
 
     public void Stop()
@@ -108,21 +111,21 @@ public class DaemonService
         // Handle SIGTERM (systemd stop)
         PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Received SIGTERM");
+            Logger.Log("Received SIGTERM");
             _cts.Cancel();
         });
 
         // Handle SIGINT (Ctrl+C)
         PosixSignalRegistration.Create(PosixSignal.SIGINT, context =>
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Received SIGINT");
+            Logger.Log("Received SIGINT");
             _cts.Cancel();
         });
 
         // Handle SIGHUP (reload config)
         PosixSignalRegistration.Create(PosixSignal.SIGHUP, context =>
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Received SIGHUP - reloading config");
+            Logger.Log("Received SIGHUP - reloading config");
             _ = ReloadConfigAsync();
         });
     }
@@ -137,7 +140,7 @@ public class DaemonService
             {
                 // This would need a proper implementation with Unix sockets
                 // For now, just log that we would notify
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Would notify systemd: READY=1");
+                Logger.Log("Would notify systemd: READY=1");
             }
             catch
             {
