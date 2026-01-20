@@ -9,7 +9,7 @@ Anycubic Camera Proxy for Linux - Converts FLV camera streams from Anycubic 3D p
 - Multi-printer support with individual MJPEG streams on separate ports
 - Auto-detection of printer model code and device ID via MQTT
 - Auto-retrieval of MQTT credentials from printer via SSH
-- **Stream recovery** - intercepts external stop commands (from slicers) and instantly restarts camera
+- **Stream recovery** - intercepts external stop commands (from slicers) and instantly restarts camera, with automatic SSH+LAN mode retry when MQTT fails
 - **Configurable FPS** - MaxFps for streaming, IdleFps for snapshots when no clients connected
 - **CPU affinity** - distributes printer threads across CPU cores for better performance
 - **Camera LED control** - toggle camera LED via HTTP API or management interface, with optional auto-control

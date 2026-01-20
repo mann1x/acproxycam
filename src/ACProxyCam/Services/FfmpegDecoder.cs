@@ -25,19 +25,43 @@ public unsafe class FfmpegDecoder : IDisposable
     private bool _isRunning;
     private bool _disposed;
 
+    // Stream health monitoring
+    private long _lastPts = long.MinValue;
+    private DateTime _lastFrameTime = DateTime.MinValue;
+    private int _staleFrameCount;
+    private const int StaleFrameThreshold = 30; // Consider stream stalled after 30 frames with same PTS
+
     public event EventHandler<FrameEventArgs>? FrameDecoded;
     public event EventHandler<string>? StatusChanged;
     public event EventHandler<Exception>? ErrorOccurred;
     public event EventHandler? DecodingStarted;
     public event EventHandler? DecodingStopped;
+    /// <summary>
+    /// Raised when stream is detected as stalled (no new frames or PTS not advancing).
+    /// </summary>
+    public event EventHandler? StreamStalled;
 
     public bool IsRunning => _isRunning;
     public int Width { get; private set; }
     public int Height { get; private set; }
     public int FramesDecoded { get; private set; }
 
+    /// <summary>
+    /// Current PTS (presentation timestamp) of the stream.
+    /// </summary>
+    public long CurrentPts => _lastPts;
+
+    /// <summary>
+    /// Time since last frame was decoded.
+    /// Returns MaxValue if no frames have ever been decoded (to trigger stall detection).
+    /// </summary>
+    public TimeSpan TimeSinceLastFrame =>
+        _lastFrameTime == DateTime.MinValue ? TimeSpan.MaxValue : DateTime.UtcNow - _lastFrameTime;
+
     private static bool _ffmpegInitialized;
     private static readonly object _initLock = new();
+    private static av_log_set_callback_callback? _logCallback;
+    private static bool _logCallbackSet;
 
     /// <summary>
     /// Initialize FFmpeg libraries.
@@ -82,6 +106,10 @@ public unsafe class FfmpegDecoder : IDisposable
                 var micro = version & 0xFF;
 
                 Console.WriteLine($"FFmpeg initialized: avcodec {major}.{minor}.{micro}");
+
+                // Set up log callback for throttled FFmpeg logging
+                SetupLogCallback();
+
                 _ffmpegInitialized = true;
             }
             catch (Exception ex)
@@ -97,6 +125,53 @@ public unsafe class FfmpegDecoder : IDisposable
     }
 
     /// <summary>
+    /// Set up FFmpeg log callback to capture and throttle log messages.
+    /// </summary>
+    private static void SetupLogCallback()
+    {
+        if (_logCallbackSet)
+            return;
+
+        // Set FFmpeg log level to only show errors (suppress info/warning spam)
+        ffmpeg.av_log_set_level(ffmpeg.AV_LOG_ERROR);
+
+        _logCallback = (p0, level, format, vl) =>
+        {
+            // Only process errors and below
+            if (level > ffmpeg.AV_LOG_ERROR)
+                return;
+
+            // Get the message from FFmpeg's format string
+            var lineSize = 1024;
+            var lineBuffer = stackalloc byte[lineSize];
+            var printPrefix = 1;
+            ffmpeg.av_log_format_line(p0, level, format, vl, lineBuffer, lineSize, &printPrefix);
+            var message = Marshal.PtrToStringAnsi((IntPtr)lineBuffer)?.Trim();
+
+            if (string.IsNullOrEmpty(message))
+                return;
+
+            // Use throttler to prevent log flooding
+            var throttledMessage = FfmpegLogThrottler.ThrottleMessage(message);
+            if (throttledMessage != null)
+            {
+                Console.WriteLine(throttledMessage);
+            }
+        };
+
+        ffmpeg.av_log_set_callback(_logCallback);
+        _logCallbackSet = true;
+    }
+
+    /// <summary>
+    /// Reset FFmpeg log throttling (e.g., when starting a new stream).
+    /// </summary>
+    public static void ResetLogThrottling()
+    {
+        FfmpegLogThrottler.ResetAll();
+    }
+
+    /// <summary>
     /// Start decoding the FLV stream.
     /// </summary>
     public void Start(string url)
@@ -105,6 +180,14 @@ public unsafe class FfmpegDecoder : IDisposable
             Stop();
 
         Initialize();
+
+        // Reset stream health state
+        _lastPts = long.MinValue;
+        _lastFrameTime = DateTime.MinValue;
+        _staleFrameCount = 0;
+
+        // Reset log throttling for fresh start
+        ResetLogThrottling();
 
         _cts = new CancellationTokenSource();
         _decodingThread = new Thread(() => DecodingLoop(url, _cts.Token))
@@ -316,6 +399,28 @@ public unsafe class FfmpegDecoder : IDisposable
                 break;
             if (ret < 0)
                 break;
+
+            // Track PTS for stream health monitoring
+            var pts = _frame->pts;
+            if (pts != ffmpeg.AV_NOPTS_VALUE)
+            {
+                if (pts == _lastPts)
+                {
+                    _staleFrameCount++;
+                    if (_staleFrameCount >= StaleFrameThreshold)
+                    {
+                        // Stream might be stalled - same PTS for too many frames
+                        StreamStalled?.Invoke(this, EventArgs.Empty);
+                        _staleFrameCount = 0; // Reset to avoid repeated events
+                    }
+                }
+                else
+                {
+                    _staleFrameCount = 0;
+                    _lastPts = pts;
+                }
+            }
+            _lastFrameTime = DateTime.UtcNow;
 
             // Convert to BGR24
             ffmpeg.sws_scale(_swsContext,

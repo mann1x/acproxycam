@@ -68,6 +68,16 @@ public class MqttCameraController : IAsyncDisposable
     // Response tracking for async queries
     private readonly ConcurrentDictionary<string, TaskCompletionSource<JsonDocument?>> _pendingResponses = new();
 
+    // State change tracking - only fire events when state actually changes
+    private string? _lastPrinterState;
+    private bool? _lastLedIsOn;
+    private int? _lastLedBrightness;
+    private readonly object _stateChangeLock = new();
+
+    // Debounce for camera stop detection
+    private DateTime _lastCameraStopTime = DateTime.MinValue;
+    private readonly TimeSpan _cameraStopDebounce = TimeSpan.FromSeconds(2);
+
     public MqttCameraController()
     {
         _mqttFactory = new MqttFactory();
@@ -240,6 +250,18 @@ public class MqttCameraController : IAsyncDisposable
 
                 if (action == "stopCapture")
                 {
+                    // Debounce to prevent duplicate stop events
+                    lock (_stateChangeLock)
+                    {
+                        var now = DateTime.UtcNow;
+                        if (now - _lastCameraStopTime < _cameraStopDebounce)
+                        {
+                            // Too soon after last stop - ignore duplicate
+                            return;
+                        }
+                        _lastCameraStopTime = now;
+                    }
+
                     StatusChanged?.Invoke(this, "Detected camera STOP command from external source!");
                     CameraStopDetected?.Invoke(this, EventArgs.Empty);
                 }
@@ -253,6 +275,7 @@ public class MqttCameraController : IAsyncDisposable
 
     /// <summary>
     /// Try to detect LED status from incoming MQTT messages.
+    /// Only fires event when status actually changes.
     /// </summary>
     private void TryDetectLedStatus(string topic, string payload)
     {
@@ -274,14 +297,27 @@ public class MqttCameraController : IAsyncDisposable
                 {
                     if (light.TryGetProperty("type", out var typeEl) && typeEl.GetInt32() == 2)
                     {
-                        var ledStatus = new LedStatus
+                        var isOn = light.TryGetProperty("status", out var statusEl) && statusEl.GetInt32() == 1;
+                        var brightness = light.TryGetProperty("brightness", out var brightnessEl) ? brightnessEl.GetInt32() : 0;
+
+                        // Only fire event if status actually changed
+                        lock (_stateChangeLock)
                         {
-                            Type = 2,
-                            IsOn = light.TryGetProperty("status", out var statusEl) && statusEl.GetInt32() == 1,
-                            Brightness = light.TryGetProperty("brightness", out var brightnessEl) ? brightnessEl.GetInt32() : 0
-                        };
-                        StatusChanged?.Invoke(this, $"LED status detected: {(ledStatus.IsOn ? "ON" : "OFF")}, brightness={ledStatus.Brightness}");
-                        LedStatusReceived?.Invoke(this, ledStatus);
+                            if (isOn != _lastLedIsOn || brightness != _lastLedBrightness)
+                            {
+                                _lastLedIsOn = isOn;
+                                _lastLedBrightness = brightness;
+
+                                var ledStatus = new LedStatus
+                                {
+                                    Type = 2,
+                                    IsOn = isOn,
+                                    Brightness = brightness
+                                };
+                                StatusChanged?.Invoke(this, $"LED status changed: {(ledStatus.IsOn ? "ON" : "OFF")}, brightness={ledStatus.Brightness}");
+                                LedStatusReceived?.Invoke(this, ledStatus);
+                            }
+                        }
                         return;
                     }
                 }
@@ -296,6 +332,7 @@ public class MqttCameraController : IAsyncDisposable
     /// <summary>
     /// Try to detect printer state from MQTT message payload.
     /// State comes in messages with {"data": {"state": "free|printing|paused|..."}}
+    /// Only fires event when state actually changes.
     /// </summary>
     private void TryDetectPrinterState(string topic, string payload)
     {
@@ -316,8 +353,17 @@ public class MqttCameraController : IAsyncDisposable
                 var state = stateEl.GetString();
                 if (!string.IsNullOrEmpty(state))
                 {
-                    StatusChanged?.Invoke(this, $"Printer state detected: {state}");
-                    PrinterStateReceived?.Invoke(this, state);
+                    // Only fire event if state actually changed
+                    lock (_stateChangeLock)
+                    {
+                        if (state != _lastPrinterState)
+                        {
+                            var oldState = _lastPrinterState ?? "unknown";
+                            _lastPrinterState = state;
+                            StatusChanged?.Invoke(this, $"Printer state changed: {oldState} → {state}");
+                            PrinterStateReceived?.Invoke(this, state);
+                        }
+                    }
                 }
             }
         }

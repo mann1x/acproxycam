@@ -49,6 +49,17 @@ public class PrinterThread : IDisposable
     private DateTime? _ledOnIdleSince;
     private readonly object _ledStateLock = new();
 
+    // Log throttling
+    private readonly LogThrottler _logThrottler;
+
+    // Stream recovery settings
+    private const int StreamRecoveryDelayMs = 2000;      // 2 seconds between recovery attempts
+    private const int QuickRecoveryPeriodMinutes = 5;    // First 5 minutes: quick retry
+    private const int StreamStabilizationSeconds = 3;    // Wait 3 seconds before considering stream stable
+    private DateTime _streamFailedAt = DateTime.MinValue; // When the stream first failed
+    private DateTime _streamStartedAt = DateTime.MinValue; // When the stream started (for stabilization)
+    private volatile bool _streamStalled;                 // Flag for stream stall detection
+
     // Watchdog settings
     private const int RetryDelayResponsive = 5;   // 5 seconds if host responds
     private const int RetryDelayOffline = 30;     // 30 seconds if host is offline
@@ -63,6 +74,12 @@ public class PrinterThread : IDisposable
     {
         Config = config;
         _listenInterfaces = listenInterfaces;
+        _logThrottler = new LogThrottler(msg =>
+        {
+            var timestamp = DateTime.Now.ToString("HH:mm:ss");
+            Console.WriteLine($"[{timestamp}] [{Config.Name}] {msg}");
+            StatusChanged?.Invoke(this, msg);
+        });
     }
 
     /// <summary>
@@ -354,7 +371,9 @@ public class PrinterThread : IDisposable
                 var retryDelay = TimeSpan.FromSeconds(isResponding ? RetryDelayResponsive : RetryDelayOffline);
                 _nextRetryAt = DateTime.UtcNow + retryDelay;
 
-                LogStatus($"Error: {ex.Message}. Retrying in {retryDelay.TotalSeconds}s");
+                // Use throttled logging for repetitive connection errors
+                var errorKey = $"connection_error:{ex.Message.GetHashCode()}";
+                _logThrottler.Log(errorKey, $"Error: {ex.Message}. Retrying in {retryDelay.TotalSeconds}s");
 
                 try
                 {
@@ -380,7 +399,7 @@ public class PrinterThread : IDisposable
         LogStatus("Retrieving credentials via SSH...");
 
         _sshService = new SshCredentialService();
-        _sshService.StatusChanged += (s, msg) => LogStatus($"SSH: {msg}");
+        _sshService.StatusChanged += (s, msg) => LogStatusThrottled("ssh_status", $"SSH: {msg}");
 
         var result = await _sshService.RetrieveCredentialsAsync(
             Config.Ip,
@@ -419,8 +438,8 @@ public class PrinterThread : IDisposable
         LogStatus("Connecting to MQTT broker...");
 
         _mqttController = new MqttCameraController();
-        _mqttController.StatusChanged += (s, msg) => LogStatus($"MQTT: {msg}");
-        _mqttController.ErrorOccurred += (s, ex) => LogStatus($"MQTT Error: {ex.Message}");
+        _mqttController.StatusChanged += (s, msg) => LogStatusThrottled("mqtt_status", $"MQTT: {msg}");
+        _mqttController.ErrorOccurred += (s, ex) => LogStatusThrottled("mqtt_error", $"MQTT Error: {ex.Message}");
         _mqttController.ModelCodeDetected += (s, code) =>
         {
             Config.ModelCode = code;
@@ -520,7 +539,7 @@ public class PrinterThread : IDisposable
     private async Task TryEnableLanModeAsync(CancellationToken ct)
     {
         _lanModeService = new LanModeService();
-        _lanModeService.StatusChanged += (s, msg) => LogStatus($"LAN Mode: {msg}");
+        _lanModeService.StatusChanged += (s, msg) => LogStatusThrottled("lan_mode", $"LAN Mode: {msg}");
 
         var result = await _lanModeService.EnableLanModeAsync(
             Config.Ip,
@@ -581,16 +600,19 @@ public class PrinterThread : IDisposable
     {
         _streamStatus.Connected = false;
         _streamStatus.FramesDecoded = 0;
+        _streamStalled = false;
+        _streamFailedAt = DateTime.MinValue;
+        _streamStartedAt = DateTime.MinValue;
 
         LogStatus("Starting FFmpeg decoder...");
 
         _decoder = new FfmpegDecoder();
         _decoder.StatusChanged += (s, msg) =>
         {
-            LogStatus($"Decoder: {msg}");
+            LogStatusThrottled("decoder_status", $"Decoder: {msg}");
             _streamStatus.DecoderStatus = msg;
         };
-        _decoder.ErrorOccurred += (s, ex) => LogStatus($"Decoder Error: {ex.Message}");
+        _decoder.ErrorOccurred += (s, ex) => LogStatusThrottled("decoder_error", $"Decoder Error: {ex.Message}");
         _decoder.FrameDecoded += (s, args) =>
         {
             _streamStatus.FramesDecoded++;
@@ -605,12 +627,20 @@ public class PrinterThread : IDisposable
             _streamStatus.Height = _decoder.Height;
             _state = PrinterState.Running;
             _lastSeenOnline = DateTime.UtcNow;
+            _streamStartedAt = DateTime.UtcNow; // Track when stream started for stabilization
+            _streamStalled = false;
             LogStatus($"Stream running: {_decoder.Width}x{_decoder.Height}");
         };
         _decoder.DecodingStopped += (s, e) =>
         {
             _streamStatus.Connected = false;
+            _streamStartedAt = DateTime.MinValue; // Reset stabilization tracking
             LogStatus("Stream stopped");
+        };
+        _decoder.StreamStalled += (s, e) =>
+        {
+            _streamStalled = true;
+            LogStatus("Stream stalled (PTS not advancing)");
         };
 
         // Register callback for snapshot requests when no frame available
@@ -625,23 +655,58 @@ public class PrinterThread : IDisposable
 
         _decoder.Start(streamUrl);
 
-        // Wait for cancellation or decoder to stop, with quick recovery on stream failure
-        int quickRetryCount = 0;
-        const int maxQuickRetries = 3;
-
         // LED auto-control: poll interval (every 30 seconds)
         var lastLedAutoControlCheck = DateTime.MinValue;
         const int ledAutoControlIntervalSeconds = 30;
         var initialLedQueryDone = false;
 
+        // Initial connection grace period - give decoder time to connect before checking health
+        const int InitialConnectionGraceSeconds = 5;
+        var decoderStartTime = DateTime.UtcNow;
+
         try
         {
             while (!ct.IsCancellationRequested && !_isPaused)
             {
-                if (_decoder.IsRunning)
+                // Check if we're still in initial connection grace period
+                var timeSinceDecoderStart = (DateTime.UtcNow - decoderStartTime).TotalSeconds;
+                var inInitialGracePeriod = timeSinceDecoderStart < InitialConnectionGraceSeconds;
+
+                // Check if stream is healthy (running, not stalled, and stabilized)
+                var streamRunning = _decoder.IsRunning && !_streamStalled;
+                var streamStabilized = _streamStartedAt != DateTime.MinValue &&
+                                       (DateTime.UtcNow - _streamStartedAt).TotalSeconds >= StreamStabilizationSeconds;
+                var streamHealthy = streamRunning && streamStabilized;
+
+                // Check if decoder is stuck (no frames received for too long)
+                // This catches: 1) decoder stuck connecting, 2) decoder running but no frames
+                var noFramesTimeout = _decoder.TimeSinceLastFrame.TotalSeconds > 10;
+                if (noFramesTimeout && timeSinceDecoderStart > 10)
                 {
+                    // Decoder has been running for >10s but no frames - it's stuck
+                    streamHealthy = false;
+                    _streamStalled = true;
+                    inInitialGracePeriod = false; // Override grace period - we've waited long enough
+                }
+
+                // During initial grace period or stabilization, just wait (unless stuck)
+                if (inInitialGracePeriod || (streamRunning && !streamStabilized && !_streamStalled))
+                {
+                    await Task.Delay(500, ct);
+                    continue;
+                }
+
+                if (streamHealthy)
+                {
+                    // Stream is stable - reset failure tracking and log throttling
+                    if (_streamFailedAt != DateTime.MinValue)
+                    {
+                        ResetLogThrottling(); // Reset throttling on successful recovery
+                        _streamFailedAt = DateTime.MinValue;
+                    }
                     _lastSeenOnline = DateTime.UtcNow;
-                    quickRetryCount = 0; // Reset on successful streaming
+                    _streamFailedAt = DateTime.MinValue; // Reset failure tracking
+                    _streamStalled = false;
 
                     // Query LED status once on startup
                     if (!initialLedQueryDone)
@@ -668,34 +733,51 @@ public class PrinterThread : IDisposable
                 }
                 else
                 {
-                    // Stream stopped - try quick recovery via MQTT restart
-                    if (quickRetryCount < maxQuickRetries)
+                    // Stream failed or stalled - implement recovery logic
+                    if (_streamFailedAt == DateTime.MinValue)
                     {
-                        quickRetryCount++;
-                        LogStatus($"Stream stopped, attempting quick recovery ({quickRetryCount}/{maxQuickRetries})...");
-
-                        if (await TryQuickCameraRestartAsync(ct))
-                        {
-                            // Wait a moment for camera to start
-                            await Task.Delay(2000, ct);
-
-                            // Restart decoder
-                            _decoder.Stop();
-                            _decoder.Start(streamUrl);
-
-                            // Wait for decoder to connect
-                            await Task.Delay(3000, ct);
-
-                            if (_decoder.IsRunning)
-                            {
-                                LogStatus("Quick recovery successful");
-                                continue;
-                            }
-                        }
+                        _streamFailedAt = DateTime.UtcNow;
                     }
 
-                    // Quick recovery failed - throw to trigger full retry
-                    throw new Exception("Stream disconnected and quick recovery failed");
+                    var failureDuration = DateTime.UtcNow - _streamFailedAt;
+                    var inQuickRecoveryPeriod = failureDuration.TotalMinutes < QuickRecoveryPeriodMinutes;
+
+                    if (inQuickRecoveryPeriod)
+                    {
+                        // First 5 minutes: quick 2-second retry (with throttled logging)
+                        LogStatusThrottled("stream_recovery",
+                            $"Stream recovery in progress ({failureDuration.TotalSeconds:F0}s)...");
+
+                        var recoveryStarted = await TryStreamRecoveryAsync(streamUrl, ct);
+                        if (recoveryStarted)
+                        {
+                            decoderStartTime = DateTime.UtcNow; // Reset grace period only if decoder was restarted
+                        }
+                        await Task.Delay(StreamRecoveryDelayMs, ct);
+                    }
+                    else
+                    {
+                        // After 5 minutes: check if printer is available
+                        var printerAvailable = await IsPrinterAvailableAsync(ct);
+
+                        if (printerAvailable)
+                        {
+                            // Printer is available - continue retry with SSH+LAN mode
+                            LogStatusThrottled("stream_recovery",
+                                $"Recovery: printer available, retrying ({failureDuration.TotalMinutes:F1}min)...");
+                            var recoveryStarted = await TryStreamRecoveryAsync(streamUrl, ct);
+                            if (recoveryStarted)
+                            {
+                                decoderStartTime = DateTime.UtcNow; // Reset grace period only if decoder was restarted
+                            }
+                            await Task.Delay(StreamRecoveryDelayMs, ct);
+                        }
+                        else
+                        {
+                            // Printer not available - trigger full restart
+                            throw new Exception($"Stream failed and printer not available after {failureDuration.TotalMinutes:F1} minutes");
+                        }
+                    }
                 }
             }
         }
@@ -705,8 +787,60 @@ public class PrinterThread : IDisposable
             {
                 _mjpegServer.SnapshotRequested -= OnSnapshotRequested;
             }
-            _decoder.Stop();
+            if (_decoder != null)
+            {
+                _decoder.StreamStalled -= (s, e) => _streamStalled = true;
+            }
+            _decoder?.Stop();
         }
+    }
+
+    /// <summary>
+    /// Try to recover the stream by restarting camera and decoder.
+    /// Returns true if recovery was attempted (MQTT succeeded), false if MQTT failed.
+    /// </summary>
+    private async Task<bool> TryStreamRecoveryAsync(string streamUrl, CancellationToken ct)
+    {
+        _streamStalled = false;
+
+        // Try to restart camera via MQTT (includes SSH+LAN mode retry if enabled)
+        if (!await TryQuickCameraRestartAsync(ct))
+        {
+            // MQTT failed - don't start decoder, stream won't be available
+            // Logging is handled by TryQuickCameraRestartAsync
+            return false;
+        }
+
+        // MQTT succeeded, wait a moment for camera to start
+        await Task.Delay(500, ct);
+
+        // Restart decoder
+        _decoder?.Stop();
+        _decoder?.Start(streamUrl);
+
+        // Give decoder a moment to connect
+        await Task.Delay(1500, ct);
+        return true;
+    }
+
+    /// <summary>
+    /// Check if printer is available via MQTT and SSH.
+    /// </summary>
+    private async Task<bool> IsPrinterAvailableAsync(CancellationToken ct)
+    {
+        // Check 1: Is MQTT connected?
+        if (_mqttController != null && _mqttController.IsConnected)
+        {
+            return true;
+        }
+
+        // Check 2: Can we reach the printer via TCP (SSH port)?
+        if (await IsHostRespondingAsync())
+        {
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -778,25 +912,26 @@ public class PrinterThread : IDisposable
         if (_state != PrinterState.Running || _streamStatus.Connected)
             return; // Camera is either not ready or already streaming
 
-        LogStatus("Snapshot requested, attempting to restart camera...");
+        LogStatusThrottled("snapshot_restart", "Snapshot requested, attempting to restart camera...");
         try
         {
             await TryQuickCameraRestartAsync(CancellationToken.None);
         }
         catch (Exception ex)
         {
-            LogStatus($"Failed to restart camera for snapshot: {ex.Message}");
+            LogStatusThrottled("snapshot_restart_error", $"Failed to restart camera for snapshot: {ex.Message}");
         }
     }
 
     /// <summary>
     /// Try to quickly restart the camera via MQTT using existing connection.
+    /// When MQTT fails and AutoLanMode is enabled, tries SSH+LAN mode like initial connection.
     /// </summary>
     private async Task<bool> TryQuickCameraRestartAsync(CancellationToken ct)
     {
         if (string.IsNullOrEmpty(Config.DeviceId) || string.IsNullOrEmpty(Config.ModelCode))
         {
-            LogStatus("Quick restart: Missing device ID or model code");
+            LogStatusThrottled("quick_restart", "Quick restart: Missing device ID or model code");
             return false;
         }
 
@@ -805,12 +940,11 @@ public class PrinterThread : IDisposable
             // Use existing MQTT controller if connected
             if (_mqttController != null && _mqttController.IsConnected)
             {
-                LogStatus("Quick restart: Sending camera start command via existing MQTT connection...");
                 var started = await _mqttController.TryStartCameraAsync(Config.DeviceId, Config.ModelCode, ct);
 
                 if (started)
                 {
-                    LogStatus("Quick restart: Camera start command sent");
+                    LogStatus("Camera start command sent via MQTT");
                     _mqttStatus.CameraStarted = true;
                     return true;
                 }
@@ -818,11 +952,9 @@ public class PrinterThread : IDisposable
             else
             {
                 // MQTT disconnected - try to reconnect
-                LogStatus("Quick restart: MQTT disconnected, reconnecting...");
-
                 if (string.IsNullOrEmpty(Config.MqttUsername) || string.IsNullOrEmpty(Config.MqttPassword))
                 {
-                    LogStatus("Quick restart: No MQTT credentials available");
+                    LogStatusThrottled("quick_restart", "Recovery: No MQTT credentials available");
                     return false;
                 }
 
@@ -830,31 +962,63 @@ public class PrinterThread : IDisposable
                 {
                     _mqttController = new MqttCameraController();
                     _mqttController.MqttPort = Config.MqttPort;
-                    _mqttController.StatusChanged += (s, msg) => LogStatus($"MQTT: {msg}");
-                    _mqttController.ErrorOccurred += (s, ex) => LogStatus($"MQTT Error: {ex.Message}");
+                    // Use strongly throttled logging for MQTT during recovery
+                    _mqttController.StatusChanged += (s, msg) => { }; // Suppress during recovery
+                    _mqttController.ErrorOccurred += (s, ex) => { }; // Suppress during recovery
                     _mqttController.CameraStopDetected += OnExternalCameraStopDetected;
                     _mqttController.LedStatusReceived += OnLedStatusReceived;
                     _mqttController.PrinterStateReceived += OnPrinterStateReceived;
                 }
 
-                await _mqttController.ConnectAsync(Config.Ip, Config.MqttUsername, Config.MqttPassword, ct);
-                await _mqttController.SubscribeToAllAsync(ct); // Subscribe to detect stop commands
-                _mqttStatus.Connected = true;
-
-                LogStatus("Quick restart: Sending camera start command...");
-                var started = await _mqttController.TryStartCameraAsync(Config.DeviceId, Config.ModelCode, ct);
-
-                if (started)
+                // Try MQTT reconnection
+                try
                 {
-                    LogStatus("Quick restart: Camera start command sent");
-                    _mqttStatus.CameraStarted = true;
-                    return true;
+                    await _mqttController.ConnectAsync(Config.Ip, Config.MqttUsername, Config.MqttPassword, ct);
+                    await _mqttController.SubscribeToAllAsync(ct);
+                    _mqttStatus.Connected = true;
+
+                    var started = await _mqttController.TryStartCameraAsync(Config.DeviceId, Config.ModelCode, ct);
+                    if (started)
+                    {
+                        LogStatus("Camera restarted via MQTT reconnection");
+                        _mqttStatus.CameraStarted = true;
+                        ResetLogThrottling(); // Connection succeeded, reset throttling
+                        return true;
+                    }
+                }
+                catch when (Config.AutoLanMode)
+                {
+                    // MQTT failed - try SSH+LAN mode like initial connection
+                    LogStatusThrottled("quick_restart", "Recovery: MQTT failed, trying SSH+LAN mode...");
+
+                    try
+                    {
+                        await TryEnableLanModeAsync(ct);
+
+                        // Retry MQTT after enabling LAN mode
+                        await _mqttController.ConnectAsync(Config.Ip, Config.MqttUsername, Config.MqttPassword, ct);
+                        await _mqttController.SubscribeToAllAsync(ct);
+                        _mqttStatus.Connected = true;
+
+                        var started = await _mqttController.TryStartCameraAsync(Config.DeviceId, Config.ModelCode, ct);
+                        if (started)
+                        {
+                            LogStatus("Camera restarted after enabling LAN mode");
+                            _mqttStatus.CameraStarted = true;
+                            ResetLogThrottling();
+                            return true;
+                        }
+                    }
+                    catch (Exception lanEx)
+                    {
+                        LogStatusThrottled("quick_restart", $"Recovery: LAN mode failed - {lanEx.Message}");
+                    }
                 }
             }
         }
         catch (Exception ex)
         {
-            LogStatus($"Quick restart failed: {ex.Message}");
+            LogStatusThrottled("quick_restart", $"Recovery failed: {ex.Message}");
             _mqttStatus.Connected = false;
         }
 
@@ -1024,6 +1188,22 @@ public class PrinterThread : IDisposable
         var timestamp = DateTime.Now.ToString("HH:mm:ss");
         Console.WriteLine($"[{timestamp}] [{Config.Name}] {message}");
         StatusChanged?.Invoke(this, message);
+    }
+
+    /// <summary>
+    /// Log a status message with throttling for repetitive messages.
+    /// </summary>
+    private void LogStatusThrottled(string key, string message)
+    {
+        _logThrottler.Log(key, message);
+    }
+
+    /// <summary>
+    /// Reset log throttling (e.g., when connection succeeds).
+    /// </summary>
+    private void ResetLogThrottling()
+    {
+        _logThrottler.ResetAll();
     }
 
     public void Dispose()
