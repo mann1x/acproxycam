@@ -76,6 +76,7 @@ public static class ConfigManager
                 MqttPassword = EncryptIfNeeded(p.MqttPassword),
                 DeviceId = p.DeviceId,
                 ModelCode = p.ModelCode,
+                DeviceType = p.DeviceType,
                 MaxFps = p.MaxFps,
                 IdleFps = p.IdleFps,
                 JpegQuality = p.JpegQuality,

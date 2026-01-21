@@ -10,6 +10,7 @@ public class PrinterStatus
     public string Name { get; set; } = "";
     public string Ip { get; set; } = "";
     public int MjpegPort { get; set; }
+    public string DeviceType { get; set; } = "";
     public PrinterState State { get; set; } = PrinterState.Stopped;
     public int ConnectedClients { get; set; }
     public bool IsPaused { get; set; }
@@ -22,6 +23,7 @@ public class PrinterStatus
     // Detailed status
     public bool IsOnline { get; set; }
     public string? LastError { get; set; }
+    public DateTime? LastErrorAt { get; set; }
     public DateTime? LastSeenOnline { get; set; }
     public DateTime? NextRetryAt { get; set; }
 

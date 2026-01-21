@@ -65,6 +65,12 @@ public class PrinterConfig
     public string ModelCode { get; set; } = "";
 
     /// <summary>
+    /// Printer device type (e.g., "K3", "KS1", "K3M"). Retrieved from printer's api.cfg.
+    /// </summary>
+    [JsonPropertyName("deviceType")]
+    public string DeviceType { get; set; } = "";
+
+    /// <summary>
     /// Maximum frames per second when clients are connected. Default: 0 (unlimited, use source FPS).
     /// </summary>
     [JsonPropertyName("maxFps")]

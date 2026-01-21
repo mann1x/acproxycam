@@ -55,6 +55,7 @@ public class PrinterManager
 
         foreach (var printer in toStop)
         {
+            printer.ConfigChanged -= OnPrinterConfigChanged;
             await printer.StopAsync();
             printer.Dispose();
         }
@@ -84,12 +85,43 @@ public class PrinterManager
             thread.SetCpuAffinity(cpuAffinity);
         }
 
+        // Subscribe to config changes (device type detected, etc.)
+        thread.ConfigChanged += OnPrinterConfigChanged;
+
         lock (_lock)
         {
             _printers[config.Name] = thread;
         }
 
         await thread.StartAsync();
+    }
+
+    /// <summary>
+    /// Called when a printer thread detects config changes (e.g., device type).
+    /// Persists the updated config to disk.
+    /// </summary>
+    private async void OnPrinterConfigChanged(object? sender, EventArgs e)
+    {
+        if (sender is PrinterThread thread)
+        {
+            // Update the config in our list
+            var existingIndex = _config.Printers.FindIndex(p => p.Name == thread.Config.Name);
+            if (existingIndex >= 0)
+            {
+                _config.Printers[existingIndex] = thread.Config;
+            }
+
+            // Save to disk
+            try
+            {
+                await ConfigManager.SaveAsync(_config);
+                Console.WriteLine($"[PrinterManager] Config saved (device type updated for {thread.Config.Name}: {thread.Config.DeviceType})");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[PrinterManager] Failed to save config: {ex.Message}");
+            }
+        }
     }
 
     public List<PrinterStatus> GetAllStatus()
@@ -208,6 +240,7 @@ public class PrinterManager
         // Stop the thread if running
         if (thread != null)
         {
+            thread.ConfigChanged -= OnPrinterConfigChanged;
             await thread.StopAsync();
             thread.Dispose();
 
@@ -295,6 +328,7 @@ public class PrinterManager
         // Stop existing thread
         if (existingThread != null)
         {
+            existingThread.ConfigChanged -= OnPrinterConfigChanged;
             await existingThread.StopAsync();
             existingThread.Dispose();
 

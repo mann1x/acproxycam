@@ -24,6 +24,7 @@ public class PrinterThread : IDisposable
     private volatile PrinterState _state = PrinterState.Stopped;
     private volatile bool _isPaused;
     private string? _lastError;
+    private DateTime? _lastErrorAt;
     private DateTime? _lastSeenOnline;
     private DateTime? _nextRetryAt;
 
@@ -69,6 +70,12 @@ public class PrinterThread : IDisposable
     private const string FlvUrlTemplate = "http://{0}:18088/flv";
 
     public event EventHandler<string>? StatusChanged;
+
+    /// <summary>
+    /// Raised when the printer configuration has changed (e.g., device type detected).
+    /// Handler should persist the updated config.
+    /// </summary>
+    public event EventHandler? ConfigChanged;
 
     public PrinterThread(PrinterConfig config, List<string> listenInterfaces)
     {
@@ -184,6 +191,7 @@ public class PrinterThread : IDisposable
                 Name = Config.Name,
                 Ip = Config.Ip,
                 MjpegPort = Config.MjpegPort,
+                DeviceType = Config.DeviceType,
                 State = _state,
                 ConnectedClients = _mjpegServer?.ConnectedClients ?? 0,
                 IsPaused = _isPaused,
@@ -192,6 +200,7 @@ public class PrinterThread : IDisposable
                 IsIdle = (_mjpegServer?.ConnectedClients ?? 0) == 0,
                 IsOnline = _state == PrinterState.Running,
                 LastError = _lastError,
+                LastErrorAt = _lastErrorAt,
                 LastSeenOnline = _lastSeenOnline,
                 NextRetryAt = _nextRetryAt,
                 SshStatus = _sshStatus,
@@ -341,10 +350,34 @@ public class PrinterThread : IDisposable
                 // Only log on first attempt or after success - throttling handles repetitive failures
                 LogStatusThrottled("connection", $"Connecting to {Config.Ip}...");
 
-                // Step 1: Check if we need SSH credentials
-                if (string.IsNullOrEmpty(Config.MqttUsername) || string.IsNullOrEmpty(Config.MqttPassword))
+                // Step 1: Check deviceId and credentials
+                // Always verify deviceId on first connection - if it changed, printer was swapped or factory reset
+                var needFullRetrieval = string.IsNullOrEmpty(Config.MqttUsername) || string.IsNullOrEmpty(Config.MqttPassword);
+
+                if (!needFullRetrieval)
+                {
+                    // Check if printer's deviceId matches our config
+                    var printerChanged = await CheckPrinterChangedAsync(ct);
+                    if (printerChanged)
+                    {
+                        LogStatus("Printer deviceId changed - re-discovering credentials and device info");
+                        // Clear old credentials since they belong to a different printer
+                        Config.MqttUsername = "";
+                        Config.MqttPassword = "";
+                        Config.DeviceType = "";
+                        Config.ModelCode = "";
+                        needFullRetrieval = true;
+                    }
+                }
+
+                if (needFullRetrieval)
                 {
                     await RetrieveSshCredentialsAsync(ct);
+                }
+                else if (string.IsNullOrEmpty(Config.DeviceType) || string.IsNullOrEmpty(Config.ModelCode))
+                {
+                    // Credentials exist and deviceId matches, but device info missing - fetch it
+                    await RefreshPrinterInfoAsync(ct);
                 }
 
                 // Step 2: MQTT - Connect and detect model code if needed
@@ -363,6 +396,7 @@ public class PrinterThread : IDisposable
             catch (Exception ex)
             {
                 _lastError = ex.Message;
+                _lastErrorAt = DateTime.UtcNow;
                 _state = PrinterState.Retrying;
 
                 await CleanupServicesAsync();
@@ -425,7 +459,106 @@ public class PrinterThread : IDisposable
         if (!string.IsNullOrEmpty(result.DeviceId))
             Config.DeviceId = result.DeviceId;
 
-        LogStatus($"SSH: Credentials retrieved. DeviceId: {Config.DeviceId ?? "unknown"}");
+        if (!string.IsNullOrEmpty(result.DeviceType))
+            Config.DeviceType = result.DeviceType;
+
+        if (!string.IsNullOrEmpty(result.ModelCode))
+            Config.ModelCode = result.ModelCode;
+
+        LogStatus($"SSH: Credentials retrieved. DeviceId: {Config.DeviceId ?? "unknown"}, DeviceType: {Config.DeviceType ?? "unknown"}, ModelCode: {Config.ModelCode ?? "unknown"}");
+
+        // Notify that config has changed (for persistence)
+        ConfigChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// Check if the printer's deviceId has changed (different printer or factory reset).
+    /// Returns true if the deviceId is different from our saved config.
+    /// </summary>
+    private async Task<bool> CheckPrinterChangedAsync(CancellationToken ct)
+    {
+        try
+        {
+            _sshService = new SshCredentialService();
+            _sshService.StatusChanged += (s, msg) => LogStatusThrottled("ssh_status", $"SSH: {msg}");
+
+            var printerInfo = await _sshService.RetrievePrinterInfoAsync(
+                Config.Ip,
+                Config.SshPort,
+                Config.SshUser,
+                Config.SshPassword,
+                ct);
+
+            if (printerInfo == null || string.IsNullOrEmpty(printerInfo.DeviceId))
+            {
+                // Couldn't get deviceId - assume no change
+                return false;
+            }
+
+            // If we don't have a saved deviceId, it's not a "change" - just a first-time discovery
+            if (string.IsNullOrEmpty(Config.DeviceId))
+            {
+                return false;
+            }
+
+            // Compare deviceIds
+            return printerInfo.DeviceId != Config.DeviceId;
+        }
+        catch (Exception ex)
+        {
+            LogStatusThrottled("deviceid_check", $"Could not check printer deviceId: {ex.Message}");
+            return false; // Assume no change on error
+        }
+    }
+
+    /// <summary>
+    /// Refresh printer info (device type, model code) from printer via SSH.
+    /// Used when credentials already exist but device info might be missing.
+    /// </summary>
+    private async Task RefreshPrinterInfoAsync(CancellationToken ct)
+    {
+        try
+        {
+            _sshService = new SshCredentialService();
+            _sshService.StatusChanged += (s, msg) => LogStatusThrottled("ssh_status", $"SSH: {msg}");
+
+            var printerInfo = await _sshService.RetrievePrinterInfoAsync(
+                Config.Ip,
+                Config.SshPort,
+                Config.SshUser,
+                Config.SshPassword,
+                ct);
+
+            if (printerInfo == null)
+                return;
+
+            var configUpdated = false;
+
+            if (!string.IsNullOrEmpty(printerInfo.DeviceType))
+            {
+                Config.DeviceType = printerInfo.DeviceType;
+                LogStatus($"Device type: {printerInfo.DeviceType}");
+                configUpdated = true;
+            }
+
+            if (!string.IsNullOrEmpty(printerInfo.ModelCode))
+            {
+                Config.ModelCode = printerInfo.ModelCode;
+                LogStatus($"Model code: {printerInfo.ModelCode}");
+                configUpdated = true;
+            }
+
+            // Persist device info if updated
+            if (configUpdated)
+            {
+                ConfigChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Don't fail connection if printer info refresh fails
+            LogStatusThrottled("printer_info", $"Could not refresh printer info: {ex.Message}");
+        }
     }
 
     private async Task ConnectMqttAndStartCameraAsync(CancellationToken ct)

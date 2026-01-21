@@ -933,6 +933,7 @@ WantedBy=multi-user.target
                 .BorderColor(Color.Blue)
                 .Title("[bold blue]Printers[/]")
                 .AddColumn(new TableColumn("[bold]Name[/]"))
+                .AddColumn(new TableColumn("[bold]Type[/]").Centered())
                 .AddColumn(new TableColumn("[bold]IP/Hostname[/]"))
                 .AddColumn(new TableColumn("[bold]Port[/]").Centered())
                 .AddColumn(new TableColumn("[bold]Resolution[/]").Centered())
@@ -973,8 +974,14 @@ WantedBy=multi-user.target
                         ? "[yellow]On[/]"
                         : "[grey]Off[/]";
 
+                // Device type display
+                var deviceTypeDisplay = string.IsNullOrEmpty(p.DeviceType)
+                    ? "[grey]-[/]"
+                    : $"[cyan]{Markup.Escape(p.DeviceType)}[/]";
+
                 printerTable.AddRow(
                     $"[white]{Markup.Escape(p.Name)}[/]",
+                    deviceTypeDisplay,
                     $"[grey]{Markup.Escape(p.Ip)}[/]",
                     $"[cyan]{p.MjpegPort}[/]",
                     resolution,
@@ -1563,138 +1570,128 @@ WantedBy=multi-user.target
 
         _ui.Clear();
 
-        // Get detailed status
+        // Get detailed status and config
         var (statusSuccess, detailedStatus, _) = await _ipcClient.GetPrinterStatusAsync(selected);
-
         if (!statusSuccess || detailedStatus == null)
-        {
             detailedStatus = printer;
-        }
 
-        // Display printer details
-        var statusColor = detailedStatus.State switch
-        {
-            PrinterState.Running => "green",
-            PrinterState.Paused => "yellow",
-            PrinterState.Failed => "red",
-            PrinterState.Retrying => "orange3",
-            _ => "grey"
-        };
-
-        _ui.WriteRule(detailedStatus.Name);
-        _ui.WriteLine();
-
-        var details = new List<(string, string)>
-        {
-            ("IP/Hostname", detailedStatus.Ip),
-            ("MJPEG Port", detailedStatus.MjpegPort.ToString()),
-            ("Status", $"[{statusColor}]{detailedStatus.State}[/]"),
-            ("Connected Clients", detailedStatus.ConnectedClients.ToString())
-        };
-
-        if (detailedStatus.LastError != null)
-        {
-            details.Add(("Last Error", $"[red]{detailedStatus.LastError}[/]"));
-        }
-
-        if (detailedStatus.LastSeenOnline.HasValue)
-        {
-            details.Add(("Last Online", detailedStatus.LastSeenOnline.Value.ToString("yyyy-MM-dd HH:mm:ss")));
-        }
-
-        if (detailedStatus.NextRetryAt.HasValue && detailedStatus.State == PrinterState.Retrying)
-        {
-            details.Add(("Next Retry", detailedStatus.NextRetryAt.Value.ToString("HH:mm:ss")));
-        }
-
-        _ui.WriteGrid(details);
-
-        // SSH Status
-        _ui.WriteLine();
-        _ui.WriteRule("SSH Status");
-        _ui.WriteGrid(new[]
-        {
-            ("Connected", detailedStatus.SshStatus.Connected ? "[green]Yes[/]" : "[grey]No[/]"),
-            ("Credentials Retrieved", detailedStatus.SshStatus.CredentialsRetrieved ? "[green]Yes[/]" : "[grey]No[/]"),
-            ("Error", detailedStatus.SshStatus.Error ?? "-")
-        });
-
-        // MQTT Status
-        _ui.WriteLine();
-        _ui.WriteRule("MQTT Status");
-        _ui.WriteGrid(new[]
-        {
-            ("Connected", detailedStatus.MqttStatus.Connected ? "[green]Yes[/]" : "[grey]No[/]"),
-            ("Model Code", detailedStatus.MqttStatus.DetectedModelCode ?? "[grey]Unknown[/]"),
-            ("Camera Started", detailedStatus.MqttStatus.CameraStarted ? "[green]Yes[/]" : "[grey]No[/]")
-        });
-
-        // Stream Status
-        _ui.WriteLine();
-        _ui.WriteRule("Stream Status");
-        var streamDetails = new List<(string, string)>
-        {
-            ("Connected", detailedStatus.StreamStatus.Connected ? "[green]Yes[/]" : "[grey]No[/]")
-        };
-        if (detailedStatus.StreamStatus.Width > 0)
-        {
-            streamDetails.Add(("Resolution", $"{detailedStatus.StreamStatus.Width}x{detailedStatus.StreamStatus.Height}"));
-        }
-        streamDetails.Add(("Frames Decoded", detailedStatus.StreamStatus.FramesDecoded.ToString()));
-        if (detailedStatus.StreamStatus.DecoderStatus != null)
-        {
-            streamDetails.Add(("Decoder Status", detailedStatus.StreamStatus.DecoderStatus));
-        }
-        _ui.WriteGrid(streamDetails);
-
-        // Encoding Settings
         var (configSuccess, printerConfig, _) = await _ipcClient.GetPrinterConfigAsync(selected);
-        if (configSuccess && printerConfig != null)
+
+        // Status indicators
+        var (statusColor, statusIcon) = detailedStatus.State switch
         {
-            // Connection Settings
-            _ui.WriteLine();
-            _ui.WriteRule("Connection Settings");
-            _ui.WriteGrid(new[]
-            {
-                ("Auto LAN Mode", printerConfig.AutoLanMode ? "[green]Enabled[/]" : "[grey]Disabled[/]"),
-                ("Send Stop Command", printerConfig.SendStopCommand ? "[green]Yes[/]" : "[grey]No[/]")
-            });
+            PrinterState.Running => ("green", "●"),
+            PrinterState.Paused => ("yellow", "◐"),
+            PrinterState.Failed => ("red", "✗"),
+            PrinterState.Retrying => ("orange3", "↻"),
+            PrinterState.Connecting => ("blue", "◌"),
+            _ => ("grey", "○")
+        };
 
-            _ui.WriteLine();
-            _ui.WriteRule("Encoding Settings");
-            _ui.WriteGrid(new[]
-            {
-                ("Max FPS", printerConfig.MaxFps.ToString()),
-                ("Idle FPS", printerConfig.IdleFps.ToString()),
-                ("JPEG Quality", printerConfig.JpegQuality.ToString())
-            });
+        var resolution = detailedStatus.StreamStatus.Width > 0
+            ? $"{detailedStatus.StreamStatus.Width}x{detailedStatus.StreamStatus.Height}"
+            : "-";
 
-            // LED Settings
-            _ui.WriteLine();
-            _ui.WriteRule("LED Settings");
-            var ledStatusDisplay = detailedStatus.CameraLed == null
-                ? "[grey]Unknown[/]"
-                : detailedStatus.CameraLed.IsOn
-                    ? $"[yellow]On[/] (brightness: {detailedStatus.CameraLed.Brightness}%)"
-                    : "[grey]Off[/]";
-            _ui.WriteGrid(new[]
+        // === HEADER ===
+        var deviceTypeDisplay = string.IsNullOrEmpty(detailedStatus.DeviceType)
+            ? ""
+            : $" [cyan]({detailedStatus.DeviceType})[/]";
+
+        var headerTable = new Table()
+            .Border(TableBorder.Rounded)
+            .BorderColor(Color.Blue)
+            .AddColumn(new TableColumn($"[bold]{detailedStatus.Name}[/]{deviceTypeDisplay}").Centered());
+
+        headerTable.AddRow($"[{statusColor}]{statusIcon} {detailedStatus.State}[/]");
+        headerTable.AddRow($"[grey]{detailedStatus.Ip}:{detailedStatus.MjpegPort}[/] │ [cyan]{detailedStatus.ConnectedClients}[/] clients │ [white]{resolution}[/]");
+
+        AnsiConsole.Write(headerTable);
+
+        // === MAIN DETAILS TABLE (4 columns) ===
+        var mainTable = new Table()
+            .Border(TableBorder.Rounded)
+            .BorderColor(Color.Grey)
+            .AddColumn(new TableColumn("[bold]Connection[/]").Width(20))
+            .AddColumn(new TableColumn("[bold]Stream[/]").Width(20))
+            .AddColumn(new TableColumn("[bold]Encoding[/]").Width(18))
+            .AddColumn(new TableColumn("[bold]LED[/]").Width(14));
+
+        // Connection column
+        var sshStatus = detailedStatus.SshStatus.Connected ? "[green]●[/] OK" : "[grey]○[/] -";
+        var mqttStatus = detailedStatus.MqttStatus.Connected
+            ? $"[green]●[/] {detailedStatus.MqttStatus.DetectedModelCode ?? "OK"}"
+            : "[grey]○[/] -";
+        var camStatus = detailedStatus.MqttStatus.CameraStarted ? "[green]●[/] Started" : "[grey]○[/] -";
+        var lanMode = configSuccess && printerConfig != null && printerConfig.AutoLanMode ? "[green]Auto[/]" : "[grey]Manual[/]";
+
+        // Stream column
+        var streamStatus = detailedStatus.StreamStatus.Connected ? "[green]●[/] Streaming" : "[grey]○[/] Stopped";
+        var framesDecoded = detailedStatus.StreamStatus.FramesDecoded.ToString("N0");
+
+        // Encoding column (from config)
+        var maxFps = configSuccess && printerConfig != null ? printerConfig.MaxFps.ToString() : "-";
+        var idleFps = configSuccess && printerConfig != null ? printerConfig.IdleFps.ToString() : "-";
+        var quality = configSuccess && printerConfig != null ? printerConfig.JpegQuality.ToString() : "-";
+        var stopCmd = configSuccess && printerConfig != null && printerConfig.SendStopCommand ? "[green]Yes[/]" : "[grey]No[/]";
+
+        // LED column
+        var ledStatus = detailedStatus.CameraLed == null
+            ? "[grey]?[/]"
+            : detailedStatus.CameraLed.IsOn
+                ? $"[yellow]● On[/] ({detailedStatus.CameraLed.Brightness}%)"
+                : "[grey]○ Off[/]";
+        var ledAuto = configSuccess && printerConfig != null && printerConfig.LedAutoControl ? "[green]✓[/]" : "[grey]✗[/]";
+        var ledTimeout = configSuccess && printerConfig != null ? $"{printerConfig.StandbyLedTimeoutMinutes}m" : "-";
+
+        // Build rows
+        mainTable.AddRow($"SSH  {sshStatus}", streamStatus, $"Max FPS: {maxFps}", ledStatus);
+        mainTable.AddRow($"MQTT {mqttStatus}", $"Frames: {framesDecoded}", $"Idle: {idleFps}", $"Auto: {ledAuto}");
+        mainTable.AddRow($"Cam  {camStatus}", "", $"Quality: {quality}", $"Timeout: {ledTimeout}");
+        mainTable.AddRow($"LAN  {lanMode}", "", $"Stop: {stopCmd}", "");
+
+        AnsiConsole.Write(mainTable);
+
+        // === URLs ===
+        var urlTable = new Table()
+            .Border(TableBorder.Rounded)
+            .BorderColor(Color.Grey)
+            .AddColumn(new TableColumn($"[bold]URLs[/]  [grey](http://<server>:{detailedStatus.MjpegPort}/)[/]").LeftAligned());
+
+        urlTable.AddRow("[cyan]/stream[/]  [grey]│[/]  [cyan]/snapshot[/]  [grey]│[/]  [cyan]/status[/]  [grey]│[/]  [cyan]/led[/]  [cyan]/led/on[/]  [cyan]/led/off[/]");
+
+        AnsiConsole.Write(urlTable);
+
+        // === ERROR/RETRY INFO (only if relevant) ===
+        if (detailedStatus.LastError != null || detailedStatus.State == PrinterState.Retrying)
+        {
+            AnsiConsole.WriteLine();
+            if (detailedStatus.LastError != null)
             {
-                ("Current LED Status", ledStatusDisplay),
-                ("Auto Control", printerConfig.LedAutoControl ? "[green]Enabled[/]" : "[grey]Disabled[/]"),
-                ("Standby Timeout", $"{printerConfig.StandbyLedTimeoutMinutes} minutes")
-            });
+                var errorTime = detailedStatus.LastErrorAt.HasValue
+                    ? $" [grey]({detailedStatus.LastErrorAt.Value.ToLocalTime():yyyy-MM-dd HH:mm:ss})[/]"
+                    : "";
+                AnsiConsole.MarkupLine($"[red]Error:{errorTime}[/] [grey]{Markup.Escape(detailedStatus.LastError)}[/]");
+            }
+
+            // Show last online and next retry info
+            var statusParts = new List<string>();
+            if (detailedStatus.LastSeenOnline.HasValue)
+            {
+                statusParts.Add($"Last online: {detailedStatus.LastSeenOnline.Value.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
+            }
+            if (detailedStatus.NextRetryAt.HasValue && detailedStatus.State == PrinterState.Retrying)
+            {
+                statusParts.Add($"Next retry: [yellow]{detailedStatus.NextRetryAt.Value.ToLocalTime():HH:mm:ss}[/]");
+            }
+            if (statusParts.Count > 0)
+            {
+                AnsiConsole.MarkupLine($"[grey]{string.Join(" │ ", statusParts)}[/]");
+            }
         }
 
-        // URLs
-        _ui.WriteLine();
-        _ui.WriteRule("Stream URLs");
-        _ui.WriteInfo($"MJPEG Stream: http://<server>:{detailedStatus.MjpegPort}/stream");
-        _ui.WriteInfo($"Snapshot: http://<server>:{detailedStatus.MjpegPort}/snapshot");
-        _ui.WriteInfo($"Status: http://<server>:{detailedStatus.MjpegPort}/status");
-        _ui.WriteInfo($"LED Control: http://<server>:{detailedStatus.MjpegPort}/led");
-
-        _ui.WriteLine();
-        _ui.WaitForKey("Press any key to return...");
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Press any key to return...[/]");
+        Console.ReadKey(true);
     }
 
     #region Input Validation Helpers
