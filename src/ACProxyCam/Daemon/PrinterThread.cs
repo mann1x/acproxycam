@@ -338,7 +338,8 @@ public class PrinterThread : IDisposable
                 _lastError = null;
                 _nextRetryAt = null;
 
-                LogStatus($"Starting connection to {Config.Ip}...");
+                // Only log on first attempt or after success - throttling handles repetitive failures
+                LogStatusThrottled("connection", $"Connecting to {Config.Ip}...");
 
                 // Step 1: Check if we need SSH credentials
                 if (string.IsNullOrEmpty(Config.MqttUsername) || string.IsNullOrEmpty(Config.MqttPassword))
@@ -371,9 +372,8 @@ public class PrinterThread : IDisposable
                 var retryDelay = TimeSpan.FromSeconds(isResponding ? RetryDelayResponsive : RetryDelayOffline);
                 _nextRetryAt = DateTime.UtcNow + retryDelay;
 
-                // Use throttled logging for repetitive connection errors
-                var errorKey = $"connection_error:{ex.Message.GetHashCode()}";
-                _logThrottler.Log(errorKey, $"Error: {ex.Message}. Retrying in {retryDelay.TotalSeconds}s");
+                // Use throttled logging for repetitive connection errors - same key as connection start
+                _logThrottler.Log("connection", $"Connection failed: {ex.Message}. Retry in {retryDelay.TotalSeconds}s");
 
                 try
                 {
@@ -435,11 +435,9 @@ public class PrinterThread : IDisposable
         _mqttStatus.DeviceIdDetected = !string.IsNullOrEmpty(Config.DeviceId);
         _mqttStatus.ModelCodeDetected = !string.IsNullOrEmpty(Config.ModelCode);
 
-        LogStatus("Connecting to MQTT broker...");
-
         _mqttController = new MqttCameraController();
-        _mqttController.StatusChanged += (s, msg) => LogStatusThrottled("mqtt_status", $"MQTT: {msg}");
-        _mqttController.ErrorOccurred += (s, ex) => LogStatusThrottled("mqtt_error", $"MQTT Error: {ex.Message}");
+        _mqttController.StatusChanged += (s, msg) => { }; // Suppress - main loop handles logging
+        _mqttController.ErrorOccurred += (s, ex) => { }; // Suppress - main loop handles logging
         _mqttController.ModelCodeDetected += (s, code) =>
         {
             Config.ModelCode = code;
@@ -467,16 +465,12 @@ public class PrinterThread : IDisposable
                 Config.MqttPassword!,
                 ct);
         }
-        catch (Exception ex) when (Config.AutoLanMode)
+        catch when (Config.AutoLanMode)
         {
-            // MQTT connection failed - try to enable LAN mode
-            LogStatus($"MQTT connection failed: {ex.Message}");
-            LogStatus("AutoLanMode is enabled, attempting to enable LAN mode on printer...");
-
+            // MQTT connection failed - try to enable LAN mode via SSH
             await TryEnableLanModeAsync(ct);
 
             // Retry MQTT connection after enabling LAN mode
-            LogStatus("Retrying MQTT connection...");
             await _mqttController.ConnectAsync(
                 Config.Ip,
                 Config.MqttUsername!,
@@ -539,7 +533,7 @@ public class PrinterThread : IDisposable
     private async Task TryEnableLanModeAsync(CancellationToken ct)
     {
         _lanModeService = new LanModeService();
-        _lanModeService.StatusChanged += (s, msg) => LogStatusThrottled("lan_mode", $"LAN Mode: {msg}");
+        _lanModeService.StatusChanged += (s, msg) => { }; // Suppress - main loop handles logging
 
         var result = await _lanModeService.EnableLanModeAsync(
             Config.Ip,
@@ -553,13 +547,9 @@ public class PrinterThread : IDisposable
             throw new Exception($"Failed to enable LAN mode: {result.Error}");
         }
 
-        if (result.WasAlreadyOpen)
+        if (!result.WasAlreadyOpen)
         {
-            LogStatus("LAN mode was already enabled on printer");
-        }
-        else
-        {
-            LogStatus("LAN mode enabled successfully, waiting 5 seconds for MQTT to become available...");
+            // LAN mode just enabled - wait for MQTT to become available
             await Task.Delay(5000, ct);
         }
     }
@@ -989,8 +979,6 @@ public class PrinterThread : IDisposable
                 catch when (Config.AutoLanMode)
                 {
                     // MQTT failed - try SSH+LAN mode like initial connection
-                    LogStatusThrottled("quick_restart", "Recovery: MQTT failed, trying SSH+LAN mode...");
-
                     try
                     {
                         await TryEnableLanModeAsync(ct);
@@ -1009,9 +997,9 @@ public class PrinterThread : IDisposable
                             return true;
                         }
                     }
-                    catch (Exception lanEx)
+                    catch
                     {
-                        LogStatusThrottled("quick_restart", $"Recovery: LAN mode failed - {lanEx.Message}");
+                        // LAN mode also failed - will be logged by caller
                     }
                 }
             }
