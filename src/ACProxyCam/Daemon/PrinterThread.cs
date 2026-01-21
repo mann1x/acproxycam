@@ -700,23 +700,32 @@ public class PrinterThread : IDisposable
         _mjpegServer.IdleFps = Config.IdleFps;
         _mjpegServer.JpegQuality = Config.JpegQuality;
 
-        // Determine bind address from config
-        IPAddress bindAddress = IPAddress.Any;
+        // Determine bind addresses from config
+        var bindAddresses = new List<IPAddress>();
         if (_listenInterfaces.Count > 0 && !_listenInterfaces.Contains("0.0.0.0"))
         {
-            // Try to bind to first configured interface
-            if (IPAddress.TryParse(_listenInterfaces[0], out var addr))
+            foreach (var iface in _listenInterfaces)
             {
-                bindAddress = addr;
+                if (IPAddress.TryParse(iface, out var addr))
+                {
+                    bindAddresses.Add(addr);
+                }
             }
+        }
+
+        // Default to any if no valid addresses configured
+        if (bindAddresses.Count == 0)
+        {
+            bindAddresses.Add(IPAddress.Any);
         }
 
         // Wire up LED control callbacks
         _mjpegServer.GetLedStatusAsync = GetLedStatusAsync;
         _mjpegServer.SetLedAsync = SetLedAsync;
 
-        _mjpegServer.Start(Config.MjpegPort, bindAddress);
-        LogStatus($"MJPEG server listening on {bindAddress}:{Config.MjpegPort} (maxFps={Config.MaxFps}, idleFps={Config.IdleFps}, quality={Config.JpegQuality})");
+        _mjpegServer.Start(Config.MjpegPort, bindAddresses);
+        var addressList = string.Join(", ", bindAddresses.Select(a => $"{a}:{Config.MjpegPort}"));
+        LogStatus($"MJPEG server listening on {addressList} (maxFps={Config.MaxFps}, idleFps={Config.IdleFps}, quality={Config.JpegQuality})");
     }
 
     private async Task RunStreamingLoopAsync(CancellationToken ct)

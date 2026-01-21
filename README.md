@@ -171,33 +171,58 @@ You can integrate the camera LED control with HomeAssistant as a switch.
 Add this to your `configuration.yaml`:
 
 ```yaml
+sensor:
+  - platform: rest
+    name: kobra_s1_camera_led_state
+    resource: http://192.168.178.12:8081/led
+    scan_interval: 5
+    value_template: "{{ value_json.state }}"
+
 rest_command:
-  printer_led_on:
-    url: http://192.168.1.10:8080/led/on
+  kobra_s1_led_on:
+    url: http://192.168.178.12:8081/led/on
     method: POST
-  printer_led_off:
-    url: http://192.168.1.10:8080/led/off
+  kobra_s1_led_off:
+    url: http://192.168.178.12:8081/led/off
     method: POST
 
 switch:
   - platform: template
     switches:
-      printer_camera_led:
-        friendly_name: "Printer Camera LED"
+      kobra_s1_camera_led:
+        friendly_name: "Kobra S1 Camera LED"
+        value_template: "{{ states('sensor.kobra_s1_camera_led_state') == 'on' }}"
         turn_on:
-          service: rest_command.printer_led_on
+          service: rest_command.kobra_s1_led_on
         turn_off:
-          service: rest_command.printer_led_off
+          service: rest_command.kobra_s1_led_off
 ```
 
-Replace `192.168.1.10:8080` with your ACProxyCam server IP and port.
+Replace `192.168.178.12:8081` with your ACProxyCam server IP and port.
 
 After adding the configuration:
 1. Go to **Developer Tools > YAML > Check Configuration**
 2. Click **Restart** to apply the changes
-3. Find `switch.printer_camera_led` in **Settings > Devices & Services > Entities**
+3. Find `switch.kobra_s1_camera_led` in **Settings > Devices & Services > Entities**
 
-You can then add this switch to any dashboard.
+### Dashboard Tile Card
+
+Add a Tile card to your dashboard for quick LED control:
+
+```yaml
+type: tile
+entity: switch.kobra_s1_camera_led
+show_entity_picture: false
+state_content: kobra_s1_camera_led_state
+vertical: false
+tap_action:
+  action: toggle
+icon_tap_action:
+  action: more-info
+features_position: inline
+```
+
+You can add this via **Edit Dashboard > Add Card > Manual** and paste the YAML.
 
 ## Systemd Service
 

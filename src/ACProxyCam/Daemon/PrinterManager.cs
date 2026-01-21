@@ -26,6 +26,8 @@ public class PrinterManager
 
     public async Task StartAllAsync()
     {
+        Logger.Log($"Starting all printers ({_config.Printers.Count} configured)...");
+
         // Calculate CPU affinity assignments
         var cpuAssignments = CpuAffinityService.CalculateCpuAssignments(_config.Printers.Count);
         var availableCpus = CpuAffinityService.GetAvailableCpus();
@@ -42,6 +44,8 @@ public class PrinterManager
             var cpuAffinity = i < cpuAssignments.Length ? cpuAssignments[i] : -1;
             await StartPrinterAsync(printerConfig, cpuAffinity);
         }
+
+        Logger.Log($"All printers started");
     }
 
     public async Task StopAllAsync()
@@ -53,18 +57,30 @@ public class PrinterManager
             _printers.Clear();
         }
 
+        if (toStop.Count > 0)
+        {
+            Logger.Log($"Stopping all printers ({toStop.Count})...");
+        }
+
         foreach (var printer in toStop)
         {
             printer.ConfigChanged -= OnPrinterConfigChanged;
             await printer.StopAsync();
             printer.Dispose();
         }
+
+        if (toStop.Count > 0)
+        {
+            Logger.Log("All printers stopped");
+        }
     }
 
     public async Task RestartAllAsync()
     {
+        Logger.Log("Restarting all printers...");
         await StopAllAsync();
         await StartAllAsync();
+        Logger.Log("All printers restarted");
     }
 
     private async Task StartPrinterAsync(PrinterConfig config, int cpuAffinity = -1)

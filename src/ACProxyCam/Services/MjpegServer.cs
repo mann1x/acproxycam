@@ -15,7 +15,7 @@ namespace ACProxyCam.Services;
 /// </summary>
 public class MjpegServer : IDisposable
 {
-    private TcpListener? _listener;
+    private readonly List<TcpListener> _listeners = new();
     private readonly List<ClientConnection> _clients = new();
     private readonly object _clientLock = new();
     private CancellationTokenSource? _cts;
@@ -38,7 +38,7 @@ public class MjpegServer : IDisposable
     public event EventHandler? SnapshotRequested;
 
     public int Port { get; private set; }
-    public IPAddress BindAddress { get; private set; } = IPAddress.Any;
+    public List<IPAddress> BindAddresses { get; private set; } = new();
     public bool IsRunning { get; private set; }
     public int ConnectedClients
     {
@@ -78,24 +78,39 @@ public class MjpegServer : IDisposable
     private static readonly byte[] ContentTypeHeader = Encoding.ASCII.GetBytes("Content-Type: image/jpeg\r\n");
 
     /// <summary>
-    /// Start the MJPEG server.
+    /// Start the MJPEG server on a single address.
     /// </summary>
     public void Start(int port, IPAddress? bindAddress = null)
+    {
+        var addresses = new List<IPAddress> { bindAddress ?? IPAddress.Any };
+        Start(port, addresses);
+    }
+
+    /// <summary>
+    /// Start the MJPEG server on multiple addresses.
+    /// </summary>
+    public void Start(int port, List<IPAddress> bindAddresses)
     {
         if (IsRunning)
             Stop();
 
         Port = port;
-        BindAddress = bindAddress ?? IPAddress.Any;
+        BindAddresses = bindAddresses.Count > 0 ? bindAddresses : new List<IPAddress> { IPAddress.Any };
 
         _cts = new CancellationTokenSource();
-        _listener = new TcpListener(BindAddress, Port);
 
         try
         {
-            _listener.Start();
+            // Create a listener for each address
+            foreach (var address in BindAddresses)
+            {
+                var listener = new TcpListener(address, Port);
+                listener.Start();
+                _listeners.Add(listener);
+                StatusChanged?.Invoke(this, $"MJPEG server started on {address}:{Port}");
+            }
+
             IsRunning = true;
-            StatusChanged?.Invoke(this, $"MJPEG server started on {BindAddress}:{Port}");
 
             _acceptThread = new Thread(AcceptLoop)
             {
@@ -106,6 +121,12 @@ public class MjpegServer : IDisposable
         }
         catch (Exception ex)
         {
+            // Clean up any listeners that were started
+            foreach (var listener in _listeners)
+            {
+                try { listener.Stop(); } catch { }
+            }
+            _listeners.Clear();
             ErrorOccurred?.Invoke(this, ex);
             throw;
         }
@@ -117,7 +138,14 @@ public class MjpegServer : IDisposable
     public void Stop()
     {
         _cts?.Cancel();
-        _listener?.Stop();
+
+        // Stop all listeners
+        foreach (var listener in _listeners)
+        {
+            try { listener.Stop(); } catch { }
+        }
+        _listeners.Clear();
+
         IsRunning = false;
 
         lock (_clientLock)
@@ -310,24 +338,42 @@ public class MjpegServer : IDisposable
     {
         var ct = _cts!.Token;
 
-        while (!ct.IsCancellationRequested && _listener != null)
+        while (!ct.IsCancellationRequested && _listeners.Count > 0)
         {
             try
             {
-                if (!_listener.Pending())
+                var anyPending = false;
+
+                // Check each listener for pending connections
+                foreach (var listener in _listeners.ToArray())
                 {
-                    Thread.Sleep(10);
-                    continue;
+                    if (ct.IsCancellationRequested) break;
+
+                    try
+                    {
+                        if (listener.Pending())
+                        {
+                            anyPending = true;
+                            var tcpClient = listener.AcceptTcpClient();
+                            var client = new ClientConnection(tcpClient);
+                            ThreadPool.QueueUserWorkItem(_ => HandleClient(client));
+                        }
+                    }
+                    catch (SocketException) when (ct.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // Listener was stopped
+                        break;
+                    }
                 }
 
-                var tcpClient = _listener.AcceptTcpClient();
-                var client = new ClientConnection(tcpClient);
-
-                ThreadPool.QueueUserWorkItem(_ => HandleClient(client));
-            }
-            catch (SocketException) when (ct.IsCancellationRequested)
-            {
-                break;
+                if (!anyPending && !ct.IsCancellationRequested)
+                {
+                    Thread.Sleep(10);
+                }
             }
             catch (Exception ex)
             {

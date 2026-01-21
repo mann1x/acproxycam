@@ -91,17 +91,25 @@ public class DaemonService
 
     public async Task ReloadConfigAsync()
     {
+        Logger.Log("Reloading configuration from disk...");
         _config = await ConfigManager.LoadAsync();
         _printerManager?.UpdateConfig(_config);
+        Logger.Log($"Configuration reloaded: {_config.Printers.Count} printers");
     }
 
     public async Task ChangeInterfacesAsync(List<string> interfaces)
     {
         if (_config != null)
         {
+            var oldInterfaces = string.Join(", ", _config.ListenInterfaces);
+            var newInterfaces = string.Join(", ", interfaces);
+            Logger.Log($"Changing listen interfaces: [{oldInterfaces}] -> [{newInterfaces}]");
+
             _config.ListenInterfaces = interfaces;
             await ConfigManager.SaveAsync(_config);
+
             // Restart printer threads with new interfaces
+            Logger.Log("Restarting all printers due to interface change...");
             await _printerManager?.RestartAllAsync()!;
         }
     }

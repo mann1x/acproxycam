@@ -170,12 +170,14 @@ public class IpcServer
                     return await _printerManager.ResumePrinterAsync(resumeReq.Name);
 
                 case IpcCommands.ReloadConfig:
+                    Logger.Log("IPC: Received reload config request");
                     await _daemon.ReloadConfigAsync();
                     return IpcResponse.Ok();
 
                 case IpcCommands.ChangeInterfaces:
                     var ifaceReq = DeserializeData<ChangeInterfacesRequest>(request.Data);
                     if (ifaceReq == null) return IpcResponse.Fail("Invalid request data");
+                    Logger.Log($"IPC: Received change interfaces request: [{string.Join(", ", ifaceReq.Interfaces)}]");
                     await _daemon.ChangeInterfacesAsync(ifaceReq.Interfaces);
                     return IpcResponse.Ok();
 
