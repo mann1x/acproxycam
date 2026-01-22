@@ -85,6 +85,98 @@ public class SpectreConsoleUI : IConsoleUI
                 .AddChoices(choices));
     }
 
+    public string? SelectOneWithEscape(string title, IEnumerable<string> choices)
+    {
+        var choiceList = choices.ToList();
+        if (choiceList.Count == 0)
+            return null;
+
+        int selectedIndex = 0;
+
+        // Write title
+        AnsiConsole.MarkupLine(title);
+
+        // Custom selection loop with Escape support
+        while (true)
+        {
+            // Move cursor up to redraw options
+            if (selectedIndex >= 0)
+            {
+                // Clear previous options
+                var cursorTop = Console.CursorTop;
+                for (int i = 0; i < choiceList.Count; i++)
+                {
+                    Console.SetCursorPosition(0, cursorTop + i);
+                    Console.Write(new string(' ', Console.WindowWidth - 1));
+                }
+                Console.SetCursorPosition(0, cursorTop);
+            }
+
+            // Draw options (don't escape - choices may contain intentional markup)
+            for (int i = 0; i < choiceList.Count; i++)
+            {
+                if (i == selectedIndex)
+                    AnsiConsole.MarkupLine($"[cyan]> {choiceList[i]}[/]");
+                else
+                    AnsiConsole.MarkupLine($"  {choiceList[i]}");
+            }
+
+            // Position hint
+            AnsiConsole.MarkupLine("[grey](↑/↓ to move, Enter to select, Esc to cancel)[/]");
+
+            // Read key
+            var keyInfo = Console.ReadKey(true);
+
+            // Clear the hint line
+            Console.SetCursorPosition(0, Console.CursorTop - 1);
+            Console.Write(new string(' ', Console.WindowWidth - 1));
+            Console.SetCursorPosition(0, Console.CursorTop);
+
+            // Move cursor back up to option area for redraw
+            for (int i = 0; i < choiceList.Count; i++)
+            {
+                Console.SetCursorPosition(0, Console.CursorTop - 1);
+            }
+
+            switch (keyInfo.Key)
+            {
+                case ConsoleKey.UpArrow:
+                    selectedIndex = selectedIndex > 0 ? selectedIndex - 1 : choiceList.Count - 1;
+                    break;
+
+                case ConsoleKey.DownArrow:
+                    selectedIndex = selectedIndex < choiceList.Count - 1 ? selectedIndex + 1 : 0;
+                    break;
+
+                case ConsoleKey.Enter:
+                    // Clear and show final selection
+                    Console.SetCursorPosition(0, Console.CursorTop);
+                    for (int i = 0; i < choiceList.Count + 1; i++)
+                    {
+                        Console.Write(new string(' ', Console.WindowWidth - 1));
+                        if (i < choiceList.Count)
+                            Console.SetCursorPosition(0, Console.CursorTop + 1);
+                    }
+                    Console.SetCursorPosition(0, Console.CursorTop - choiceList.Count);
+                    AnsiConsole.MarkupLine($"[green]{Markup.Escape(choiceList[selectedIndex])}[/]");
+                    return choiceList[selectedIndex];
+
+                case ConsoleKey.Escape:
+                    // Clear and show cancelled
+                    Console.SetCursorPosition(0, Console.CursorTop);
+                    for (int i = 0; i < choiceList.Count + 1; i++)
+                    {
+                        Console.Write(new string(' ', Console.WindowWidth - 1));
+                        if (i < choiceList.Count)
+                            Console.SetCursorPosition(0, Console.CursorTop + 1);
+                    }
+                    Console.SetCursorPosition(0, Console.CursorTop - choiceList.Count);
+                    AnsiConsole.MarkupLine("[grey]Cancelled[/]");
+                    return null;
+            }
+        }
+    }
+
     public List<string> SelectMany(string title, IEnumerable<string> choices, string? instructions = null)
     {
         var prompt = new MultiSelectionPrompt<string>()

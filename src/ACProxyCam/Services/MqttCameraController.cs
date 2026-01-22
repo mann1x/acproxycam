@@ -54,10 +54,12 @@ public class MqttCameraController : IAsyncDisposable
     private const string VideoTopicTemplate = "anycubic/anycubicCloud/v1/web/printer/{0}/{1}/video";
     private const string LightTopicTemplate = "anycubic/anycubicCloud/v1/web/printer/{0}/{1}/light";
     private const string InfoTopicTemplate = "anycubic/anycubicCloud/v1/web/printer/{0}/{1}/info";
+    private const string TempTopicTemplate = "anycubic/anycubicCloud/v1/web/printer/{0}/{1}/tempature";
 
     // Response topic patterns
     private const string LightReportSuffix = "/light/report";
     private const string InfoReportSuffix = "/info/report";
+    private const string TempReportSuffix = "/tempature/report";
     private const string ResponseSuffix = "/response";  // Anycubic sends responses here
 
     // Regex to extract model code from MQTT topics
@@ -395,7 +397,7 @@ public class MqttCameraController : IAsyncDisposable
     private void TryCompleteResponse(string topic, string payload)
     {
         // Only process report or response topics
-        var isReportTopic = topic.EndsWith(LightReportSuffix) || topic.EndsWith(InfoReportSuffix);
+        var isReportTopic = topic.EndsWith(LightReportSuffix) || topic.EndsWith(InfoReportSuffix) || topic.EndsWith(TempReportSuffix);
         var isResponseTopic = topic.EndsWith(ResponseSuffix);
 
         if (!isReportTopic && !isResponseTopic)
@@ -490,6 +492,14 @@ public class MqttCameraController : IAsyncDisposable
     private static string BuildInfoTopic(string modelCode, string deviceId)
     {
         return string.Format(InfoTopicTemplate, modelCode, deviceId);
+    }
+
+    /// <summary>
+    /// Build the MQTT topic for temperature control.
+    /// </summary>
+    private static string BuildTempTopic(string modelCode, string deviceId)
+    {
+        return string.Format(TempTopicTemplate, modelCode, deviceId);
     }
 
     /// <summary>
@@ -743,6 +753,157 @@ public class MqttCameraController : IAsyncDisposable
         catch (OperationCanceledException)
         {
             return false;
+        }
+        finally
+        {
+            _pendingResponses.TryRemove(msgId, out _);
+        }
+    }
+
+    /// <summary>
+    /// Set heater temperatures via MQTT.
+    /// </summary>
+    /// <param name="deviceId">The printer device ID</param>
+    /// <param name="bedTemp">Target bed temperature (0 to turn off)</param>
+    /// <param name="nozzleTemp">Target nozzle temperature (0 to turn off)</param>
+    /// <param name="modelCode">Optional model code (uses detected if not provided)</param>
+    /// <param name="cancellationToken">Cancellation token</param>
+    /// <returns>True if command was sent successfully</returns>
+    public async Task<bool> SetTemperatureAsync(
+        string deviceId,
+        int bedTemp,
+        int nozzleTemp,
+        string? modelCode = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_mqttClient == null || !_mqttClient.IsConnected)
+            return false;
+
+        var effectiveModelCode = modelCode ?? _detectedModelCode;
+        if (string.IsNullOrEmpty(effectiveModelCode))
+            return false;
+
+        var topic = BuildTempTopic(effectiveModelCode, deviceId);
+        var msgId = Guid.NewGuid().ToString();
+
+        // Determine type: 0 = nozzle only, 1 = bed only, 2 = both (based on which temps are non-zero)
+        // From observation: type 0 sets nozzle, type 1 sets bed
+        // We'll send separate commands if both need to be set
+        var commands = new List<(int type, int bed, int nozzle)>();
+
+        if (bedTemp > 0 || (bedTemp == 0 && nozzleTemp == 0))
+        {
+            // Set bed temperature (type 1)
+            commands.Add((1, bedTemp, 0));
+        }
+        if (nozzleTemp > 0 || (bedTemp == 0 && nozzleTemp == 0))
+        {
+            // Set nozzle temperature (type 0)
+            commands.Add((0, 0, nozzleTemp));
+        }
+
+        try
+        {
+            foreach (var (type, bed, nozzle) in commands)
+            {
+                var command = new Dictionary<string, object?>
+                {
+                    ["type"] = "tempature",
+                    ["action"] = "set",
+                    ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    ["msgid"] = Guid.NewGuid().ToString(),
+                    ["data"] = new { type, target_hotbed_temp = bed, target_nozzle_temp = nozzle }
+                };
+                var payload = JsonSerializer.Serialize(command);
+
+                var message = new MqttApplicationMessageBuilder()
+                    .WithTopic(topic)
+                    .WithPayload(payload)
+                    .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+                    .Build();
+
+                await _mqttClient.PublishAsync(message, cancellationToken);
+
+                // Small delay between commands
+                if (commands.Count > 1)
+                    await Task.Delay(100, cancellationToken);
+            }
+
+            StatusChanged?.Invoke(this, $"Temperature command sent: bed={bedTemp}°C, nozzle={nozzleTemp}°C");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            StatusChanged?.Invoke(this, $"Failed to send temperature command: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Query current temperatures via MQTT.
+    /// </summary>
+    public async Task<(int bedTemp, int nozzleTemp, int targetBed, int targetNozzle)?> QueryTemperatureAsync(
+        string deviceId,
+        string? modelCode = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_mqttClient == null || !_mqttClient.IsConnected)
+            return null;
+
+        var effectiveModelCode = modelCode ?? _detectedModelCode;
+        if (string.IsNullOrEmpty(effectiveModelCode))
+            return null;
+
+        var topic = BuildTempTopic(effectiveModelCode, deviceId);
+        var msgId = Guid.NewGuid().ToString();
+        var command = new Dictionary<string, object?>
+        {
+            ["type"] = "tempature",
+            ["action"] = "query",
+            ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["msgid"] = msgId,
+            ["data"] = null
+        };
+        var payload = JsonSerializer.Serialize(command);
+
+        var tcs = new TaskCompletionSource<JsonDocument?>();
+        _pendingResponses[msgId] = tcs;
+
+        try
+        {
+            var message = new MqttApplicationMessageBuilder()
+                .WithTopic(topic)
+                .WithPayload(payload)
+                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+                .Build();
+
+            await _mqttClient.PublishAsync(message, cancellationToken);
+
+            // Wait for response with timeout
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromSeconds(5));
+
+            var response = await tcs.Task.WaitAsync(cts.Token);
+            if (response == null)
+                return null;
+
+            using (response)
+            {
+                // Parse response: {"data": {"curr_hotbed_temp": X, "curr_nozzle_temp": X, "target_hotbed_temp": X, "target_nozzle_temp": X}}
+                if (response.RootElement.TryGetProperty("data", out var data))
+                {
+                    var currBed = data.TryGetProperty("curr_hotbed_temp", out var cb) ? cb.GetInt32() : 0;
+                    var currNozzle = data.TryGetProperty("curr_nozzle_temp", out var cn) ? cn.GetInt32() : 0;
+                    var targetBed = data.TryGetProperty("target_hotbed_temp", out var tb) ? tb.GetInt32() : 0;
+                    var targetNozzle = data.TryGetProperty("target_nozzle_temp", out var tn) ? tn.GetInt32() : 0;
+                    return (currBed, currNozzle, targetBed, targetNozzle);
+                }
+            }
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
         }
         finally
         {

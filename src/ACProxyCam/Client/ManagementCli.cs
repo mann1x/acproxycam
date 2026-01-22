@@ -459,11 +459,11 @@ public class ManagementCli
     {
         var interfaces = GetNetworkInterfaces();
 
-        // First, ask what to do with a single-select prompt
-        var actionChoices = new List<string> { "All interfaces (0.0.0.0)", "Select specific interfaces", "Cancel" };
-        var action = _ui.SelectOne("Select listening interfaces for MJPEG streams:", actionChoices);
+        // First, ask what to do with a single-select prompt (Escape to cancel)
+        var actionChoices = new List<string> { "All interfaces (0.0.0.0)", "Select specific interfaces" };
+        var action = _ui.SelectOneWithEscape("Select listening interfaces for MJPEG streams:", actionChoices);
 
-        if (action == "Cancel")
+        if (action == null)
         {
             return null;
         }
@@ -763,7 +763,8 @@ WantedBy=multi-user.target
         ModifyPrinter,
         TogglePause,
         ShowDetails,
-        ToggleLed
+        ToggleLed,
+        BedMesh
     }
 
     private async Task<int> ManagementLoopAsync()
@@ -802,6 +803,7 @@ WantedBy=multi-user.target
                                 action = key switch
                                 {
                                     ConsoleKey.Q => MenuAction.Quit,
+                                    ConsoleKey.Escape => MenuAction.Quit,
                                     ConsoleKey.S => MenuAction.ToggleService,
                                     ConsoleKey.R => MenuAction.RestartService,
                                     ConsoleKey.U => MenuAction.Uninstall,
@@ -812,6 +814,7 @@ WantedBy=multi-user.target
                                     ConsoleKey.Spacebar => MenuAction.TogglePause,
                                     ConsoleKey.Enter => MenuAction.ShowDetails,
                                     ConsoleKey.T => MenuAction.ToggleLed,
+                                    ConsoleKey.B => MenuAction.BedMesh,
                                     _ => MenuAction.None
                                 };
                                 break; // Exit inner loop to refresh or handle action
@@ -827,6 +830,8 @@ WantedBy=multi-user.target
             switch (action)
             {
                 case MenuAction.Quit:
+                    _ipcClient?.Dispose();
+                    _ipcClient = null;
                     return 0;
 
                 case MenuAction.ToggleService:
@@ -876,6 +881,11 @@ WantedBy=multi-user.target
                 case MenuAction.ToggleLed:
                     AnsiConsole.Clear();
                     await TogglePrinterLedAsync();
+                    break;
+
+                case MenuAction.BedMesh:
+                    AnsiConsole.Clear();
+                    await ShowBedMeshMenuFromMainAsync();
                     break;
             }
         }
@@ -998,7 +1008,7 @@ WantedBy=multi-user.target
 
         // === PRINTER CONTROLS ===
         renderables.Add(new Markup(
-            "[grey]Printers:[/] [white][[A]][/][grey]dd[/]  [white][[D]][/][grey]elete[/]  [white][[M]][/][grey]odify[/]  [white][[Space]][/][grey]Pause[/]  [white][[T]][/][grey]LED[/]  [white][[Enter]][/][grey]Details[/]"
+            "[grey]Printers:[/] [white][[A]][/][grey]dd[/]  [white][[D]][/][grey]elete[/]  [white][[M]][/][grey]odify[/]  [white][[Space]][/][grey]Pause[/]  [white][[T]][/][grey]LED[/]  [white][[B]][/][grey]edMesh[/]  [white][[Enter]][/][grey]Details[/]"
         ));
 
         return new Rows(renderables);
@@ -1327,11 +1337,10 @@ WantedBy=multi-user.target
         }
 
         var choices = printers.Select(p => p.Name).ToList();
-        choices.Add("Cancel");
 
-        var selected = _ui.SelectOne("Select printer to delete:", choices);
+        var selected = _ui.SelectOneWithEscape("Select printer to delete:", choices);
 
-        if (selected == "Cancel")
+        if (selected == null)
             return;
 
         if (!_ui.Confirm($"Delete printer '{selected}'?", false))
@@ -1363,11 +1372,10 @@ WantedBy=multi-user.target
         }
 
         var choices = printers.Select(p => p.Name).ToList();
-        choices.Add("Cancel");
 
-        var selected = _ui.SelectOne("Select printer to modify:", choices);
+        var selected = _ui.SelectOneWithEscape("Select printer to modify:", choices);
 
-        if (selected == "Cancel")
+        if (selected == null)
             return;
 
         // Get existing config
@@ -1467,11 +1475,10 @@ WantedBy=multi-user.target
         }
 
         var choices = printers.Select(p => $"{p.Name} ({(p.IsPaused ? "Paused" : "Running")})").ToList();
-        choices.Add("Cancel");
 
-        var selected = _ui.SelectOne("Select printer to pause/resume:", choices);
+        var selected = _ui.SelectOneWithEscape("Select printer to pause/resume:", choices);
 
-        if (selected == "Cancel")
+        if (selected == null)
             return;
 
         // Extract printer name
@@ -1519,11 +1526,10 @@ WantedBy=multi-user.target
             var ledStatus = p.CameraLed == null ? "?" : (p.CameraLed.IsOn ? "On" : "Off");
             return $"{p.Name} (LED: {ledStatus})";
         }).ToList();
-        choices.Add("Cancel");
 
-        var selected = _ui.SelectOne("Select printer to toggle LED:", choices);
+        var selected = _ui.SelectOneWithEscape("Select printer to toggle LED:", choices);
 
-        if (selected == "Cancel")
+        if (selected == null)
             return;
 
         // Extract printer name
@@ -1559,11 +1565,10 @@ WantedBy=multi-user.target
         }
 
         var choices = printers.Select(p => p.Name).ToList();
-        choices.Add("Cancel");
 
-        var selected = _ui.SelectOne("Select printer to view:", choices);
+        var selected = _ui.SelectOneWithEscape("Select printer to view:", choices);
 
-        if (selected == "Cancel")
+        if (selected == null)
             return;
 
         var printer = printers.First(p => p.Name == selected);
@@ -1692,6 +1697,457 @@ WantedBy=multi-user.target
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine("[grey]Press any key to return...[/]");
         Console.ReadKey(true);
+    }
+
+    private async Task ShowBedMeshMenuFromMainAsync()
+    {
+        var (success, printers, _) = await _ipcClient!.ListPrintersAsync();
+
+        if (!success || printers == null || printers.Count == 0)
+        {
+            _ui.WriteWarning("No printers configured.");
+            await Task.Delay(1500);
+            return;
+        }
+
+        await ShowBedMeshMenuAsync(printers);
+    }
+
+    private async Task ShowBedMeshMenuAsync(List<PrinterStatus> printers)
+    {
+        while (true)
+        {
+            _ui.Clear();
+            _ui.WriteRule("BedMesh");
+            _ui.WriteLine();
+
+            var choice = _ui.SelectOneWithEscape("Select action:", new[]
+            {
+                "Calibrate",
+                "Analyse (coming soon)",
+                "Sessions"
+            });
+
+            if (choice == null)
+                return;
+
+            switch (choice)
+            {
+                case "Calibrate":
+                    await RunCalibrationWizardAsync(printers);
+                    break;
+
+                case "Analyse (coming soon)":
+                    _ui.WriteInfo("Analysis feature coming soon!");
+                    await Task.Delay(1500);
+                    break;
+
+                case "Sessions":
+                    await ShowSessionsMenuAsync();
+                    break;
+            }
+        }
+    }
+
+    private async Task RunCalibrationWizardAsync(List<PrinterStatus> printers)
+    {
+        _ui.Clear();
+        _ui.WriteRule("BedMesh Calibration");
+        _ui.WriteLine();
+
+        // Select printer
+        var choices = printers.Select(p =>
+        {
+            var status = p.State == PrinterState.Running ? "[green]●[/]" : "[grey]○[/]";
+            return $"{status} {p.Name}";
+        }).ToList();
+
+        var selected = _ui.SelectOneWithEscape("Select printer:", choices);
+
+        if (selected == null)
+            return;
+
+        // Extract printer name (remove status prefix)
+        var printerName = selected.Substring(selected.IndexOf(' ') + 1);
+        var printerStatus = printers.First(p => p.Name == printerName);
+
+        _ui.Clear();
+        _ui.WriteRule($"BedMesh Calibration - {printerName}");
+        _ui.WriteLine();
+
+        // Check if printer is connected
+        if (printerStatus.State != PrinterState.Running)
+        {
+            _ui.WriteError("Printer must be connected and running to start calibration.");
+            _ui.WaitForKey("Press any key to continue...");
+            return;
+        }
+
+        // Check if calibration already running
+        var (sessionsSuccess, sessions, _) = await _ipcClient!.GetBedMeshSessionsAsync();
+        if (sessionsSuccess && sessions != null)
+        {
+            var (configSuccess, config, _) = await _ipcClient.GetPrinterConfigAsync(printerName);
+            if (configSuccess && config != null && !string.IsNullOrEmpty(config.DeviceId))
+            {
+                var existingSession = sessions.ActiveSessions.FirstOrDefault(s => s.DeviceId == config.DeviceId);
+                if (existingSession != null)
+                {
+                    _ui.WriteWarning($"Calibration already running for this printer (started {existingSession.StartedUtc.ToLocalTime():HH:mm:ss})");
+                    _ui.WaitForKey("Press any key to continue...");
+                    return;
+                }
+            }
+        }
+
+        // Heat soak selection
+        _ui.WriteInfo("Heat soak warms the bed before calibration for more accurate results.");
+        _ui.WriteLine();
+
+        var heatSoakChoice = _ui.SelectOneWithEscape("Select heat soak duration:", new[]
+        {
+            "None (0 minutes)",
+            "15 minutes",
+            "30 minutes",
+            "60 minutes",
+            "90 minutes",
+            "120 minutes",
+            "Custom"
+        });
+
+        if (heatSoakChoice == null)
+            return;
+
+        int heatSoakMinutes;
+        if (heatSoakChoice == "Custom")
+        {
+            var customMinutes = _ui.Ask("Enter heat soak duration in minutes:", "0");
+            if (!int.TryParse(customMinutes, out heatSoakMinutes) || heatSoakMinutes < 0)
+            {
+                _ui.WriteError("Invalid value. Must be a positive integer.");
+                _ui.WaitForKey("Press any key to continue...");
+                return;
+            }
+        }
+        else
+        {
+            heatSoakMinutes = heatSoakChoice switch
+            {
+                "15 minutes" => 15,
+                "30 minutes" => 30,
+                "60 minutes" => 60,
+                "90 minutes" => 90,
+                "120 minutes" => 120,
+                _ => 0
+            };
+        }
+
+        // Session name (optional)
+        _ui.WriteLine();
+        _ui.WriteInfo("Optionally enter a name for this calibration (e.g., build plate identifier).");
+        var sessionName = _ui.Ask("Name (leave empty to skip):", "");
+        sessionName = string.IsNullOrWhiteSpace(sessionName) ? null : sessionName.Trim();
+
+        // Confirmation
+        _ui.WriteLine();
+        _ui.WriteInfo($"Calibration will:");
+        _ui.WriteLine($"  1. Turn camera LED on");
+        if (heatSoakMinutes > 0)
+        {
+            _ui.WriteLine($"  2. Heat bed to 60°C and wait {heatSoakMinutes} minutes");
+            _ui.WriteLine($"  3. Run preheating, wiping, and probing sequences");
+        }
+        else
+        {
+            _ui.WriteLine($"  2. Run preheating, wiping, and probing sequences");
+        }
+        _ui.WriteLine();
+
+        if (!_ui.Confirm("Start calibration?", true))
+            return;
+
+        // Start calibration
+        _ui.WriteInfo("Starting calibration...");
+        var (success, error) = await _ipcClient.StartCalibrationAsync(printerName, heatSoakMinutes, sessionName);
+
+        if (success)
+        {
+            _ui.WriteSuccess("Calibration started!");
+            _ui.WriteInfo("You can monitor progress in the Sessions menu.");
+        }
+        else
+        {
+            _ui.WriteError($"Failed to start calibration: {error ?? "Unknown error"}");
+        }
+
+        _ui.WaitForKey("Press any key to continue...");
+    }
+
+    private async Task ShowSessionsMenuAsync()
+    {
+        while (true)
+        {
+            _ui.Clear();
+            _ui.WriteRule("BedMesh Sessions");
+            _ui.WriteLine();
+
+            var (success, sessions, _) = await _ipcClient!.GetBedMeshSessionsAsync();
+            if (!success || sessions == null)
+            {
+                _ui.WriteError("Failed to get sessions");
+                _ui.WaitForKey("Press any key to continue...");
+                return;
+            }
+
+            // Show all sessions (not filtered by printer)
+            var activeSessions = sessions.ActiveSessions;
+            var calibrations = sessions.Calibrations;
+
+            var choices = new List<string>
+            {
+                $"Active ({activeSessions.Count})",
+                $"Saved calibrations ({calibrations.Count})",
+                $"Saved analyses ({sessions.AnalysisCount})"
+            };
+
+            var choice = _ui.SelectOneWithEscape("Select category:", choices);
+
+            if (choice == null)
+                return;
+
+            if (choice.StartsWith("Active"))
+            {
+                await ShowActiveSessionsAsync(activeSessions);
+            }
+            else if (choice.StartsWith("Saved calibrations"))
+            {
+                await ShowSavedCalibrationsAsync(calibrations);
+            }
+            else if (choice.StartsWith("Saved analyses"))
+            {
+                _ui.WriteInfo("Analysis feature coming soon!");
+                await Task.Delay(1500);
+            }
+        }
+    }
+
+    private async Task ShowActiveSessionsAsync(List<BedMeshSession> activeSessions)
+    {
+        if (activeSessions.Count == 0)
+        {
+            _ui.WriteInfo("No active calibrations");
+            _ui.WaitForKey("Press any key to continue...");
+            return;
+        }
+
+        // Auto-refresh display
+        var refreshInterval = TimeSpan.FromSeconds(5);
+        var lastRefresh = DateTime.MinValue;
+        var completedNotifications = new List<string>();
+        var previousSessionIds = activeSessions.Select(s => s.DeviceId).ToHashSet();
+
+        while (!Console.KeyAvailable)
+        {
+            if ((DateTime.UtcNow - lastRefresh) >= refreshInterval)
+            {
+                // Refresh data
+                var (success, sessions, _) = await _ipcClient!.GetBedMeshSessionsAsync();
+                if (success && sessions != null)
+                {
+                    // Check for completed sessions (were active before, not active now)
+                    var currentIds = sessions.ActiveSessions.Select(s => s.DeviceId).ToHashSet();
+                    foreach (var prevId in previousSessionIds)
+                    {
+                        if (!currentIds.Contains(prevId))
+                        {
+                            // Session completed - check if it's in saved calibrations
+                            var completed = sessions.Calibrations
+                                .FirstOrDefault(c => c.DeviceId == prevId);
+                            if (completed != null)
+                            {
+                                var statusText = completed.Status == CalibrationStatus.Success
+                                    ? "[green]SUCCESS[/]"
+                                    : "[red]FAILED[/]";
+                                var range = completed.MeshRange.HasValue
+                                    ? $" | Range: {MeshStats.FormatMm(completed.MeshRange.Value)}"
+                                    : "";
+                                completedNotifications.Insert(0,
+                                    $"{statusText} {completed.PrinterName} at {completed.Timestamp.ToLocalTime():HH:mm:ss}{range}");
+                            }
+                            else
+                            {
+                                // Session disappeared but not in saved - likely failed
+                                var prevSession = activeSessions.FirstOrDefault(s => s.DeviceId == prevId);
+                                if (prevSession != null)
+                                {
+                                    completedNotifications.Insert(0,
+                                        $"[red]FAILED[/] {prevSession.PrinterName} - Session ended unexpectedly");
+                                }
+                            }
+                        }
+                    }
+
+                    previousSessionIds = currentIds;
+                    activeSessions = sessions.ActiveSessions;
+                }
+
+                // Clear screen and redraw everything
+                AnsiConsole.Clear();
+                AnsiConsole.MarkupLine("[bold blue]───────────────────── Active Sessions ─────────────────────[/]");
+                AnsiConsole.MarkupLine("[grey]Auto-refreshes every 5 seconds. Press any key to go back.[/]");
+                AnsiConsole.WriteLine();
+
+                // Show completion notifications at the top
+                if (completedNotifications.Count > 0)
+                {
+                    AnsiConsole.MarkupLine("[bold]Recent completions:[/]");
+                    foreach (var notification in completedNotifications.Take(5))
+                    {
+                        AnsiConsole.MarkupLine($"  {notification}");
+                    }
+                    AnsiConsole.WriteLine();
+                }
+
+                // Show active sessions
+                if (activeSessions.Count > 0)
+                {
+                    foreach (var session in activeSessions)
+                    {
+                        var elapsed = session.DurationFormatted;
+                        var step = session.CurrentStep ?? "Calibrating...";
+                        var heatSoak = session.HeatSoakMinutes > 0 ? $" | Heat soak: {session.HeatSoakMinutes}min" : "";
+                        var nameDisplay = !string.IsNullOrEmpty(session.Name) ? $" ({Markup.Escape(session.Name)})" : "";
+
+                        AnsiConsole.MarkupLine($"  [white]{Markup.Escape(session.PrinterName)}{nameDisplay}[/] - [yellow]{Markup.Escape(step)}[/]");
+                        AnsiConsole.MarkupLine($"    [grey]Started: {session.StartedUtc.ToLocalTime():HH:mm:ss} | Elapsed: {elapsed}{heatSoak}[/]");
+                        AnsiConsole.WriteLine();
+                    }
+                }
+                else
+                {
+                    AnsiConsole.MarkupLine("[grey]No active calibrations[/]");
+                }
+
+                lastRefresh = DateTime.UtcNow;
+            }
+
+            await Task.Delay(100);
+        }
+
+        Console.ReadKey(true); // Consume the key
+    }
+
+    private async Task ShowSavedCalibrationsAsync(List<BedMeshSessionInfo> calibrations)
+    {
+        while (true)
+        {
+            // Refresh calibrations list each iteration (in case of deletion)
+            var (refreshSuccess, sessions, _) = await _ipcClient!.GetBedMeshSessionsAsync();
+            if (refreshSuccess && sessions != null)
+            {
+                calibrations = sessions.Calibrations;
+            }
+
+            if (calibrations.Count == 0)
+            {
+                _ui.WriteInfo("No saved calibrations");
+                _ui.WaitForKey("Press any key to continue...");
+                return;
+            }
+
+            _ui.Clear();
+            _ui.WriteRule("Saved Calibrations");
+            _ui.WriteLine();
+
+            // Build choices from calibrations
+            var choices = calibrations.Select(c =>
+            {
+                var status = c.Status == CalibrationStatus.Success ? "[green]✓[/]" : "[red]✗[/]";
+                var range = c.MeshRange.HasValue ? $"Range: {MeshStats.FormatMm(c.MeshRange.Value)}" : "";
+                // Show Name if set, otherwise show DeviceType
+                var description = !string.IsNullOrEmpty(c.Name) ? c.Name : c.DeviceType ?? "";
+                var descDisplay = !string.IsNullOrEmpty(description) ? $" | {description}" : "";
+                return $"{status} {c.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm} | {c.PrinterName}{descDisplay} | {range}";
+            }).ToList();
+
+            var indexedChoices = choices.Select((c, i) => (Choice: c, Index: i)).ToList();
+
+            var selected = _ui.SelectOneWithEscape("Select calibration to view:", choices);
+
+            if (selected == null)
+                return;
+
+            var selectedIndex = indexedChoices.First(x => x.Choice == selected).Index;
+            if (selectedIndex < calibrations.Count)
+            {
+                await ShowCalibrationDetailsAsync(calibrations[selectedIndex]);
+            }
+        }
+    }
+
+    private async Task ShowCalibrationDetailsAsync(BedMeshSessionInfo info)
+    {
+        var (success, session, _) = await _ipcClient!.GetCalibrationAsync(info.FileName);
+        if (!success || session == null)
+        {
+            _ui.WriteError("Failed to load calibration details");
+            _ui.WaitForKey("Press any key to continue...");
+            return;
+        }
+
+        _ui.Clear();
+        var titleSuffix = !string.IsNullOrEmpty(session.Name) ? $" ({session.Name})" : "";
+        _ui.WriteRule($"Calibration Result - {session.PrinterName}{titleSuffix}");
+        _ui.WriteLine();
+
+        // Use the visual mesh renderer if mesh data is available
+        if (session.MeshData != null && session.MeshData.Points.Length > 0)
+        {
+            MeshVisualizer.RenderCalibrationResult(session);
+        }
+        else
+        {
+            // Fallback to text-only display
+            var statusDisplay = session.Status == CalibrationStatus.Success
+                ? "[green]SUCCESS[/]"
+                : "[red]FAILED[/]";
+            AnsiConsole.MarkupLine($"  Status:    {statusDisplay}");
+            if (!string.IsNullOrEmpty(session.Name))
+                AnsiConsole.MarkupLine($"  Name:      [grey]{Markup.Escape(session.Name)}[/]");
+            AnsiConsole.MarkupLine($"  Started:   [grey]{session.StartedUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}[/]");
+            if (session.FinishedUtc.HasValue)
+                AnsiConsole.MarkupLine($"  Finished:  [grey]{session.FinishedUtc.Value.ToLocalTime():yyyy-MM-dd HH:mm:ss}[/]");
+            AnsiConsole.MarkupLine($"  Duration:  [grey]{session.DurationFormatted}[/]");
+            if (session.HeatSoakMinutes > 0)
+                AnsiConsole.MarkupLine($"  Heat Soak: [grey]{session.HeatSoakMinutes} min[/]");
+
+            if (!string.IsNullOrEmpty(session.ErrorMessage))
+            {
+                AnsiConsole.WriteLine();
+                AnsiConsole.MarkupLine($"  [red]Error: {Markup.Escape(session.ErrorMessage)}[/]");
+            }
+        }
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey][[D]][/][grey]elete  |  Press any other key to go back...[/]");
+
+        var key = Console.ReadKey(true).Key;
+        if (key == ConsoleKey.D)
+        {
+            if (_ui.Confirm("Delete this calibration?", false))
+            {
+                var (deleteSuccess, error) = await _ipcClient.DeleteCalibrationAsync(info.FileName);
+                if (deleteSuccess)
+                {
+                    _ui.WriteSuccess("Calibration deleted.");
+                }
+                else
+                {
+                    _ui.WriteError($"Failed to delete: {error ?? "Unknown error"}");
+                }
+                await Task.Delay(1500);
+            }
+        }
     }
 
     #region Input Validation Helpers

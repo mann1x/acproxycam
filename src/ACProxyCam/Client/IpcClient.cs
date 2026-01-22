@@ -60,7 +60,21 @@ public class IpcClient : IDisposable
     /// </summary>
     public void Disconnect()
     {
-        _socket?.Close();
+        try
+        {
+            if (_socket != null && _socket.Connected)
+            {
+                _socket.Shutdown(SocketShutdown.Both);
+            }
+        }
+        catch { /* Ignore shutdown errors */ }
+
+        try
+        {
+            _socket?.Close();
+        }
+        catch { /* Ignore close errors */ }
+
         _socket?.Dispose();
         _socket = null;
     }
@@ -240,6 +254,55 @@ public class IpcClient : IDisposable
         return (response.Success, response.Error);
     }
 
+    /// <summary>
+    /// Get BedMesh session summary.
+    /// </summary>
+    public async Task<(bool Success, BedMeshSessionSummary? Data, string? Error)> GetBedMeshSessionsAsync()
+    {
+        var response = await SendAsync(IpcCommands.GetBedMeshSessions);
+        if (!response.Success)
+            return (false, null, response.Error);
+
+        var data = DeserializeData<BedMeshSessionSummary>(response.Data);
+        return (true, data, null);
+    }
+
+    /// <summary>
+    /// Start a BedMesh calibration.
+    /// </summary>
+    public async Task<(bool Success, string? Error)> StartCalibrationAsync(string printerName, int heatSoakMinutes, string? name = null)
+    {
+        var response = await SendAsync(IpcCommands.StartCalibration, new StartCalibrationRequest
+        {
+            PrinterName = printerName,
+            HeatSoakMinutes = heatSoakMinutes,
+            Name = name
+        });
+        return (response.Success, response.Error);
+    }
+
+    /// <summary>
+    /// Get a saved calibration by filename.
+    /// </summary>
+    public async Task<(bool Success, BedMeshSession? Data, string? Error)> GetCalibrationAsync(string fileName)
+    {
+        var response = await SendAsync(IpcCommands.GetCalibration, new CalibrationFileRequest { FileName = fileName });
+        if (!response.Success)
+            return (false, null, response.Error);
+
+        var data = DeserializeData<BedMeshSession>(response.Data);
+        return (true, data, null);
+    }
+
+    /// <summary>
+    /// Delete a saved calibration.
+    /// </summary>
+    public async Task<(bool Success, string? Error)> DeleteCalibrationAsync(string fileName)
+    {
+        var response = await SendAsync(IpcCommands.DeleteCalibration, new CalibrationFileRequest { FileName = fileName });
+        return (response.Success, response.Error);
+    }
+
     private T? DeserializeData<T>(object? data) where T : class
     {
         if (data == null) return null;
@@ -252,6 +315,6 @@ public class IpcClient : IDisposable
 
     public void Dispose()
     {
-        _socket?.Dispose();
+        Disconnect();
     }
 }

@@ -134,6 +134,30 @@ public class SetLedRequest
 }
 
 /// <summary>
+/// Request to start BedMesh calibration.
+/// </summary>
+public class StartCalibrationRequest
+{
+    [JsonPropertyName("printerName")]
+    public string PrinterName { get; set; } = "";
+
+    [JsonPropertyName("heatSoakMinutes")]
+    public int HeatSoakMinutes { get; set; }
+
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
+}
+
+/// <summary>
+/// Request to get or delete a calibration.
+/// </summary>
+public class CalibrationFileRequest
+{
+    [JsonPropertyName("fileName")]
+    public string FileName { get; set; } = "";
+}
+
+/// <summary>
 /// IPC command names.
 /// </summary>
 public static class IpcCommands
@@ -152,4 +176,10 @@ public static class IpcCommands
     public const string StopService = "stop_service";
     public const string GetLedStatus = "get_led_status";
     public const string SetLed = "set_led";
+
+    // BedMesh commands
+    public const string GetBedMeshSessions = "get_bedmesh_sessions";
+    public const string StartCalibration = "start_calibration";
+    public const string GetCalibration = "get_calibration";
+    public const string DeleteCalibration = "delete_calibration";
 }

@@ -14,6 +14,7 @@ public class DaemonService
     private readonly DateTime _startTime = DateTime.UtcNow;
     private IpcServer? _ipcServer;
     private PrinterManager? _printerManager;
+    private BedMeshManager? _bedMeshManager;
     private AppConfig? _config;
 
     public TimeSpan Uptime => DateTime.UtcNow - _startTime;
@@ -34,13 +35,19 @@ public class DaemonService
         // Initialize printer manager
         _printerManager = new PrinterManager(_config);
 
+        // Initialize BedMesh manager
+        _bedMeshManager = new BedMeshManager(_printerManager);
+
         // Start IPC server
-        _ipcServer = new IpcServer(this, _printerManager);
+        _ipcServer = new IpcServer(this, _printerManager, _bedMeshManager);
         await _ipcServer.StartAsync();
         Logger.Log("IPC server started");
 
         // Start all configured printers
         await _printerManager.StartAllAsync();
+
+        // Start BedMesh monitoring (after printers so we can find them for recovery)
+        await _bedMeshManager.StartAsync();
 
         // Notify systemd we're ready (if running under systemd)
         NotifySystemdReady();
@@ -60,6 +67,8 @@ public class DaemonService
         // Graceful shutdown
         Logger.Log("Shutting down...");
 
+        if (_bedMeshManager != null)
+            await _bedMeshManager.StopAsync();
         await _printerManager.StopAllAsync();
         _ipcServer.Stop();
 

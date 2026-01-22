@@ -69,6 +69,12 @@ public interface IConsoleUI
     string SelectOne(string title, IEnumerable<string> choices);
 
     /// <summary>
+    /// Present a single-choice selection menu with Escape key support.
+    /// Returns null if user presses Escape to cancel.
+    /// </summary>
+    string? SelectOneWithEscape(string title, IEnumerable<string> choices);
+
+    /// <summary>
     /// Present a multi-choice selection menu.
     /// </summary>
     List<string> SelectMany(string title, IEnumerable<string> choices, string? instructions = null);

@@ -137,6 +137,37 @@ public class SimpleConsoleUI : IConsoleUI
         return choiceList[0];
     }
 
+    public string? SelectOneWithEscape(string title, IEnumerable<string> choices)
+    {
+        var choiceList = choices.ToList();
+
+        Console.WriteLine(title);
+        for (int i = 0; i < choiceList.Count; i++)
+        {
+            Console.WriteLine($"  {i + 1}. {choiceList[i]}");
+        }
+        Console.WriteLine("  0. Cancel");
+
+        Console.Write($"Enter choice (0-{choiceList.Count}): ");
+        Console.Out.Flush();
+
+        var input = Console.ReadLine()?.Trim();
+
+        // Cancel on 0, empty, or 'c'
+        if (string.IsNullOrEmpty(input) || input == "0" || input.ToLower() == "c")
+        {
+            return null;
+        }
+
+        if (int.TryParse(input, out var index) && index >= 1 && index <= choiceList.Count)
+        {
+            return choiceList[index - 1];
+        }
+
+        // Invalid input - treat as cancel
+        return null;
+    }
+
     public List<string> SelectMany(string title, IEnumerable<string> choices, string? instructions = null)
     {
         var choiceList = choices.ToList();

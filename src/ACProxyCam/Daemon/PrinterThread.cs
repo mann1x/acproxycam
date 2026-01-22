@@ -835,6 +835,7 @@ public class PrinterThread : IDisposable
                     {
                         ResetLogThrottling(); // Reset throttling on successful recovery
                         _streamFailedAt = DateTime.MinValue;
+                        _state = PrinterState.Running; // Ensure state is Running after recovery
                     }
                     _lastSeenOnline = DateTime.UtcNow;
                     _streamFailedAt = DateTime.MinValue; // Reset failure tracking
@@ -869,6 +870,7 @@ public class PrinterThread : IDisposable
                     if (_streamFailedAt == DateTime.MinValue)
                     {
                         _streamFailedAt = DateTime.UtcNow;
+                        _state = PrinterState.Retrying; // Update state so UI reflects recovery mode
                     }
 
                     var failureDuration = DateTime.UtcNow - _streamFailedAt;

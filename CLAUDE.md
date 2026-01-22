@@ -141,7 +141,53 @@ When adding a printer, optional connectivity check verifies:
 | DietPi (x64) | linux-x64 | 192.168.178.2 | claude_test |
 | Printer | Anycubic Kobra S1 | 192.168.178.43 | root (password: rockchip) |
 
-Deploy commands:
+### Automated Testing with Expect
+
+The CLI has a hidden `--simple-ui` argument that uses `SimpleConsoleUI` instead of `SpectreConsoleUI`. This allows automated testing with `expect` scripts since it doesn't use advanced terminal features.
+
+```bash
+# Run CLI with simple UI for expect automation
+sudo /usr/local/bin/acproxycam --simple-ui
+```
+
+Example expect script for testing BedMesh calibration:
+```expect
+#!/usr/bin/expect -f
+set timeout 300
+spawn sudo /usr/local/bin/acproxycam --simple-ui
+
+expect "Select option:"
+send "b"  ;# BedMesh menu
+
+expect "Select option:"
+send "1"  ;# Calibrate
+
+expect "Select printer"
+send "1\r"  ;# First printer
+
+expect -re "heat.?soak|minutes"
+send "0\r"  ;# No heat soak
+
+expect -re "complete|Complete|saved"
+puts "CALIBRATION COMPLETED"
+```
+
+`expect` is available on the test servers for automated testing.
+
+### Deploy and Test via SSH
+
+Use Windows OpenSSH (not Git for Windows SSH) to deploy and test. Do NOT use Python paramiko - use direct SSH and scp commands instead.
+
+**Important**: Always use the full path to Windows OpenSSH or ensure it's in your PATH before Git's SSH:
+```bash
+# Windows OpenSSH is typically at:
+C:\Windows\System32\OpenSSH\ssh.exe
+C:\Windows\System32\OpenSSH\scp.exe
+
+# Or use with explicit key file:
+ssh -i ~/.ssh/claude_test claude_test@192.168.178.12
+```
+
 ```bash
 # Stop service before deployment
 ssh claude_test@192.168.178.12 "sudo systemctl stop acproxycam"
@@ -151,28 +197,61 @@ scp src/ACProxyCam/bin/Release/net8.0/linux-arm64/publish/acproxycam claude_test
 
 # Install and restart
 ssh claude_test@192.168.178.12 "sudo cp /tmp/acproxycam_new /usr/local/bin/acproxycam && sudo chmod +x /usr/local/bin/acproxycam && sudo systemctl start acproxycam"
+
+# Check service status
+ssh claude_test@192.168.178.12 "sudo systemctl status acproxycam"
 ```
 
-### Deploy via Python (paramiko)
+### Running Tests via SSH
 
-SSH key authentication is required. Use paramiko with Ed25519 key:
+For interactive testing with expect, SSH into the test server and run commands directly:
 
-```python
-import paramiko
+```bash
+# SSH into test server
+ssh claude_test@192.168.178.12
 
-ssh = paramiko.SSHClient()
-ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-pkey = paramiko.Ed25519Key.from_private_key_file(r'c:\users\manni\.ssh\claude_test')
-ssh.connect('192.168.178.12', username='claude_test', pkey=pkey, timeout=10)
+# On the server, create and run expect scripts directly
+cat > /tmp/test_calibration.exp << 'EOF'
+#!/usr/bin/expect -f
+set timeout 600
+spawn sudo /usr/local/bin/acproxycam --simple-ui
 
-# Stop, upload, install, start
-ssh.exec_command('sudo systemctl stop acproxycam')
-sftp = ssh.open_sftp()
-sftp.put(local_path, '/tmp/acproxycam_new')
-sftp.close()
-ssh.exec_command('sudo cp /tmp/acproxycam_new /usr/local/bin/acproxycam && sudo chmod +x /usr/local/bin/acproxycam && sudo systemctl start acproxycam')
-ssh.close()
+expect "Select option:"
+send "b"
+
+expect "Select option:"
+send "1"
+
+expect -re "Select printer|Enter.*number"
+send "1\r"
+
+expect -re "heat.?soak|minutes|Heat"
+send "0\r"
+
+expect -re "name.*calibration|Name|optional"
+send "\r"
+
+set timeout 900
+expect {
+    -re "complete|Complete|saved|SUCCESS|finished" {
+        puts "\nCALIBRATION COMPLETED SUCCESSFULLY"
+    }
+    -re "fail|error|Error|FAIL" {
+        puts "\nCALIBRATION FAILED"
+    }
+    timeout {
+        puts "\nCALIBRATION TIMEOUT"
+    }
+}
+send "q"
+expect eof
+EOF
+
+chmod +x /tmp/test_calibration.exp
+expect /tmp/test_calibration.exp
 ```
+
+**Important**: Always use direct SSH for testing - do not use Python paramiko wrappers as they have issues with terminal handling and expect scripts.
 
 ## Creating a Release
 

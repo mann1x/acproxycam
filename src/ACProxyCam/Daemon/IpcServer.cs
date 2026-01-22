@@ -16,14 +16,16 @@ public class IpcServer
 
     private readonly DaemonService _daemon;
     private readonly PrinterManager _printerManager;
+    private readonly BedMeshManager _bedMeshManager;
     private Socket? _socket;
     private CancellationTokenSource? _cts;
     private Task? _acceptTask;
 
-    public IpcServer(DaemonService daemon, PrinterManager printerManager)
+    public IpcServer(DaemonService daemon, PrinterManager printerManager, BedMeshManager bedMeshManager)
     {
         _daemon = daemon;
         _printerManager = printerManager;
+        _bedMeshManager = bedMeshManager;
     }
 
     public async Task StartAsync()
@@ -194,6 +196,25 @@ public class IpcServer
                     var setLedReq = DeserializeData<SetLedRequest>(request.Data);
                     if (setLedReq == null) return IpcResponse.Fail("Invalid request data");
                     return await SetLedAsync(setLedReq.Name, setLedReq.On);
+
+                // BedMesh commands
+                case IpcCommands.GetBedMeshSessions:
+                    return await _bedMeshManager.GetSessionsAsync();
+
+                case IpcCommands.StartCalibration:
+                    var startCalReq = DeserializeData<StartCalibrationRequest>(request.Data);
+                    if (startCalReq == null) return IpcResponse.Fail("Invalid request data");
+                    return await _bedMeshManager.StartCalibrationAsync(startCalReq.PrinterName, startCalReq.HeatSoakMinutes, startCalReq.Name);
+
+                case IpcCommands.GetCalibration:
+                    var getCalReq = DeserializeData<CalibrationFileRequest>(request.Data);
+                    if (getCalReq == null) return IpcResponse.Fail("Invalid request data");
+                    return await _bedMeshManager.GetCalibrationAsync(getCalReq.FileName);
+
+                case IpcCommands.DeleteCalibration:
+                    var delCalReq = DeserializeData<CalibrationFileRequest>(request.Data);
+                    if (delCalReq == null) return IpcResponse.Fail("Invalid request data");
+                    return _bedMeshManager.DeleteCalibration(delCalReq.FileName);
 
                 default:
                     return IpcResponse.Fail($"Unknown command: {request.Command}");
