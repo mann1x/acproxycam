@@ -143,6 +143,73 @@ public class BedMeshManager : IDisposable
     }
 
     /// <summary>
+    /// Start an analysis for a printer (multiple calibrations).
+    /// </summary>
+    public async Task<IpcResponse> StartAnalysisAsync(string printerName, int heatSoakMinutes, int calibrationCount, string? name = null)
+    {
+        // Get printer config
+        var config = _printerManager.GetConfig(printerName);
+        if (config == null)
+            return IpcResponse.Fail($"Printer '{printerName}' not found");
+
+        if (string.IsNullOrEmpty(config.DeviceId))
+            return IpcResponse.Fail($"Printer '{printerName}' has no deviceId - connect at least once first");
+
+        if (calibrationCount < 5)
+            return IpcResponse.Fail("Analysis requires at least 5 calibrations for IQR accuracy");
+
+        // Get the printer thread for LED control
+        var printerThread = _printerManager.GetPrinterThread(printerName);
+
+        // Create LED turn-on callback
+        Func<Task<bool>>? turnLedOn = null;
+        if (printerThread != null)
+        {
+            turnLedOn = async () =>
+            {
+                try
+                {
+                    return await printerThread.SetLedAsync(true);
+                }
+                catch
+                {
+                    return false;
+                }
+            };
+        }
+
+        var (success, error) = await _service.StartAnalysisAsync(config, heatSoakMinutes, calibrationCount, turnLedOn, name);
+
+        if (success)
+            return IpcResponse.Ok();
+        else
+            return IpcResponse.Fail(error ?? "Unknown error");
+    }
+
+    /// <summary>
+    /// Get a saved analysis by filename.
+    /// </summary>
+    public async Task<IpcResponse> GetAnalysisAsync(string fileName)
+    {
+        var analysis = await _service.LoadAnalysisAsync(fileName);
+        if (analysis == null)
+            return IpcResponse.Fail("Analysis not found");
+        return IpcResponse.Ok(analysis);
+    }
+
+    /// <summary>
+    /// Delete a saved analysis.
+    /// </summary>
+    public IpcResponse DeleteAnalysis(string fileName)
+    {
+        var success = _service.DeleteAnalysis(fileName);
+        if (success)
+            return IpcResponse.Ok();
+        else
+            return IpcResponse.Fail("Failed to delete analysis");
+    }
+
+    /// <summary>
     /// Get active sessions (for display).
     /// </summary>
     public List<BedMeshSession> GetActiveSessions()

@@ -31,13 +31,20 @@ public class BedMeshService : IDisposable
     private bool _disposed;
 
     /// <summary>
-    /// Currently active sessions being monitored.
+    /// Currently active calibration sessions being monitored.
     /// </summary>
     private readonly Dictionary<string, BedMeshSession> _activeSessions = new();
+
+    /// <summary>
+    /// Currently active analysis sessions being monitored.
+    /// </summary>
+    private readonly Dictionary<string, AnalysisSession> _activeAnalyses = new();
+
     private readonly object _lock = new();
 
     public event EventHandler<string>? StatusChanged;
     public event EventHandler<BedMeshSession>? SessionCompleted;
+    public event EventHandler<AnalysisSession>? AnalysisCompleted;
 
     /// <summary>
     /// Start the monitoring loop for active sessions.
@@ -110,20 +117,47 @@ public class BedMeshService : IDisposable
     /// </summary>
     public void AddRecoveredSession(PrinterConfig config, RunningSession runningSession)
     {
-        var session = new BedMeshSession
+        if (runningSession.IsAnalysis)
         {
-            DeviceId = runningSession.DeviceId,
-            PrinterName = runningSession.PrinterName,
-            DeviceType = runningSession.DeviceType,
-            StartedUtc = runningSession.StartedUtc,
-            HeatSoakMinutes = runningSession.HeatSoakMinutes,
-            Status = CalibrationStatus.Running,
-            CurrentStep = "Monitoring..."
-        };
+            // Recover as analysis session
+            var analysisSession = new AnalysisSession
+            {
+                DeviceId = runningSession.DeviceId,
+                PrinterName = runningSession.PrinterName,
+                DeviceType = runningSession.DeviceType,
+                Name = runningSession.Name,
+                StartedUtc = runningSession.StartedUtc,
+                HeatSoakMinutes = runningSession.HeatSoakMinutes,
+                Status = CalibrationStatus.Running,
+                CalibrationCount = runningSession.CalibrationCount,
+                CurrentCalibration = runningSession.CurrentCalibration,
+                CurrentStep = "Monitoring..."
+            };
 
-        lock (_lock)
+            lock (_lock)
+            {
+                _activeAnalyses[analysisSession.DeviceId] = analysisSession;
+            }
+        }
+        else
         {
-            _activeSessions[session.DeviceId] = session;
+            // Recover as calibration session
+            var session = new BedMeshSession
+            {
+                DeviceId = runningSession.DeviceId,
+                PrinterName = runningSession.PrinterName,
+                DeviceType = runningSession.DeviceType,
+                Name = runningSession.Name,
+                StartedUtc = runningSession.StartedUtc,
+                HeatSoakMinutes = runningSession.HeatSoakMinutes,
+                Status = CalibrationStatus.Running,
+                CurrentStep = "Monitoring..."
+            };
+
+            lock (_lock)
+            {
+                _activeSessions[session.DeviceId] = session;
+            }
         }
     }
 
@@ -213,13 +247,113 @@ public class BedMeshService : IDisposable
     }
 
     /// <summary>
-    /// Get all active sessions.
+    /// Start a new analysis (multiple calibrations) for a printer.
+    /// </summary>
+    public async Task<(bool success, string? error)> StartAnalysisAsync(
+        PrinterConfig config,
+        int heatSoakMinutes,
+        int calibrationCount,
+        Func<Task<bool>>? turnLedOn = null,
+        string? name = null)
+    {
+        if (string.IsNullOrEmpty(config.DeviceId))
+            return (false, "Printer deviceId is required");
+
+        if (calibrationCount < 3)
+            return (false, "Minimum 3 calibrations required for analysis");
+
+        // Check if session already running for this printer
+        lock (_lock)
+        {
+            if (_activeSessions.ContainsKey(config.DeviceId) || _activeAnalyses.ContainsKey(config.DeviceId))
+                return (false, "Session already running for this printer");
+        }
+
+        try
+        {
+            EnsureDirectoriesExist();
+
+            // Turn LED on
+            if (turnLedOn != null)
+            {
+                LogStatus($"Turning LED on for {config.Name}...");
+                await turnLedOn();
+            }
+
+            // Create analysis session
+            var session = new AnalysisSession
+            {
+                DeviceId = config.DeviceId,
+                PrinterName = config.Name,
+                DeviceType = config.DeviceType,
+                Name = name,
+                StartedUtc = DateTime.UtcNow,
+                HeatSoakMinutes = heatSoakMinutes,
+                CalibrationCount = calibrationCount,
+                Status = CalibrationStatus.Running,
+                CurrentStep = "Starting analysis..."
+            };
+
+            // Create running session file
+            var runningSession = new RunningSession
+            {
+                DeviceId = config.DeviceId,
+                PrinterName = config.Name,
+                DeviceType = config.DeviceType,
+                Name = name,
+                PrinterIp = config.Ip,
+                StartedUtc = session.StartedUtc,
+                HeatSoakMinutes = heatSoakMinutes,
+                IsAnalysis = true,
+                CalibrationCount = calibrationCount,
+                CurrentCalibration = 0
+            };
+
+            var runningPath = GetRunningSessionPath(config.DeviceId);
+            await File.WriteAllTextAsync(runningPath, JsonSerializer.Serialize(runningSession, new JsonSerializerOptions { WriteIndented = true }));
+
+            // Execute analysis script
+            var scriptResult = await ExecuteAnalysisScriptAsync(config, heatSoakMinutes, calibrationCount);
+            if (!scriptResult.success)
+            {
+                try { File.Delete(runningPath); } catch { }
+                return (false, scriptResult.error);
+            }
+
+            // Add to active analyses
+            lock (_lock)
+            {
+                _activeAnalyses[config.DeviceId] = session;
+            }
+
+            LogStatus($"Analysis started for {config.Name} ({calibrationCount} calibrations)");
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Get all active sessions (calibrations and analyses).
     /// </summary>
     public List<BedMeshSession> GetActiveSessions()
     {
         lock (_lock)
         {
             return _activeSessions.Values.ToList();
+        }
+    }
+
+    /// <summary>
+    /// Get all active analysis sessions.
+    /// </summary>
+    public List<AnalysisSession> GetActiveAnalyses()
+    {
+        lock (_lock)
+        {
+            return _activeAnalyses.Values.ToList();
         }
     }
 
@@ -232,8 +366,39 @@ public class BedMeshService : IDisposable
 
         lock (_lock)
         {
-            summary.ActiveCount = _activeSessions.Count;
-            summary.ActiveSessions = _activeSessions.Values.ToList();
+            summary.ActiveCount = _activeSessions.Count + _activeAnalyses.Count;
+
+            // Include both calibrations and analyses in active sessions
+            var activeSessions = new List<BedMeshSession>();
+            activeSessions.AddRange(_activeSessions.Values);
+
+            // Convert active analyses to BedMeshSession for display
+            foreach (var analysis in _activeAnalyses.Values)
+            {
+                var currentCalib = analysis.CurrentCalibration > 0 ? analysis.CurrentCalibration : 1;
+                // Check if step already has [N/M] prefix from script output
+                var stepAlreadyHasPrefix = analysis.CurrentStep?.StartsWith("[") == true;
+                var stepDisplay = !string.IsNullOrEmpty(analysis.CurrentStep)
+                    ? (stepAlreadyHasPrefix ? analysis.CurrentStep : $"[{currentCalib}/{analysis.CalibrationCount}] {analysis.CurrentStep}")
+                    : $"Calibration {currentCalib}/{analysis.CalibrationCount}";
+
+                activeSessions.Add(new BedMeshSession
+                {
+                    DeviceId = analysis.DeviceId,
+                    PrinterName = analysis.PrinterName,
+                    DeviceType = analysis.DeviceType,
+                    Name = analysis.Name,
+                    StartedUtc = analysis.StartedUtc,
+                    FinishedUtc = analysis.FinishedUtc,
+                    HeatSoakMinutes = analysis.HeatSoakMinutes,
+                    Status = analysis.Status,
+                    ErrorMessage = analysis.ErrorMessage,
+                    IsAnalysis = true,
+                    CurrentStep = stepDisplay
+                });
+            }
+
+            summary.ActiveSessions = activeSessions;
         }
 
         // Count saved calibrations
@@ -319,6 +484,46 @@ public class BedMeshService : IDisposable
     }
 
     /// <summary>
+    /// Load a saved analysis by filename.
+    /// </summary>
+    public async Task<AnalysisSession?> LoadAnalysisAsync(string fileName)
+    {
+        var path = Path.Combine(AnalysesDir, fileName);
+        if (!File.Exists(path))
+            return null;
+
+        try
+        {
+            var json = await File.ReadAllTextAsync(path);
+            return JsonSerializer.Deserialize<AnalysisSession>(json);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Delete a saved analysis.
+    /// </summary>
+    public bool DeleteAnalysis(string fileName)
+    {
+        var path = Path.Combine(AnalysesDir, fileName);
+        if (!File.Exists(path))
+            return false;
+
+        try
+        {
+            File.Delete(path);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Execute the calibration shell script on the printer via SSH.
     /// </summary>
     private async Task<(bool success, string? error)> ExecuteCalibrationScriptAsync(PrinterConfig config, int heatSoakMinutes)
@@ -379,6 +584,175 @@ public class BedMeshService : IDisposable
                 return (false, $"SSH error: {ex.Message}");
             }
         });
+    }
+
+    /// <summary>
+    /// Execute the analysis shell script on the printer via SSH.
+    /// </summary>
+    private async Task<(bool success, string? error)> ExecuteAnalysisScriptAsync(PrinterConfig config, int heatSoakMinutes, int calibrationCount)
+    {
+        return await Task.Run(() =>
+        {
+            try
+            {
+                using var client = new SshClient(config.Ip, config.SshPort, config.SshUser, config.SshPassword);
+                client.ConnectionInfo.Timeout = TimeSpan.FromSeconds(SshTimeoutSeconds);
+                client.Connect();
+
+                if (!client.IsConnected)
+                    return (false, "SSH connection failed");
+
+                LogStatus($"SSH connected to {config.Ip}, creating analysis script...");
+
+                // Create the shell script for analysis
+                var script = GenerateAnalysisScript(heatSoakMinutes, calibrationCount);
+                script = script.Replace("\r\n", "\n").Replace("\r", "\n");
+
+                var scriptBytes = System.Text.Encoding.UTF8.GetBytes(script);
+                var scriptBase64 = Convert.ToBase64String(scriptBytes);
+
+                var writeCmd = client.RunCommand($"echo '{scriptBase64}' | base64 -d > {PrinterScriptPath}");
+                if (writeCmd.ExitStatus != 0)
+                    return (false, $"Failed to create script: {writeCmd.Error}");
+
+                client.RunCommand($"chmod +x {PrinterScriptPath}");
+
+                LogStatus($"Starting analysis script on {config.Name} ({calibrationCount} calibrations)...");
+                var runCmd = client.RunCommand($"nohup sh {PrinterScriptPath} > /dev/null 2>&1 &");
+
+                Thread.Sleep(500);
+                var pidCheck = client.RunCommand($"cat {PrinterPidPath} 2>/dev/null");
+                if (pidCheck.ExitStatus != 0 || string.IsNullOrWhiteSpace(pidCheck.Result))
+                {
+                    var outCheck = client.RunCommand($"cat {PrinterOutputPath} 2>/dev/null");
+                    return (false, $"Script failed to start. Output: {outCheck.Result}");
+                }
+
+                var pid = pidCheck.Result.Trim();
+                LogStatus($"Analysis script started with PID {pid}");
+
+                client.Disconnect();
+                return (true, (string?)null);
+            }
+            catch (Exception ex)
+            {
+                return (false, $"SSH error: {ex.Message}");
+            }
+        });
+    }
+
+    /// <summary>
+    /// Generate the analysis shell script (multiple calibrations).
+    /// </summary>
+    private string GenerateAnalysisScript(int heatSoakMinutes, int calibrationCount)
+    {
+        // Heat soak section - only before first calibration
+        var heatSoakSection = heatSoakMinutes > 0 ? $@"
+# Heat soak (only before first calibration)
+echo ""STEP: Heat soak - setting bed to 60C via Moonraker API"" >> ""$LOG""
+wget -q -O /dev/null 'http://localhost:7125/printer/gcode/script?script=SET_HEATER_TEMPERATURE%20HEATER=heater_bed%20TARGET=60' 2>>""$LOG""
+echo ""STEP: Heat soak - waiting {heatSoakMinutes} minutes"" >> ""$LOG""
+sleep $(({heatSoakMinutes} * 60))
+echo ""STEP: Heat soak complete"" >> ""$LOG""
+" : "";
+
+        return $@"#!/bin/sh
+# ACProxyCam BedMesh Analysis Script - {calibrationCount} calibrations
+LOG=""{PrinterOutputPath}""
+echo ""$$"" > {PrinterPidPath}
+echo ""STARTED $(date -Iseconds)"" > ""$LOG""
+echo ""ANALYSIS_COUNT: {calibrationCount}"" >> ""$LOG""
+
+trap 'echo ""SCRIPT_EXIT: code=$? at $(date -Iseconds)"" >> ""$LOG""' EXIT
+
+API_CMD() {{
+    local timeout=$1
+    local cmd=$2
+    printf '%s\003' ""$cmd"" | nc -w ""$timeout"" localhost 18086 2>>""$LOG"" | tr -d '\003' | grep -v 'process_status_update' | grep -v 'process_gcode_response' | tail -1
+}}
+
+# Set Busy
+echo ""STEP: Setting printer busy"" >> ""$LOG""
+API_CMD 30 '{{""id"":1,""method"":""Printer/ReportUIWorkStatus"",""params"":{{""busy"":1}}}}'
+{heatSoakSection}
+CALIBRATION=1
+while [ $CALIBRATION -le {calibrationCount} ]; do
+    echo ""CALIBRATION_START: $CALIBRATION"" >> ""$LOG""
+    echo ""STEP: Starting calibration $CALIBRATION of {calibrationCount}"" >> ""$LOG""
+
+    # Ensure printer is busy and LED is on at start of each calibration
+    API_CMD 30 '{{""id"":1,""method"":""Printer/ReportUIWorkStatus"",""params"":{{""busy"":1}}}}'
+    API_CMD 30 '{{""id"":2,""method"":""Multicolor/LedCtrl"",""params"":{{""ledState"":1}}}}'
+
+    # Preheating
+    echo ""STEP: [$CALIBRATION/{calibrationCount}] Preheating"" >> ""$LOG""
+    RESULT=$(API_CMD 120 '{{""id"":3,""method"":""Leviq2/Preheating"",""params"":{{""script"":""LEVIQ2_PREHEATING""}}}}')
+    echo ""RESULT_PREHEAT_$CALIBRATION: $RESULT"" >> ""$LOG""
+    if echo ""$RESULT"" | grep -q '""error""'; then
+        echo ""ERROR: Preheating failed on calibration $CALIBRATION"" >> ""$LOG""
+        API_CMD 30 '{{""id"":99,""method"":""Printer/ReportUIWorkStatus"",""params"":{{""busy"":0}}}}'
+        rm -f {PrinterPidPath}
+        exit 1
+    fi
+
+    # Wiping
+    echo ""STEP: [$CALIBRATION/{calibrationCount}] Wiping"" >> ""$LOG""
+    RESULT=$(API_CMD 180 '{{""id"":4,""method"":""Leviq2/Wiping"",""params"":{{""script"":""LEVIQ2_WIPING""}}}}')
+    echo ""RESULT_WIPE_$CALIBRATION: $RESULT"" >> ""$LOG""
+    if echo ""$RESULT"" | grep -q '""error""'; then
+        echo ""ERROR: Wiping failed on calibration $CALIBRATION"" >> ""$LOG""
+        API_CMD 30 '{{""id"":99,""method"":""Printer/ReportUIWorkStatus"",""params"":{{""busy"":0}}}}'
+        rm -f {PrinterPidPath}
+        exit 1
+    fi
+
+    # Probe
+    echo ""STEP: [$CALIBRATION/{calibrationCount}] Probing"" >> ""$LOG""
+    RESULT=$(API_CMD 3600 '{{""id"":5,""method"":""Leviq2/Probe"",""params"":{{""script"":""LEVIQ2_PROBE""}}}}')
+    echo ""RESULT_PROBE_$CALIBRATION: $RESULT"" >> ""$LOG""
+    if echo ""$RESULT"" | grep -q '""error""'; then
+        echo ""ERROR: Probing failed on calibration $CALIBRATION"" >> ""$LOG""
+        API_CMD 30 '{{""id"":99,""method"":""Printer/ReportUIWorkStatus"",""params"":{{""busy"":0}}}}'
+        rm -f {PrinterPidPath}
+        exit 1
+    fi
+
+    # Save mesh (SAVE_CONFIG)
+    echo ""STEP: [$CALIBRATION/{calibrationCount}] Saving mesh"" >> ""$LOG""
+    RESULT=$(API_CMD 60 '{{""id"":6,""method"":""Config/PrinterConfSave"",""params"":{{""script"":""SAVE_CONFIG""}}}}')
+    echo ""RESULT_SAVE_$CALIBRATION: $RESULT"" >> ""$LOG""
+    sync
+    sleep 2
+
+    # Copy mesh data to numbered file for later retrieval
+    cp {PrinterMutableCfgPath} /tmp/acproxycam_mesh_$CALIBRATION.json 2>/dev/null
+    echo ""MESH_SAVED: $CALIBRATION"" >> ""$LOG""
+    echo ""CALIBRATION_END: $CALIBRATION"" >> ""$LOG""
+
+    # 1 minute pause between calibrations (except after last one)
+    if [ $CALIBRATION -lt {calibrationCount} ]; then
+        echo ""STEP: Pausing 1 minute before next calibration"" >> ""$LOG""
+        sleep 60
+    fi
+
+    CALIBRATION=$((CALIBRATION + 1))
+done
+
+# Turn off heaters (only after last calibration)
+echo ""STEP: Turning off heaters"" >> ""$LOG""
+wget -q -O /dev/null 'http://localhost:7125/printer/gcode/script?script=SET_HEATER_TEMPERATURE%20HEATER=extruder%20TARGET=0' 2>>""$LOG""
+wget -q -O /dev/null 'http://localhost:7125/printer/gcode/script?script=SET_HEATER_TEMPERATURE%20HEATER=heater_bed%20TARGET=0' 2>>""$LOG""
+
+# Set Free
+echo ""STEP: Setting printer free"" >> ""$LOG""
+API_CMD 30 '{{""id"":9,""method"":""Printer/ReportUIWorkStatus"",""params"":{{""busy"":0}}}}'
+
+echo ""CALIBRATIONS_COMPLETED: $(($CALIBRATION - 1))"" >> ""$LOG""
+echo ""SUCCESS $(date -Iseconds)"" >> ""$LOG""
+sync
+sleep 1
+rm -f {PrinterPidPath}
+";
     }
 
     /// <summary>
@@ -489,16 +863,26 @@ rm -f {PrinterPidPath}
             {
                 await Task.Delay(TimeSpan.FromSeconds(MonitorIntervalSeconds), ct);
 
-                List<string> toCheck;
+                List<string> calibrationsToCheck;
+                List<string> analysesToCheck;
                 lock (_lock)
                 {
-                    toCheck = _activeSessions.Keys.ToList();
+                    calibrationsToCheck = _activeSessions.Keys.ToList();
+                    analysesToCheck = _activeAnalyses.Keys.ToList();
                 }
 
-                foreach (var deviceId in toCheck)
+                // Check calibrations
+                foreach (var deviceId in calibrationsToCheck)
                 {
                     if (ct.IsCancellationRequested) break;
                     await CheckSessionStatusAsync(deviceId, ct);
+                }
+
+                // Check analyses
+                foreach (var deviceId in analysesToCheck)
+                {
+                    if (ct.IsCancellationRequested) break;
+                    await CheckAnalysisStatusAsync(deviceId, ct);
                 }
             }
             catch (OperationCanceledException)
@@ -708,8 +1092,8 @@ rm -f {PrinterPidPath}
                         return;
                     }
 
-                    // Remove script, output, and PID files
-                    client.RunCommand($"rm -f {PrinterScriptPath} {PrinterOutputPath} {PrinterPidPath}");
+                    // Remove script, output, PID files, and any temporary mesh files
+                    client.RunCommand($"rm -f {PrinterScriptPath} {PrinterOutputPath} {PrinterPidPath} /tmp/acproxycam_mesh_*.json");
                     client.Disconnect();
                     LogStatus($"Cleaned up temporary files on printer {printerIp}");
                 }
@@ -719,6 +1103,340 @@ rm -f {PrinterPidPath}
                 LogStatus($"Failed to cleanup printer files: {ex.Message}");
             }
         });
+    }
+
+    /// <summary>
+    /// Check the status of a running analysis session.
+    /// </summary>
+    private async Task CheckAnalysisStatusAsync(string deviceId, CancellationToken ct)
+    {
+        AnalysisSession? session;
+        lock (_lock)
+        {
+            if (!_activeAnalyses.TryGetValue(deviceId, out session))
+                return;
+        }
+
+        var sessionAge = DateTime.UtcNow - session.StartedUtc;
+        if (sessionAge.TotalSeconds < 30)
+            return;
+
+        try
+        {
+            var runningPath = GetRunningSessionPath(deviceId);
+            if (!File.Exists(runningPath))
+            {
+                await CompleteAnalysisAsync(deviceId, false, "Running session file not found", null);
+                return;
+            }
+
+            var runningJson = await File.ReadAllTextAsync(runningPath, ct);
+            var running = JsonSerializer.Deserialize<RunningSession>(runningJson);
+            if (running == null)
+            {
+                await CompleteAnalysisAsync(deviceId, false, "Invalid running session file", null);
+                return;
+            }
+
+            // Check status via SSH
+            var (pidExists, output, error) = await CheckAnalysisOutputAsync(running, ct);
+
+            if (pidExists)
+            {
+                // Update progress from output
+                session.CurrentStep = ParseCurrentStep(output);
+
+                // Update current calibration number from output
+                if (output != null)
+                {
+                    var calibMatch = Regex.Match(output, @"CALIBRATION_START: (\d+)", RegexOptions.RightToLeft);
+                    if (calibMatch.Success && int.TryParse(calibMatch.Groups[1].Value, out var currentCalib))
+                    {
+                        running.CurrentCalibration = currentCalib;
+                        session.CurrentCalibration = currentCalib;
+                        // Update the running file
+                        await File.WriteAllTextAsync(runningPath, JsonSerializer.Serialize(running, new JsonSerializerOptions { WriteIndented = true }));
+                    }
+                }
+                return;
+            }
+
+            // Script finished - check result
+            if (output != null && output.Contains("SUCCESS"))
+            {
+                // Parse all mesh data from the output
+                var calibrations = ParseMultipleMeshData(output, running);
+                await CompleteAnalysisAsync(deviceId, true, null, calibrations);
+            }
+            else if (output != null && output.Contains("ERROR"))
+            {
+                var errorMsg = ParseErrorMessage(output);
+                await CompleteAnalysisAsync(deviceId, false, errorMsg ?? "Analysis failed", null);
+            }
+            else
+            {
+                await CompleteAnalysisAsync(deviceId, false, error ?? "Unknown analysis result", null);
+            }
+
+            await CleanupPrinterFilesAsync(running.PrinterIp);
+        }
+        catch (Exception ex)
+        {
+            LogStatus($"Error checking analysis {deviceId}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Check analysis output via SSH.
+    /// </summary>
+    private async Task<(bool pidExists, string? output, string? error)> CheckAnalysisOutputAsync(
+        RunningSession running, CancellationToken ct)
+    {
+        return await Task.Run<(bool, string?, string?)>(() =>
+        {
+            try
+            {
+                using var client = new SshClient(running.PrinterIp, 22, "root", "rockchip");
+                client.ConnectionInfo.Timeout = TimeSpan.FromSeconds(SshTimeoutSeconds);
+                client.Connect();
+
+                if (!client.IsConnected)
+                    return (false, null, "SSH connection failed");
+
+                var pidRead = client.RunCommand($"cat {PrinterPidPath} 2>/dev/null");
+                var pidValue = pidRead.Result.Trim();
+
+                bool pidExists = false;
+                if (!string.IsNullOrEmpty(pidValue))
+                {
+                    var processCheck = client.RunCommand($"ps | grep -w {pidValue} | grep -v grep || echo NOT_FOUND");
+                    pidExists = !processCheck.Result.Contains("NOT_FOUND") && processCheck.Result.Trim().Length > 0;
+                }
+
+                // Read full output for analysis (need all mesh data)
+                var outCheck = client.RunCommand($"cat {PrinterOutputPath} 2>/dev/null");
+                var output = outCheck.ExitStatus == 0 ? outCheck.Result : null;
+
+                // Check file modification time
+                var statCheck = client.RunCommand($"stat -c %Y {PrinterOutputPath} 2>/dev/null");
+                if (long.TryParse(statCheck.Result.Trim(), out var modTimestamp))
+                {
+                    var modTime = DateTimeOffset.FromUnixTimeSeconds(modTimestamp).UtcDateTime;
+                    if ((DateTime.UtcNow - modTime).TotalSeconds < 60 &&
+                        output?.Contains("SUCCESS") != true &&
+                        output?.Contains("ERROR") != true)
+                    {
+                        return (true, output, null);
+                    }
+                }
+
+                client.Disconnect();
+                return (pidExists, output, null);
+            }
+            catch (Exception ex)
+            {
+                return (false, null, ex.Message);
+            }
+        }, ct);
+    }
+
+    /// <summary>
+    /// Parse multiple mesh data entries from analysis by reading saved mesh files from printer.
+    /// </summary>
+    private List<MeshData> ParseMultipleMeshData(string output, RunningSession running)
+    {
+        var meshes = new List<MeshData>();
+
+        try
+        {
+            // Find how many calibrations completed
+            var completedMatch = Regex.Match(output, @"CALIBRATIONS_COMPLETED:\s*(\d+)");
+            var calibrationCount = completedMatch.Success && int.TryParse(completedMatch.Groups[1].Value, out var count)
+                ? count
+                : running.CalibrationCount;
+
+            if (calibrationCount == 0)
+            {
+                LogStatus("No calibrations completed");
+                return meshes;
+            }
+
+            // Read each mesh file directly from the printer
+            using var client = new SshClient(running.PrinterIp, 22, "root", "rockchip");
+            client.ConnectionInfo.Timeout = TimeSpan.FromSeconds(SshTimeoutSeconds);
+            client.Connect();
+
+            if (!client.IsConnected)
+            {
+                LogStatus("Failed to connect to printer to read mesh files");
+                return meshes;
+            }
+
+            // Read probe count for coordinate calculation
+            string? generatedCfg = null;
+            var generatedCfgCheck = client.RunCommand($"cat {PrinterGeneratedCfgPath} 2>/dev/null");
+            if (generatedCfgCheck.ExitStatus == 0)
+            {
+                generatedCfg = generatedCfgCheck.Result;
+            }
+
+            for (int i = 1; i <= calibrationCount; i++)
+            {
+                var meshPath = $"/tmp/acproxycam_mesh_{i}.json";
+                var meshCheck = client.RunCommand($"cat {meshPath} 2>/dev/null");
+
+                if (meshCheck.ExitStatus == 0 && !string.IsNullOrWhiteSpace(meshCheck.Result))
+                {
+                    var meshData = ParseMeshData(meshCheck.Result);
+                    if (meshData != null)
+                    {
+                        if (generatedCfg != null)
+                        {
+                            ParseProbeCount(generatedCfg, meshData);
+                        }
+                        meshData.Stats = MeshStats.Calculate(meshData);
+                        meshes.Add(meshData);
+                        LogStatus($"Parsed mesh data for calibration {i}: {meshData.XCount}x{meshData.YCount} points");
+                    }
+                    else
+                    {
+                        LogStatus($"Failed to parse mesh data for calibration {i}");
+                    }
+                }
+                else
+                {
+                    LogStatus($"Failed to read mesh file for calibration {i}: {meshPath}");
+                }
+            }
+
+            // Clean up temporary mesh files
+            for (int i = 1; i <= calibrationCount; i++)
+            {
+                client.RunCommand($"rm -f /tmp/acproxycam_mesh_{i}.json");
+            }
+
+            client.Disconnect();
+        }
+        catch (Exception ex)
+        {
+            LogStatus($"Failed to parse multiple mesh data: {ex.Message}");
+        }
+
+        return meshes;
+    }
+
+    /// <summary>
+    /// Complete an analysis session.
+    /// </summary>
+    private async Task CompleteAnalysisAsync(string deviceId, bool success, string? error, List<MeshData>? calibrations)
+    {
+        AnalysisSession? session;
+        lock (_lock)
+        {
+            if (!_activeAnalyses.TryGetValue(deviceId, out session))
+                return;
+
+            _activeAnalyses.Remove(deviceId);
+        }
+
+        session.FinishedUtc = DateTime.UtcNow;
+        session.Status = success ? CalibrationStatus.Success : CalibrationStatus.Failed;
+        session.ErrorMessage = error;
+
+        if (calibrations != null && calibrations.Count > 0)
+        {
+            session.Calibrations = calibrations;
+
+            // Calculate average mesh
+            session.AverageMesh = CalculateAverageMesh(calibrations);
+            if (session.AverageMesh != null)
+            {
+                session.AverageMesh.Stats = MeshStats.Calculate(session.AverageMesh);
+            }
+
+            // Calculate analysis statistics
+            session.AnalysisStats = AnalysisStats.Calculate(calibrations, session.AverageMesh!);
+        }
+
+        // Save to analyses directory
+        var timestamp = session.StartedUtc.ToString("yyyyMMdd_HHmmss");
+        var fileName = $"{deviceId}_{timestamp}.analysis";
+        var savePath = Path.Combine(AnalysesDir, fileName);
+
+        try
+        {
+            var json = JsonSerializer.Serialize(session, new JsonSerializerOptions { WriteIndented = true });
+            await File.WriteAllTextAsync(savePath, json);
+            LogStatus($"Analysis saved: {fileName}");
+        }
+        catch (Exception ex)
+        {
+            LogStatus($"Failed to save analysis: {ex.Message}");
+        }
+
+        // Delete running session file
+        var runningPath = GetRunningSessionPath(deviceId);
+        try { if (File.Exists(runningPath)) File.Delete(runningPath); } catch { }
+
+        LogStatus($"Analysis {(success ? "completed" : "failed")} for {session.PrinterName} ({session.Calibrations.Count} calibrations)");
+        AnalysisCompleted?.Invoke(this, session);
+    }
+
+    /// <summary>
+    /// Calculate average mesh from multiple calibrations.
+    /// </summary>
+    private MeshData? CalculateAverageMesh(List<MeshData> calibrations)
+    {
+        if (calibrations.Count == 0)
+            return null;
+
+        var first = calibrations[0];
+        var rows = first.Points.Length;
+        var cols = rows > 0 ? first.Points[0].Length : 0;
+
+        if (rows == 0 || cols == 0)
+            return null;
+
+        // Create average mesh with same structure
+        var avgMesh = new MeshData
+        {
+            Algorithm = first.Algorithm,
+            MinX = first.MinX,
+            MaxX = first.MaxX,
+            MinY = first.MinY,
+            MaxY = first.MaxY,
+            XCount = first.XCount,
+            YCount = first.YCount,
+            ProbeCountX = first.ProbeCountX,
+            ProbeCountY = first.ProbeCountY,
+            Tension = first.Tension,
+            MeshXPps = first.MeshXPps,
+            MeshYPps = first.MeshYPps,
+            ZOffset = first.ZOffset,
+            NozzleDiameter = first.NozzleDiameter,
+            NozzleMaterial = first.NozzleMaterial,
+            Points = new double[rows][]
+        };
+
+        // Calculate average for each point (including outliers)
+        for (int r = 0; r < rows; r++)
+        {
+            avgMesh.Points[r] = new double[cols];
+            for (int c = 0; c < cols; c++)
+            {
+                var values = new List<double>();
+                foreach (var mesh in calibrations)
+                {
+                    if (r < mesh.Points.Length && c < mesh.Points[r].Length)
+                    {
+                        values.Add(mesh.Points[r][c]);
+                    }
+                }
+                avgMesh.Points[r][c] = values.Count > 0 ? values.Average() : 0;
+            }
+        }
+
+        return avgMesh;
     }
 
     /// <summary>
@@ -960,20 +1678,49 @@ rm -f {PrinterPidPath}
             try
             {
                 var json = await File.ReadAllTextAsync(file);
-                var session = JsonSerializer.Deserialize<BedMeshSession>(json);
-                if (session != null)
+                var fileName = Path.GetFileName(file);
+                var isAnalysis = fileName.EndsWith(".analysis", StringComparison.OrdinalIgnoreCase);
+
+                if (isAnalysis)
                 {
-                    infos.Add(new BedMeshSessionInfo
+                    // Parse as AnalysisSession
+                    var analysis = JsonSerializer.Deserialize<AnalysisSession>(json);
+                    if (analysis != null)
                     {
-                        FileName = Path.GetFileName(file),
-                        DeviceId = session.DeviceId,
-                        PrinterName = session.PrinterName,
-                        DeviceType = session.DeviceType,
-                        Name = session.Name,
-                        Timestamp = session.StartedUtc,
-                        Status = session.Status,
-                        MeshRange = session.MeshData?.Stats?.Range
-                    });
+                        infos.Add(new BedMeshSessionInfo
+                        {
+                            FileName = fileName,
+                            DeviceId = analysis.DeviceId,
+                            PrinterName = analysis.PrinterName,
+                            DeviceType = analysis.DeviceType,
+                            Name = analysis.Name,
+                            Timestamp = analysis.StartedUtc,
+                            Status = analysis.Status,
+                            MeshRange = analysis.AverageMesh?.Stats?.Range,
+                            IsAnalysis = true,
+                            CalibrationCount = analysis.Calibrations.Count
+                        });
+                    }
+                }
+                else
+                {
+                    // Parse as BedMeshSession (calibration)
+                    var session = JsonSerializer.Deserialize<BedMeshSession>(json);
+                    if (session != null)
+                    {
+                        infos.Add(new BedMeshSessionInfo
+                        {
+                            FileName = fileName,
+                            DeviceId = session.DeviceId,
+                            PrinterName = session.PrinterName,
+                            DeviceType = session.DeviceType,
+                            Name = session.Name,
+                            Timestamp = session.StartedUtc,
+                            Status = session.Status,
+                            MeshRange = session.MeshData?.Stats?.Range,
+                            IsAnalysis = false
+                        });
+                    }
                 }
             }
             catch { }

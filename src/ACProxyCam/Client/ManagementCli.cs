@@ -1724,7 +1724,7 @@ WantedBy=multi-user.target
             var choice = _ui.SelectOneWithEscape("Select action:", new[]
             {
                 "Calibrate",
-                "Analyse (coming soon)",
+                "Analyse",
                 "Sessions"
             });
 
@@ -1737,9 +1737,8 @@ WantedBy=multi-user.target
                     await RunCalibrationWizardAsync(printers);
                     break;
 
-                case "Analyse (coming soon)":
-                    _ui.WriteInfo("Analysis feature coming soon!");
-                    await Task.Delay(1500);
+                case "Analyse":
+                    await RunAnalysisWizardAsync(printers);
                     break;
 
                 case "Sessions":
@@ -1883,6 +1882,188 @@ WantedBy=multi-user.target
         _ui.WaitForKey("Press any key to continue...");
     }
 
+    private async Task RunAnalysisWizardAsync(List<PrinterStatus> printers)
+    {
+        _ui.Clear();
+        _ui.WriteRule("BedMesh Analysis");
+        _ui.WriteLine();
+
+        _ui.WriteInfo("Analysis runs multiple calibrations to detect outliers and compute statistics.");
+        _ui.WriteInfo("Recommended: Run at least 10 calibrations for accurate results.");
+        _ui.WriteLine();
+
+        // Select printer
+        var choices = printers.Select(p =>
+        {
+            var status = p.State == PrinterState.Running ? "[green]●[/]" : "[grey]○[/]";
+            return $"{status} {p.Name}";
+        }).ToList();
+
+        var selected = _ui.SelectOneWithEscape("Select printer:", choices);
+
+        if (selected == null)
+            return;
+
+        // Extract printer name (remove status prefix)
+        var printerName = selected.Substring(selected.IndexOf(' ') + 1);
+        var printerStatus = printers.First(p => p.Name == printerName);
+
+        _ui.Clear();
+        _ui.WriteRule($"BedMesh Analysis - {printerName}");
+        _ui.WriteLine();
+
+        // Check if printer is connected
+        if (printerStatus.State != PrinterState.Running)
+        {
+            _ui.WriteError("Printer must be connected and running to start analysis.");
+            _ui.WaitForKey("Press any key to continue...");
+            return;
+        }
+
+        // Check if calibration/analysis already running
+        var (sessionsSuccess, sessions, _) = await _ipcClient!.GetBedMeshSessionsAsync();
+        if (sessionsSuccess && sessions != null)
+        {
+            var (configSuccess, config, _) = await _ipcClient.GetPrinterConfigAsync(printerName);
+            if (configSuccess && config != null && !string.IsNullOrEmpty(config.DeviceId))
+            {
+                var existingSession = sessions.ActiveSessions.FirstOrDefault(s => s.DeviceId == config.DeviceId);
+                if (existingSession != null)
+                {
+                    var sessionType = existingSession.IsAnalysis ? "Analysis" : "Calibration";
+                    _ui.WriteWarning($"{sessionType} already running for this printer (started {existingSession.StartedUtc.ToLocalTime():HH:mm:ss})");
+                    _ui.WaitForKey("Press any key to continue...");
+                    return;
+                }
+            }
+        }
+
+        // Calibration count selection
+        _ui.WriteInfo("How many calibrations to run?");
+        _ui.WriteInfo("Minimum: 5 (for IQR accuracy), Recommended: 10 or more");
+        _ui.WriteLine();
+
+        var countChoice = _ui.SelectOneWithEscape("Select calibration count:", new[]
+        {
+            "5 calibrations (minimum)",
+            "10 calibrations (recommended)",
+            "15 calibrations",
+            "20 calibrations",
+            "Custom"
+        });
+
+        if (countChoice == null)
+            return;
+
+        int calibrationCount;
+        if (countChoice == "Custom")
+        {
+            var customCount = _ui.Ask("Enter number of calibrations (minimum 5):", "10");
+            if (!int.TryParse(customCount, out calibrationCount) || calibrationCount < 5)
+            {
+                _ui.WriteError("Invalid value. Must be at least 5 calibrations for IQR accuracy.");
+                _ui.WaitForKey("Press any key to continue...");
+                return;
+            }
+        }
+        else
+        {
+            calibrationCount = countChoice switch
+            {
+                "5 calibrations (minimum)" => 5,
+                "10 calibrations (recommended)" => 10,
+                "15 calibrations" => 15,
+                "20 calibrations" => 20,
+                _ => 10
+            };
+        }
+
+        // Heat soak selection (only before first calibration)
+        _ui.WriteLine();
+        _ui.WriteInfo("Heat soak warms the bed before the FIRST calibration.");
+        _ui.WriteInfo("Subsequent calibrations run back-to-back with 1 minute pauses.");
+        _ui.WriteLine();
+
+        var heatSoakChoice = _ui.SelectOneWithEscape("Select heat soak duration:", new[]
+        {
+            "None (0 minutes)",
+            "15 minutes",
+            "30 minutes",
+            "60 minutes",
+            "90 minutes",
+            "120 minutes",
+            "Custom"
+        });
+
+        if (heatSoakChoice == null)
+            return;
+
+        int heatSoakMinutes;
+        if (heatSoakChoice == "Custom")
+        {
+            var customMinutes = _ui.Ask("Enter heat soak duration in minutes:", "0");
+            if (!int.TryParse(customMinutes, out heatSoakMinutes) || heatSoakMinutes < 0)
+            {
+                _ui.WriteError("Invalid value. Must be a positive integer.");
+                _ui.WaitForKey("Press any key to continue...");
+                return;
+            }
+        }
+        else
+        {
+            heatSoakMinutes = heatSoakChoice switch
+            {
+                "15 minutes" => 15,
+                "30 minutes" => 30,
+                "60 minutes" => 60,
+                "90 minutes" => 90,
+                "120 minutes" => 120,
+                _ => 0
+            };
+        }
+
+        // Session name (optional)
+        _ui.WriteLine();
+        _ui.WriteInfo("Optionally enter a name for this analysis (e.g., build plate identifier).");
+        var sessionName = _ui.Ask("Name (leave empty to skip):", "");
+        sessionName = string.IsNullOrWhiteSpace(sessionName) ? null : sessionName.Trim();
+
+        // Confirmation
+        _ui.WriteLine();
+        _ui.WriteInfo($"Analysis will:");
+        _ui.WriteLine($"  1. Turn camera LED on");
+        if (heatSoakMinutes > 0)
+        {
+            _ui.WriteLine($"  2. Heat bed to 60°C and wait {heatSoakMinutes} minutes");
+            _ui.WriteLine($"  3. Run {calibrationCount} calibrations with 1 minute pauses between");
+        }
+        else
+        {
+            _ui.WriteLine($"  2. Run {calibrationCount} calibrations with 1 minute pauses between");
+        }
+        _ui.WriteLine($"  4. Calculate statistics and detect outliers using IQR method");
+        _ui.WriteLine();
+
+        if (!_ui.Confirm("Start analysis?", true))
+            return;
+
+        // Start analysis
+        _ui.WriteInfo("Starting analysis...");
+        var (success, error) = await _ipcClient.StartAnalysisAsync(printerName, heatSoakMinutes, calibrationCount, sessionName);
+
+        if (success)
+        {
+            _ui.WriteSuccess("Analysis started!");
+            _ui.WriteInfo("You can monitor progress in the Sessions menu.");
+        }
+        else
+        {
+            _ui.WriteError($"Failed to start analysis: {error ?? "Unknown error"}");
+        }
+
+        _ui.WaitForKey("Press any key to continue...");
+    }
+
     private async Task ShowSessionsMenuAsync()
     {
         while (true)
@@ -1925,8 +2106,7 @@ WantedBy=multi-user.target
             }
             else if (choice.StartsWith("Saved analyses"))
             {
-                _ui.WriteInfo("Analysis feature coming soon!");
-                await Task.Delay(1500);
+                await ShowSavedAnalysesAsync(sessions.Analyses);
             }
         }
     }
@@ -1935,7 +2115,7 @@ WantedBy=multi-user.target
     {
         if (activeSessions.Count == 0)
         {
-            _ui.WriteInfo("No active calibrations");
+            _ui.WriteInfo("No active sessions");
             _ui.WaitForKey("Press any key to continue...");
             return;
         }
@@ -2017,15 +2197,16 @@ WantedBy=multi-user.target
                         var step = session.CurrentStep ?? "Calibrating...";
                         var heatSoak = session.HeatSoakMinutes > 0 ? $" | Heat soak: {session.HeatSoakMinutes}min" : "";
                         var nameDisplay = !string.IsNullOrEmpty(session.Name) ? $" ({Markup.Escape(session.Name)})" : "";
+                        var typeLabel = session.IsAnalysis ? "[cyan]Analysis[/] " : "";
 
-                        AnsiConsole.MarkupLine($"  [white]{Markup.Escape(session.PrinterName)}{nameDisplay}[/] - [yellow]{Markup.Escape(step)}[/]");
+                        AnsiConsole.MarkupLine($"  {typeLabel}[white]{Markup.Escape(session.PrinterName)}{nameDisplay}[/] - [yellow]{Markup.Escape(step)}[/]");
                         AnsiConsole.MarkupLine($"    [grey]Started: {session.StartedUtc.ToLocalTime():HH:mm:ss} | Elapsed: {elapsed}{heatSoak}[/]");
                         AnsiConsole.WriteLine();
                     }
                 }
                 else
                 {
-                    AnsiConsole.MarkupLine("[grey]No active calibrations[/]");
+                    AnsiConsole.MarkupLine("[grey]No active sessions[/]");
                 }
 
                 lastRefresh = DateTime.UtcNow;
@@ -2148,6 +2329,204 @@ WantedBy=multi-user.target
                 await Task.Delay(1500);
             }
         }
+    }
+
+    private async Task ShowSavedAnalysesAsync(List<BedMeshSessionInfo> analyses)
+    {
+        while (true)
+        {
+            // Refresh analyses list each iteration (in case of deletion)
+            var (refreshSuccess, sessions, _) = await _ipcClient!.GetBedMeshSessionsAsync();
+            if (refreshSuccess && sessions != null)
+            {
+                analyses = sessions.Analyses;
+            }
+
+            if (analyses.Count == 0)
+            {
+                _ui.WriteInfo("No saved analyses");
+                _ui.WaitForKey("Press any key to continue...");
+                return;
+            }
+
+            _ui.Clear();
+            _ui.WriteRule("Saved Analyses");
+            _ui.WriteLine();
+
+            // Build choices from analyses
+            var choices = analyses.Select(a =>
+            {
+                var status = a.Status == CalibrationStatus.Success ? "[green]✓[/]" : "[red]✗[/]";
+                var countStr = a.CalibrationCount.HasValue ? $"{a.CalibrationCount}x" : "";
+                var range = a.MeshRange.HasValue ? $"Avg Range: {MeshStats.FormatMm(a.MeshRange.Value)}" : "";
+                // Show Name if set, otherwise show DeviceType
+                var description = !string.IsNullOrEmpty(a.Name) ? a.Name : a.DeviceType ?? "";
+                var descDisplay = !string.IsNullOrEmpty(description) ? $" | {description}" : "";
+                return $"{status} {a.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm} | {a.PrinterName}{descDisplay} | {countStr} | {range}";
+            }).ToList();
+
+            var indexedChoices = choices.Select((c, i) => (Choice: c, Index: i)).ToList();
+
+            var selected = _ui.SelectOneWithEscape("Select analysis to view:", choices);
+
+            if (selected == null)
+                return;
+
+            var selectedIndex = indexedChoices.First(x => x.Choice == selected).Index;
+            if (selectedIndex < analyses.Count)
+            {
+                await ShowAnalysisDetailsAsync(analyses[selectedIndex]);
+            }
+        }
+    }
+
+    private async Task ShowAnalysisDetailsAsync(BedMeshSessionInfo info)
+    {
+        var (success, analysis, _) = await _ipcClient!.GetAnalysisAsync(info.FileName);
+        if (!success || analysis == null)
+        {
+            _ui.WriteError("Failed to load analysis details");
+            _ui.WaitForKey("Press any key to continue...");
+            return;
+        }
+
+        while (true)
+        {
+            _ui.Clear();
+            var titleSuffix = !string.IsNullOrEmpty(analysis.Name) ? $" ({analysis.Name})" : "";
+            _ui.WriteRule($"Analysis Result - {analysis.PrinterName}{titleSuffix}");
+            _ui.WriteLine();
+
+            // Use the visual analysis renderer if average mesh data is available
+            if (analysis.AverageMesh != null && analysis.AverageMesh.Points.Length > 0)
+            {
+                MeshVisualizer.RenderAnalysisResult(analysis);
+            }
+            else
+            {
+                // Fallback to text-only display
+                var statusDisplay = analysis.Status == CalibrationStatus.Success
+                    ? "[green]SUCCESS[/]"
+                    : "[red]FAILED[/]";
+                AnsiConsole.MarkupLine($"  Status:         {statusDisplay}");
+                if (!string.IsNullOrEmpty(analysis.Name))
+                    AnsiConsole.MarkupLine($"  Name:           [grey]{Markup.Escape(analysis.Name)}[/]");
+                AnsiConsole.MarkupLine($"  Calibrations:   [grey]{analysis.CalibrationCount}[/]");
+                AnsiConsole.MarkupLine($"  Started:        [grey]{analysis.StartedUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}[/]");
+                if (analysis.FinishedUtc.HasValue)
+                    AnsiConsole.MarkupLine($"  Finished:       [grey]{analysis.FinishedUtc.Value.ToLocalTime():yyyy-MM-dd HH:mm:ss}[/]");
+                AnsiConsole.MarkupLine($"  Duration:       [grey]{analysis.DurationFormatted}[/]");
+                if (analysis.HeatSoakMinutes > 0)
+                    AnsiConsole.MarkupLine($"  Heat Soak:      [grey]{analysis.HeatSoakMinutes} min[/]");
+
+                if (analysis.AnalysisStats != null)
+                {
+                    AnsiConsole.WriteLine();
+                    AnsiConsole.MarkupLine($"  [bold]Statistics:[/]");
+                    AnsiConsole.MarkupLine($"    Average Range: [grey]{MeshStats.FormatMm(analysis.AnalysisStats.AverageRange)}[/]");
+                    AnsiConsole.MarkupLine($"    Min Range:     [grey]{MeshStats.FormatMm(analysis.AnalysisStats.MinRange)}[/]");
+                    AnsiConsole.MarkupLine($"    Max Range:     [grey]{MeshStats.FormatMm(analysis.AnalysisStats.MaxRange)}[/]");
+                    AnsiConsole.MarkupLine($"    Total Outliers:[grey]{analysis.AnalysisStats.TotalOutlierCount}[/]");
+                }
+
+                if (!string.IsNullOrEmpty(analysis.ErrorMessage))
+                {
+                    AnsiConsole.WriteLine();
+                    AnsiConsole.MarkupLine($"  [red]Error: {Markup.Escape(analysis.ErrorMessage)}[/]");
+                }
+            }
+
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[grey][[V]][/][grey]iew individual calibrations  |  [[D]][/][grey]elete  |  Press any other key to go back...[/]");
+
+            var key = Console.ReadKey(true).Key;
+            if (key == ConsoleKey.D)
+            {
+                if (_ui.Confirm("Delete this analysis?", false))
+                {
+                    var (deleteSuccess, error) = await _ipcClient.DeleteAnalysisAsync(info.FileName);
+                    if (deleteSuccess)
+                    {
+                        _ui.WriteSuccess("Analysis deleted.");
+                    }
+                    else
+                    {
+                        _ui.WriteError($"Failed to delete: {error ?? "Unknown error"}");
+                    }
+                    await Task.Delay(1500);
+                    return;
+                }
+            }
+            else if (key == ConsoleKey.V)
+            {
+                await ShowIndividualCalibrationsAsync(analysis);
+            }
+            else
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task ShowIndividualCalibrationsAsync(AnalysisSession analysis)
+    {
+        if (analysis.Calibrations.Count == 0)
+        {
+            _ui.WriteInfo("No individual calibration data available");
+            _ui.WaitForKey("Press any key to continue...");
+            return;
+        }
+
+        while (true)
+        {
+            _ui.Clear();
+            _ui.WriteRule($"Individual Calibrations - {analysis.PrinterName}");
+            _ui.WriteLine();
+
+            // Build choices from calibrations
+            var choices = analysis.Calibrations.Select((cal, i) =>
+            {
+                var range = $"Range: {MeshStats.FormatMm(cal.Stats?.Range ?? 0)}";
+                return $"Calibration #{i + 1} | {range}";
+            }).ToList();
+
+            var indexedChoices = choices.Select((c, i) => (Choice: c, Index: i)).ToList();
+
+            var selected = _ui.SelectOneWithEscape("Select calibration to view:", choices);
+
+            if (selected == null)
+                return;
+
+            var selectedIndex = indexedChoices.First(x => x.Choice == selected).Index;
+            if (selectedIndex < analysis.Calibrations.Count)
+            {
+                await ShowIndividualCalibrationMeshAsync(analysis, selectedIndex);
+            }
+        }
+    }
+
+    private Task ShowIndividualCalibrationMeshAsync(AnalysisSession analysis, int calibrationIndex)
+    {
+        var calibration = analysis.Calibrations[calibrationIndex];
+
+        _ui.Clear();
+        var titleSuffix = !string.IsNullOrEmpty(analysis.Name) ? $" ({analysis.Name})" : "";
+        _ui.WriteRule($"Calibration #{calibrationIndex + 1} - {analysis.PrinterName}{titleSuffix}");
+        _ui.WriteLine();
+
+        // Use the visual mesh renderer
+        if (calibration.Points.Length > 0)
+        {
+            MeshVisualizer.RenderIndividualCalibration(calibration, calibrationIndex + 1, analysis.AnalysisStats);
+        }
+        else
+        {
+            _ui.WriteInfo("No mesh data available for this calibration.");
+        }
+
+        _ui.WriteLine();
+        _ui.WaitForKey("Press any key to go back...");
+        return Task.CompletedTask;
     }
 
     #region Input Validation Helpers

@@ -303,6 +303,43 @@ public class IpcClient : IDisposable
         return (response.Success, response.Error);
     }
 
+    /// <summary>
+    /// Start a BedMesh analysis (multiple calibrations).
+    /// </summary>
+    public async Task<(bool Success, string? Error)> StartAnalysisAsync(string printerName, int heatSoakMinutes, int calibrationCount, string? name = null)
+    {
+        var response = await SendAsync(IpcCommands.StartAnalysis, new StartAnalysisRequest
+        {
+            PrinterName = printerName,
+            HeatSoakMinutes = heatSoakMinutes,
+            CalibrationCount = calibrationCount,
+            Name = name
+        });
+        return (response.Success, response.Error);
+    }
+
+    /// <summary>
+    /// Get a saved analysis by filename.
+    /// </summary>
+    public async Task<(bool Success, AnalysisSession? Data, string? Error)> GetAnalysisAsync(string fileName)
+    {
+        var response = await SendAsync(IpcCommands.GetAnalysis, new AnalysisFileRequest { FileName = fileName });
+        if (!response.Success)
+            return (false, null, response.Error);
+
+        var data = DeserializeData<AnalysisSession>(response.Data);
+        return (true, data, null);
+    }
+
+    /// <summary>
+    /// Delete a saved analysis.
+    /// </summary>
+    public async Task<(bool Success, string? Error)> DeleteAnalysisAsync(string fileName)
+    {
+        var response = await SendAsync(IpcCommands.DeleteAnalysis, new AnalysisFileRequest { FileName = fileName });
+        return (response.Success, response.Error);
+    }
+
     private T? DeserializeData<T>(object? data) where T : class
     {
         if (data == null) return null;

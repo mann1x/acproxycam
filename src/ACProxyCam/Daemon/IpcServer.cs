@@ -216,6 +216,26 @@ public class IpcServer
                     if (delCalReq == null) return IpcResponse.Fail("Invalid request data");
                     return _bedMeshManager.DeleteCalibration(delCalReq.FileName);
 
+                // Analysis commands
+                case IpcCommands.StartAnalysis:
+                    var startAnalysisReq = DeserializeData<StartAnalysisRequest>(request.Data);
+                    if (startAnalysisReq == null) return IpcResponse.Fail("Invalid request data");
+                    return await _bedMeshManager.StartAnalysisAsync(
+                        startAnalysisReq.PrinterName,
+                        startAnalysisReq.HeatSoakMinutes,
+                        startAnalysisReq.CalibrationCount,
+                        startAnalysisReq.Name);
+
+                case IpcCommands.GetAnalysis:
+                    var getAnalysisReq = DeserializeData<AnalysisFileRequest>(request.Data);
+                    if (getAnalysisReq == null) return IpcResponse.Fail("Invalid request data");
+                    return await _bedMeshManager.GetAnalysisAsync(getAnalysisReq.FileName);
+
+                case IpcCommands.DeleteAnalysis:
+                    var delAnalysisReq = DeserializeData<AnalysisFileRequest>(request.Data);
+                    if (delAnalysisReq == null) return IpcResponse.Fail("Invalid request data");
+                    return _bedMeshManager.DeleteAnalysis(delAnalysisReq.FileName);
+
                 default:
                     return IpcResponse.Fail($"Unknown command: {request.Command}");
             }

@@ -158,6 +158,33 @@ public class CalibrationFileRequest
 }
 
 /// <summary>
+/// Request to start BedMesh analysis (multiple calibrations).
+/// </summary>
+public class StartAnalysisRequest
+{
+    [JsonPropertyName("printerName")]
+    public string PrinterName { get; set; } = "";
+
+    [JsonPropertyName("heatSoakMinutes")]
+    public int HeatSoakMinutes { get; set; }
+
+    [JsonPropertyName("calibrationCount")]
+    public int CalibrationCount { get; set; }
+
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
+}
+
+/// <summary>
+/// Request to get or delete an analysis session.
+/// </summary>
+public class AnalysisFileRequest
+{
+    [JsonPropertyName("fileName")]
+    public string FileName { get; set; } = "";
+}
+
+/// <summary>
 /// IPC command names.
 /// </summary>
 public static class IpcCommands
@@ -182,4 +209,9 @@ public static class IpcCommands
     public const string StartCalibration = "start_calibration";
     public const string GetCalibration = "get_calibration";
     public const string DeleteCalibration = "delete_calibration";
+
+    // Analysis commands
+    public const string StartAnalysis = "start_analysis";
+    public const string GetAnalysis = "get_analysis";
+    public const string DeleteAnalysis = "delete_analysis";
 }
