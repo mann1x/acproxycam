@@ -674,6 +674,10 @@ API_CMD() {{
 # Set Busy
 echo ""STEP: Setting printer busy"" >> ""$LOG""
 API_CMD 30 '{{""id"":1,""method"":""Printer/ReportUIWorkStatus"",""params"":{{""busy"":1}}}}'
+
+# Set printer to PAUSE state
+echo ""STEP: Setting PAUSE state"" >> ""$LOG""
+API_CMD 30 '{{""id"":2,""method"":""gcode/script"",""params"":{{""script"":""PAUSE""}}}}'
 {heatSoakSection}
 CALIBRATION=1
 while [ $CALIBRATION -le {calibrationCount} ]; do
@@ -747,6 +751,10 @@ wget -q -O /dev/null 'http://localhost:7125/printer/gcode/script?script=SET_HEAT
 echo ""STEP: Setting printer free"" >> ""$LOG""
 API_CMD 30 '{{""id"":9,""method"":""Printer/ReportUIWorkStatus"",""params"":{{""busy"":0}}}}'
 
+# Restart printer to clear PAUSE state
+echo ""STEP: Restarting printer"" >> ""$LOG""
+API_CMD 60 '{{""id"":10,""method"":""gcode/script"",""params"":{{""script"":""RESTART""}}}}'
+
 echo ""CALIBRATIONS_COMPLETED: $(($CALIBRATION - 1))"" >> ""$LOG""
 echo ""SUCCESS $(date -Iseconds)"" >> ""$LOG""
 sync
@@ -795,6 +803,10 @@ API_CMD() {{
 # 1. Set Busy
 echo ""STEP: Setting printer busy"" >> ""$LOG""
 API_CMD 30 '{{""id"":1,""method"":""Printer/ReportUIWorkStatus"",""params"":{{""busy"":1}}}}'
+
+# 1b. Set printer to PAUSE state
+echo ""STEP: Setting PAUSE state"" >> ""$LOG""
+API_CMD 30 '{{""id"":2,""method"":""gcode/script"",""params"":{{""script"":""PAUSE""}}}}'
 {heatSoakSection}
 # 3. Preheating
 echo ""STEP: Preheating"" >> ""$LOG""
@@ -843,6 +855,10 @@ wget -q -O /dev/null 'http://localhost:7125/printer/gcode/script?script=SET_HEAT
 # 8. Set Free
 echo ""STEP: Setting printer free"" >> ""$LOG""
 API_CMD 30 '{{""id"":9,""method"":""Printer/ReportUIWorkStatus"",""params"":{{""busy"":0}}}}'
+
+# 9. Restart printer to clear PAUSE state
+echo ""STEP: Restarting printer"" >> ""$LOG""
+API_CMD 60 '{{""id"":10,""method"":""gcode/script"",""params"":{{""script"":""RESTART""}}}}'
 
 # Write SUCCESS marker and sync to ensure it's flushed to disk
 echo ""SUCCESS $(date -Iseconds)"" >> ""$LOG""
