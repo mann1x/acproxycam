@@ -13,6 +13,8 @@ Anycubic Camera Proxy for Linux - Converts FLV camera streams from Anycubic 3D p
 - **Configurable FPS** - MaxFps for streaming, IdleFps for snapshots when no clients connected
 - **CPU affinity** - distributes printer threads across CPU cores for better performance
 - **Camera LED control** - toggle camera LED via HTTP API or management interface, with optional auto-control
+- **BedMesh Calibration** - run bed mesh calibration with visual heatmap display
+- **BedMesh Analysis** - run multiple calibrations with IQR-based statistical analysis and outlier detection
 - Systemd service with watchdog support
 - Interactive terminal management interface using Spectre.Console with auto-refresh
 - Pre-flight connectivity check when adding printers
@@ -115,6 +117,72 @@ Once a printer is configured and running, access the streams at:
 | LED Off | `http://server-ip:8080/led/off` | POST: Turn LED off |
 
 Configure the stream URLs in Mainsail/Fluidd webcam settings.
+
+## BedMesh Calibration & Analysis
+
+ACProxyCam includes built-in bed mesh calibration and analysis tools that work directly with Anycubic printers via their local API.
+
+### BedMesh Menu
+
+Press `B` in the management interface to access the BedMesh menu:
+
+| Key | Action |
+|-----|--------|
+| `1` | Run single calibration |
+| `2` | Run analysis (multiple calibrations) |
+| `3` | View saved calibrations |
+| `4` | View saved analyses |
+| `Esc` | Return to main menu |
+
+### Single Calibration
+
+![BedMesh Calibration](docs/calibration.png)
+
+Run a single bed mesh calibration with optional heat soak:
+
+1. Select a printer from the list
+2. Enter heat soak time in minutes (0 to skip)
+3. Optionally name the calibration for later reference
+4. The calibration runs automatically (preheat → wipe → probe → save)
+5. View results with a color-coded heatmap showing bed deviation
+
+**Heatmap Features:**
+- Color gradient from blue (low) to red (high)
+- Grid shows probe point positions
+- Statistics display: min, max, range, average deviation
+- Coordinates of min/max points shown
+
+### Analysis (Multiple Calibrations)
+
+![BedMesh Analysis](docs/analysis.png)
+
+Run multiple calibrations to analyze bed mesh repeatability and detect probing errors:
+
+1. Select a printer
+2. Enter heat soak time (only applied before first calibration)
+3. Enter number of calibrations to run (minimum 5 recommended for accurate IQR)
+4. Optionally name the analysis
+5. Each calibration runs with a 1-minute pause between runs
+
+**Analysis Statistics:**
+- **Average Mesh** - computed from all calibrations
+- **Standard Deviation** - per-point variation across runs
+- **Range** - min/max deviation across all calibrations
+- **IQR-based Outlier Detection** - identifies probe points with inconsistent readings
+
+**Outlier Detection:**
+- Uses Interquartile Range (IQR) method: values outside Q1-1.5×IQR to Q3+1.5×IQR
+- Minimum threshold of 0.030mm (30 microns) based on strain gauge probe accuracy
+- Shows outlier positions with coordinates, count, average delta, and IQR values
+- Helps identify mechanical issues or probe inconsistencies
+
+### Saved Sessions
+
+All calibrations and analyses are saved to `/etc/acproxycam/sessions/`:
+- Calibrations: `calibrations/*.mesh`
+- Analyses: `analyses/*.analysis`
+
+View saved sessions from the BedMesh menu to review historical data and compare results.
 
 ### Multiple Printers
 
