@@ -75,6 +75,15 @@ public interface IConsoleUI
     string? SelectOneWithEscape(string title, IEnumerable<string> choices);
 
     /// <summary>
+    /// Present a single-choice selection menu with Escape key support and position tracking.
+    /// Returns (selectedItem, selectedIndex) or (null, -1) if user presses Escape.
+    /// </summary>
+    /// <param name="title">The prompt title</param>
+    /// <param name="choices">Available choices</param>
+    /// <param name="startIndex">Initial cursor position (0-based)</param>
+    (string? Item, int Index) SelectOneWithEscapeAndIndex(string title, IEnumerable<string> choices, int startIndex = 0);
+
+    /// <summary>
     /// Present a multi-choice selection menu.
     /// </summary>
     List<string> SelectMany(string title, IEnumerable<string> choices, string? instructions = null);

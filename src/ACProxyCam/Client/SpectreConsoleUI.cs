@@ -87,11 +87,18 @@ public class SpectreConsoleUI : IConsoleUI
 
     public string? SelectOneWithEscape(string title, IEnumerable<string> choices)
     {
+        var (item, _) = SelectOneWithEscapeAndIndex(title, choices, 0);
+        return item;
+    }
+
+    public (string? Item, int Index) SelectOneWithEscapeAndIndex(string title, IEnumerable<string> choices, int startIndex = 0)
+    {
         var choiceList = choices.ToList();
         if (choiceList.Count == 0)
-            return null;
+            return (null, -1);
 
-        int selectedIndex = 0;
+        // Clamp startIndex to valid range
+        int selectedIndex = Math.Max(0, Math.Min(startIndex, choiceList.Count - 1));
 
         // Write title
         AnsiConsole.MarkupLine(title);
@@ -159,7 +166,7 @@ public class SpectreConsoleUI : IConsoleUI
                     }
                     Console.SetCursorPosition(0, Console.CursorTop - choiceList.Count);
                     AnsiConsole.MarkupLine($"[green]{Markup.Escape(choiceList[selectedIndex])}[/]");
-                    return choiceList[selectedIndex];
+                    return (choiceList[selectedIndex], selectedIndex);
 
                 case ConsoleKey.Escape:
                     // Clear and show cancelled
@@ -172,7 +179,7 @@ public class SpectreConsoleUI : IConsoleUI
                     }
                     Console.SetCursorPosition(0, Console.CursorTop - choiceList.Count);
                     AnsiConsole.MarkupLine("[grey]Cancelled[/]");
-                    return null;
+                    return (null, -1);
             }
         }
     }

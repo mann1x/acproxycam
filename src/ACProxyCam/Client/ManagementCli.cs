@@ -1566,21 +1566,54 @@ WantedBy=multi-user.target
 
         var choices = printers.Select(p => p.Name).ToList();
 
-        var selected = _ui.SelectOneWithEscape("Select printer to view:", choices);
+        var (selected, selectedIndex) = _ui.SelectOneWithEscapeAndIndex("Select printer to view:", choices, 0);
 
         if (selected == null)
             return;
 
-        var printer = printers.First(p => p.Name == selected);
+        int currentIndex = selectedIndex;
 
+        // Cycling through printers with Up/Down arrows
+        while (true)
+        {
+            await RenderPrinterDetailsAsync(printers[currentIndex].Name, currentIndex, printers.Count);
+
+            var key = Console.ReadKey(true).Key;
+
+            switch (key)
+            {
+                case ConsoleKey.DownArrow:
+                case ConsoleKey.RightArrow:
+                    // Next printer, wrap to first if at end
+                    currentIndex = (currentIndex + 1) % printers.Count;
+                    break;
+
+                case ConsoleKey.UpArrow:
+                case ConsoleKey.LeftArrow:
+                    // Previous printer, wrap to last if at start
+                    currentIndex = currentIndex > 0 ? currentIndex - 1 : printers.Count - 1;
+                    break;
+
+                default:
+                    // Any other key exits
+                    return;
+            }
+        }
+    }
+
+    private async Task RenderPrinterDetailsAsync(string printerName, int currentIndex, int totalCount)
+    {
         _ui.Clear();
 
         // Get detailed status and config
-        var (statusSuccess, detailedStatus, _) = await _ipcClient.GetPrinterStatusAsync(selected);
+        var (statusSuccess, detailedStatus, _) = await _ipcClient!.GetPrinterStatusAsync(printerName);
         if (!statusSuccess || detailedStatus == null)
-            detailedStatus = printer;
+        {
+            _ui.WriteError($"Failed to get status for {printerName}");
+            return;
+        }
 
-        var (configSuccess, printerConfig, _) = await _ipcClient.GetPrinterConfigAsync(selected);
+        var (configSuccess, printerConfig, _) = await _ipcClient.GetPrinterConfigAsync(printerName);
 
         // Status indicators
         var (statusColor, statusIcon) = detailedStatus.State switch
@@ -1602,10 +1635,12 @@ WantedBy=multi-user.target
             ? ""
             : $" [cyan]({detailedStatus.DeviceType})[/]";
 
+        var positionIndicator = totalCount > 1 ? $" [grey]({currentIndex + 1}/{totalCount})[/]" : "";
+
         var headerTable = new Table()
             .Border(TableBorder.Rounded)
             .BorderColor(Color.Blue)
-            .AddColumn(new TableColumn($"[bold]{detailedStatus.Name}[/]{deviceTypeDisplay}").Centered());
+            .AddColumn(new TableColumn($"[bold]{detailedStatus.Name}[/]{deviceTypeDisplay}{positionIndicator}").Centered());
 
         headerTable.AddRow($"[{statusColor}]{statusIcon} {detailedStatus.State}[/]");
         headerTable.AddRow($"[grey]{detailedStatus.Ip}:{detailedStatus.MjpegPort}[/] │ [cyan]{detailedStatus.ConnectedClients}[/] clients │ [white]{resolution}[/]");
@@ -1695,8 +1730,14 @@ WantedBy=multi-user.target
         }
 
         AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[grey]Press any key to return...[/]");
-        Console.ReadKey(true);
+        if (totalCount > 1)
+        {
+            AnsiConsole.MarkupLine("[grey]↑/↓ Previous/Next printer  |  Any other key to return...[/]");
+        }
+        else
+        {
+            AnsiConsole.MarkupLine("[grey]Press any key to return...[/]");
+        }
     }
 
     private async Task ShowBedMeshMenuFromMainAsync()
@@ -1715,21 +1756,21 @@ WantedBy=multi-user.target
 
     private async Task ShowBedMeshMenuAsync(List<PrinterStatus> printers)
     {
+        int lastSelectedIndex = 0;
+        var menuChoices = new[] { "Calibrate", "Analyse", "Sessions" };
+
         while (true)
         {
             _ui.Clear();
             _ui.WriteRule("BedMesh");
             _ui.WriteLine();
 
-            var choice = _ui.SelectOneWithEscape("Select action:", new[]
-            {
-                "Calibrate",
-                "Analyse",
-                "Sessions"
-            });
+            var (choice, selectedIndex) = _ui.SelectOneWithEscapeAndIndex("Select action:", menuChoices, lastSelectedIndex);
 
             if (choice == null)
                 return;
+
+            lastSelectedIndex = selectedIndex;
 
             switch (choice)
             {
@@ -2066,6 +2107,8 @@ WantedBy=multi-user.target
 
     private async Task ShowSessionsMenuAsync()
     {
+        int lastSelectedIndex = 0;
+
         while (true)
         {
             _ui.Clear();
@@ -2091,10 +2134,12 @@ WantedBy=multi-user.target
                 $"Saved analyses ({sessions.AnalysisCount})"
             };
 
-            var choice = _ui.SelectOneWithEscape("Select category:", choices);
+            var (choice, selectedIndex) = _ui.SelectOneWithEscapeAndIndex("Select category:", choices, lastSelectedIndex);
 
             if (choice == null)
                 return;
+
+            lastSelectedIndex = selectedIndex;
 
             if (choice.StartsWith("Active"))
             {
@@ -2220,6 +2265,9 @@ WantedBy=multi-user.target
 
     private async Task ShowSavedCalibrationsAsync(List<BedMeshSessionInfo> calibrations)
     {
+        int lastSelectedIndex = 0;
+        int previousCount = calibrations.Count;
+
         while (true)
         {
             // Refresh calibrations list each iteration (in case of deletion)
@@ -2236,6 +2284,14 @@ WantedBy=multi-user.target
                 return;
             }
 
+            // Adjust position if items were deleted
+            if (calibrations.Count < previousCount)
+            {
+                // Move cursor up proportionally if items were removed
+                lastSelectedIndex = Math.Min(lastSelectedIndex, calibrations.Count - 1);
+            }
+            previousCount = calibrations.Count;
+
             _ui.Clear();
             _ui.WriteRule("Saved Calibrations");
             _ui.WriteLine();
@@ -2251,15 +2307,14 @@ WantedBy=multi-user.target
                 return $"{status} {c.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm} | {c.PrinterName}{descDisplay} | {range}";
             }).ToList();
 
-            var indexedChoices = choices.Select((c, i) => (Choice: c, Index: i)).ToList();
-
-            var selected = _ui.SelectOneWithEscape("Select calibration to view:", choices);
+            var (selected, selectedIndex) = _ui.SelectOneWithEscapeAndIndex("Select calibration to view:", choices, lastSelectedIndex);
 
             if (selected == null)
                 return;
 
-            var selectedIndex = indexedChoices.First(x => x.Choice == selected).Index;
-            if (selectedIndex < calibrations.Count)
+            lastSelectedIndex = selectedIndex;
+
+            if (selectedIndex >= 0 && selectedIndex < calibrations.Count)
             {
                 await ShowCalibrationDetailsAsync(calibrations[selectedIndex]);
             }
@@ -2333,6 +2388,9 @@ WantedBy=multi-user.target
 
     private async Task ShowSavedAnalysesAsync(List<BedMeshSessionInfo> analyses)
     {
+        int lastSelectedIndex = 0;
+        int previousCount = analyses.Count;
+
         while (true)
         {
             // Refresh analyses list each iteration (in case of deletion)
@@ -2348,6 +2406,14 @@ WantedBy=multi-user.target
                 _ui.WaitForKey("Press any key to continue...");
                 return;
             }
+
+            // Adjust position if items were deleted
+            if (analyses.Count < previousCount)
+            {
+                // Move cursor up proportionally if items were removed
+                lastSelectedIndex = Math.Min(lastSelectedIndex, analyses.Count - 1);
+            }
+            previousCount = analyses.Count;
 
             _ui.Clear();
             _ui.WriteRule("Saved Analyses");
@@ -2365,15 +2431,14 @@ WantedBy=multi-user.target
                 return $"{status} {a.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm} | {a.PrinterName}{descDisplay} | {countStr} | {range}";
             }).ToList();
 
-            var indexedChoices = choices.Select((c, i) => (Choice: c, Index: i)).ToList();
-
-            var selected = _ui.SelectOneWithEscape("Select analysis to view:", choices);
+            var (selected, selectedIndex) = _ui.SelectOneWithEscapeAndIndex("Select analysis to view:", choices, lastSelectedIndex);
 
             if (selected == null)
                 return;
 
-            var selectedIndex = indexedChoices.First(x => x.Choice == selected).Index;
-            if (selectedIndex < analyses.Count)
+            lastSelectedIndex = selectedIndex;
+
+            if (selectedIndex >= 0 && selectedIndex < analyses.Count)
             {
                 await ShowAnalysisDetailsAsync(analyses[selectedIndex]);
             }
@@ -2468,50 +2533,57 @@ WantedBy=multi-user.target
         }
     }
 
-    private async Task ShowIndividualCalibrationsAsync(AnalysisSession analysis)
+    private Task ShowIndividualCalibrationsAsync(AnalysisSession analysis)
     {
         if (analysis.Calibrations.Count == 0)
         {
             _ui.WriteInfo("No individual calibration data available");
             _ui.WaitForKey("Press any key to continue...");
-            return;
+            return Task.CompletedTask;
         }
+
+        // Start at first calibration and allow cycling with Up/Down arrows
+        int currentIndex = 0;
 
         while (true)
         {
-            _ui.Clear();
-            _ui.WriteRule($"Individual Calibrations - {analysis.PrinterName}");
-            _ui.WriteLine();
+            ShowIndividualCalibrationWithNavigation(analysis, currentIndex);
 
-            // Build choices from calibrations
-            var choices = analysis.Calibrations.Select((cal, i) =>
+            var key = Console.ReadKey(true).Key;
+
+            switch (key)
             {
-                var range = $"Range: {MeshStats.FormatMm(cal.Stats?.Range ?? 0)}";
-                return $"Calibration #{i + 1} | {range}";
-            }).ToList();
+                case ConsoleKey.DownArrow:
+                case ConsoleKey.RightArrow:
+                    // Next calibration, wrap to first if at end
+                    currentIndex = (currentIndex + 1) % analysis.Calibrations.Count;
+                    break;
 
-            var indexedChoices = choices.Select((c, i) => (Choice: c, Index: i)).ToList();
+                case ConsoleKey.UpArrow:
+                case ConsoleKey.LeftArrow:
+                    // Previous calibration, wrap to last if at start
+                    currentIndex = currentIndex > 0 ? currentIndex - 1 : analysis.Calibrations.Count - 1;
+                    break;
 
-            var selected = _ui.SelectOneWithEscape("Select calibration to view:", choices);
+                case ConsoleKey.Escape:
+                case ConsoleKey.Backspace:
+                case ConsoleKey.Q:
+                    return Task.CompletedTask;
 
-            if (selected == null)
-                return;
-
-            var selectedIndex = indexedChoices.First(x => x.Choice == selected).Index;
-            if (selectedIndex < analysis.Calibrations.Count)
-            {
-                await ShowIndividualCalibrationMeshAsync(analysis, selectedIndex);
+                default:
+                    // Any other key exits
+                    return Task.CompletedTask;
             }
         }
     }
 
-    private Task ShowIndividualCalibrationMeshAsync(AnalysisSession analysis, int calibrationIndex)
+    private void ShowIndividualCalibrationWithNavigation(AnalysisSession analysis, int calibrationIndex)
     {
         var calibration = analysis.Calibrations[calibrationIndex];
 
         _ui.Clear();
         var titleSuffix = !string.IsNullOrEmpty(analysis.Name) ? $" ({analysis.Name})" : "";
-        _ui.WriteRule($"Calibration #{calibrationIndex + 1} - {analysis.PrinterName}{titleSuffix}");
+        _ui.WriteRule($"Calibration #{calibrationIndex + 1} of {analysis.Calibrations.Count} - {analysis.PrinterName}{titleSuffix}");
         _ui.WriteLine();
 
         // Use the visual mesh renderer
@@ -2525,9 +2597,9 @@ WantedBy=multi-user.target
         }
 
         _ui.WriteLine();
-        _ui.WaitForKey("Press any key to go back...");
-        return Task.CompletedTask;
+        AnsiConsole.MarkupLine("[grey]↑/↓ Previous/Next calibration  |  Any other key to go back...[/]");
     }
+
 
     #region Input Validation Helpers
 

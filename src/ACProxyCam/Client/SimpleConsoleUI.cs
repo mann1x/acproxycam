@@ -139,33 +139,49 @@ public class SimpleConsoleUI : IConsoleUI
 
     public string? SelectOneWithEscape(string title, IEnumerable<string> choices)
     {
+        var (item, _) = SelectOneWithEscapeAndIndex(title, choices, 0);
+        return item;
+    }
+
+    public (string? Item, int Index) SelectOneWithEscapeAndIndex(string title, IEnumerable<string> choices, int startIndex = 0)
+    {
         var choiceList = choices.ToList();
 
         Console.WriteLine(title);
         for (int i = 0; i < choiceList.Count; i++)
         {
-            Console.WriteLine($"  {i + 1}. {choiceList[i]}");
+            // Mark the suggested starting position with asterisk
+            var marker = i == startIndex ? "*" : " ";
+            Console.WriteLine($" {marker}{i + 1}. {choiceList[i]}");
         }
         Console.WriteLine("  0. Cancel");
 
-        Console.Write($"Enter choice (0-{choiceList.Count}): ");
+        // Show default based on startIndex
+        var defaultChoice = startIndex >= 0 && startIndex < choiceList.Count ? (startIndex + 1).ToString() : "";
+        Console.Write($"Enter choice (0-{choiceList.Count}) [{defaultChoice}]: ");
         Console.Out.Flush();
 
         var input = Console.ReadLine()?.Trim();
 
-        // Cancel on 0, empty, or 'c'
-        if (string.IsNullOrEmpty(input) || input == "0" || input.ToLower() == "c")
+        // Use default if empty and startIndex is valid
+        if (string.IsNullOrEmpty(input) && startIndex >= 0 && startIndex < choiceList.Count)
         {
-            return null;
+            return (choiceList[startIndex], startIndex);
+        }
+
+        // Cancel on 0 or 'c'
+        if (input == "0" || input?.ToLower() == "c")
+        {
+            return (null, -1);
         }
 
         if (int.TryParse(input, out var index) && index >= 1 && index <= choiceList.Count)
         {
-            return choiceList[index - 1];
+            return (choiceList[index - 1], index - 1);
         }
 
         // Invalid input - treat as cancel
-        return null;
+        return (null, -1);
     }
 
     public List<string> SelectMany(string title, IEnumerable<string> choices, string? instructions = null)

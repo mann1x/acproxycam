@@ -52,9 +52,11 @@ public class IpcServer
 
         // Set socket permissions (rw for owner and group)
         // chmod 660
+#pragma warning disable CA1416 // Platform-specific API (Linux only)
         File.SetUnixFileMode(SocketPath,
             UnixFileMode.UserRead | UnixFileMode.UserWrite |
             UnixFileMode.GroupRead | UnixFileMode.GroupWrite);
+#pragma warning restore CA1416
 
         _acceptTask = AcceptClientsAsync(_cts.Token);
     }

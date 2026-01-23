@@ -53,7 +53,9 @@ public static class ConfigManager
         {
             Directory.CreateDirectory(ConfigDir);
             // Set directory permissions (rwx for owner only)
+#pragma warning disable CA1416 // Platform-specific API (Linux only)
             File.SetUnixFileMode(ConfigDir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+#pragma warning restore CA1416
         }
 
         // Clone config and encrypt credentials
@@ -93,7 +95,9 @@ public static class ConfigManager
         await File.WriteAllTextAsync(ConfigFile, json);
 
         // Set file permissions (rw for owner only)
+#pragma warning disable CA1416 // Platform-specific API (Linux only)
         File.SetUnixFileMode(ConfigFile, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+#pragma warning restore CA1416
     }
 
     /// <summary>
