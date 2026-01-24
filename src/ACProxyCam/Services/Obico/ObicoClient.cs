@@ -880,6 +880,20 @@ public class ObicoClient : IDisposable
             _printStartTime = DateTime.UtcNow;
             _currentFilename = e.Filename;
 
+            // If filename is empty, fetch it from Moonraker (state change may arrive before filename)
+            if (string.IsNullOrEmpty(_currentFilename))
+            {
+                try
+                {
+                    var result = await _moonraker.GetAsync<JsonNode>("/printer/objects/query?print_stats=filename");
+                    _currentFilename = result?["status"]?["print_stats"]?["filename"]?.GetValue<string>();
+                }
+                catch (Exception ex)
+                {
+                    Log($"Failed to fetch filename: {ex.Message}");
+                }
+            }
+
             // Fetch estimated total time from virtual_sdcard
             await FetchEstimatedTotalTimeAsync();
 
@@ -887,7 +901,7 @@ public class ObicoClient : IDisposable
             await FetchFileMetadataAsync();
 
             SendPrintEvent("PrintStarted");
-            Log($"Print started: {e.Filename}");
+            Log($"Print started: {_currentFilename}");
         }
         // Detect print end
         else if (previouslyPrinting && (e.State == "complete" || e.State == "cancelled" || e.State == "error"))
