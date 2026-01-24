@@ -293,6 +293,8 @@ git push origin main
 
 ### Step 3: Build Release Artifacts
 
+**IMPORTANT**: Always use `build.bat` to create release artifacts. Do NOT manually create zip files or checksums.
+
 Run the build script from the repository root:
 
 ```cmd

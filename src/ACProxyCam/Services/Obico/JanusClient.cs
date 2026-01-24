@@ -45,6 +45,9 @@ public class JanusClient : IDisposable
     // WebRTC connection state tracking
     private volatile bool _webrtcUp;
 
+    // Keepalive error suppression - avoid log spam when connection is down
+    private int _consecutiveKeepaliveErrors;
+
     // Default Janus ports (as used by moonraker-obico)
     public const int DEFAULT_JANUS_WS_PORT = 8188;  // Standard Janus WebSocket port
 
@@ -452,10 +455,19 @@ public class JanusClient : IDisposable
                 ["janus"] = "keepalive",
                 ["session_id"] = _sessionId.Value
             }, ct, timeout: TimeSpan.FromSeconds(5));
+
+            // Reset error counter on success
+            _consecutiveKeepaliveErrors = 0;
         }
         catch (Exception ex)
         {
-            Log($"Keepalive error: {ex.Message}");
+            _consecutiveKeepaliveErrors++;
+
+            // Only log the first error to avoid spam when connection is down
+            if (_consecutiveKeepaliveErrors == 1)
+            {
+                Log($"Keepalive error: {ex.Message}");
+            }
         }
     }
 

@@ -54,6 +54,10 @@ public class ObicoClient : IDisposable
     private volatile bool _isUserViewing;
     private DateTime _lastViewingUpdate = DateTime.MinValue;
 
+    // Printer offline tracking - when Moonraker is disconnected
+    private volatile bool _printerOffline;
+    private DateTime _lastOfflineLogTime = DateTime.MinValue;
+
     // Snapshot callback (set by PrinterThread if camera is enabled)
     private Func<byte[]?>? _getSnapshotCallback;
 
@@ -78,6 +82,55 @@ public class ObicoClient : IDisposable
     public ObicoClientState State { get; private set; } = ObicoClientState.Stopped;
     public bool IsLinked => _printerConfig.Obico.IsLinked;
     public string PrinterName => _printerConfig.Name;
+
+    /// <summary>
+    /// Sets the printer offline state. Called by PrinterThread when printer becomes unavailable.
+    /// This suppresses Obico logging and status updates until the printer reconnects.
+    /// </summary>
+    public void SetPrinterOffline(bool offline)
+    {
+        if (_printerOffline == offline)
+            return;
+
+        _printerOffline = offline;
+
+        if (offline)
+        {
+            Log("Printer marked offline - stopping Janus and suppressing status updates");
+
+            // Stop Janus streaming when going offline
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await StopJanusAsync();
+                }
+                catch (Exception ex)
+                {
+                    Log($"Error stopping Janus: {ex.Message}");
+                }
+            });
+
+            // Update status to show printer offline
+            lock (_statusLock)
+            {
+                _currentStatus.Status.State.Text = "Offline";
+                _currentStatus.Status.State.Flags.Operational = false;
+                _currentStatus.Status.State.Flags.Ready = false;
+                _currentStatus.Status.State.Flags.ClosedOrError = true;
+                _currentStatus.Status.State.Flags.Printing = false;
+                _currentStatus.Status.State.Flags.Paused = false;
+            }
+
+            // Send offline status to Obico immediately
+            SendStatusUpdate(force: true);
+        }
+        else
+        {
+            Log("Printer marked online - resuming status updates");
+            // Janus will be restarted when stream recovers via StartJanusAsync
+        }
+    }
 
     public ObicoClient(PrinterConfig printerConfig)
     {
@@ -199,6 +252,9 @@ public class ObicoClient : IDisposable
         _obicoServer = new ObicoServerConnection(
             _printerConfig.Obico.ServerUrl,
             _printerConfig.Obico.AuthToken);
+
+        // Enable verbose logging via environment variable (e.g., for systemd troubleshooting)
+        _obicoServer.Verbose = Environment.GetEnvironmentVariable("ACPROXYCAM_VERBOSE") == "1";
 
         _obicoServer.PassthruCommandReceived += OnPassthruCommand;
         _obicoServer.ConnectionStateChanged += OnObicoConnectionChanged;
@@ -400,6 +456,10 @@ public class ObicoClient : IDisposable
     /// </summary>
     private async void OnJanusMessageFromServer(object? sender, string janusJson)
     {
+        // Skip Janus relay when printer is offline - no point relaying if stream is down
+        if (_printerOffline)
+            return;
+
         if (_janusClient == null)
         {
             Log("Cannot relay Janus message - Janus client not connected");
@@ -445,6 +505,10 @@ public class ObicoClient : IDisposable
     /// </summary>
     private void OnJanusMessageFromJanus(object? sender, System.Text.Json.Nodes.JsonNode janusMsg)
     {
+        // Skip relay when printer is offline
+        if (_printerOffline)
+            return;
+
         if (_obicoServer?.IsConnected == true)
         {
             Log($"Relaying Janus message from local Janus to Obico");
@@ -913,9 +977,32 @@ public class ObicoClient : IDisposable
     {
         if (!connected && _isRunning)
         {
-            Log("Moonraker disconnected - will attempt reconnection");
+            Log("Moonraker disconnected - printer offline, will attempt reconnection");
+            _printerOffline = true;
+
+            // Update status to show printer offline
+            lock (_statusLock)
+            {
+                _currentStatus.Status.State.Text = "Offline";
+                _currentStatus.Status.State.Flags.Operational = false;
+                _currentStatus.Status.State.Flags.Ready = false;
+                _currentStatus.Status.State.Flags.ClosedOrError = true;
+                _currentStatus.Status.State.Flags.Printing = false;
+                _currentStatus.Status.State.Flags.Paused = false;
+            }
+
+            // Send offline status to Obico immediately
+            SendStatusUpdate(force: true);
+
             SetState(ObicoClientState.Reconnecting);
             TriggerReconnection();
+        }
+        else if (connected && _printerOffline)
+        {
+            Log("Moonraker reconnected - printer back online");
+            _printerOffline = false;
+
+            // Status will be updated by normal Moonraker status events
         }
     }
 
@@ -1432,8 +1519,16 @@ public class ObicoClient : IDisposable
         {
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(10), ct);
-                SendStatusUpdate();
+                // When printer is offline, reduce update frequency to once per minute
+                var delay = _printerOffline ? 60 : 10;
+                await Task.Delay(TimeSpan.FromSeconds(delay), ct);
+
+                // Skip status updates when offline - the offline status was already sent
+                // and we don't want to spam with stale data
+                if (!_printerOffline)
+                {
+                    SendStatusUpdate();
+                }
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
@@ -1756,8 +1851,7 @@ public class ObicoClient : IDisposable
         _currentStatus.Status.FileMetadata ??= new ObicoFileMetadata();
         _currentStatus.Status.FileMetadata.Analysis ??= new ObicoFileAnalysis();
         _currentStatus.Status.FileMetadata.Analysis.PrintingArea ??= new ObicoPrintingArea();
-        if (_currentStatus.Status.FileMetadata.Analysis.PrintingArea != null)
-            _currentStatus.Status.FileMetadata.Analysis.PrintingArea.MaxZ = maxZ;
+        _currentStatus.Status.FileMetadata.Analysis.PrintingArea!.MaxZ = maxZ;
     }
 
     /// <summary>

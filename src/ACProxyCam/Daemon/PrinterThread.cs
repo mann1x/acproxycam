@@ -619,6 +619,14 @@ public class PrinterThread : IDisposable
         _mqttController.PrinterStateReceived += OnPrinterStateReceived;
 
 
+        // When AutoLanMode is enabled, always enable LAN mode first
+        // This ensures the HTTP streaming service (port 18088) is running
+        // even if MQTT credentials are cached from a previous session
+        if (Config.AutoLanMode)
+        {
+            await TryEnableLanModeAsync(ct);
+        }
+
         try
         {
             await _mqttController.ConnectAsync(
@@ -629,7 +637,7 @@ public class PrinterThread : IDisposable
         }
         catch when (Config.AutoLanMode)
         {
-            // MQTT connection failed - try to enable LAN mode via SSH
+            // MQTT connection failed after LAN mode - try enabling again
             await TryEnableLanModeAsync(ct);
 
             // Retry MQTT connection after enabling LAN mode
@@ -694,6 +702,8 @@ public class PrinterThread : IDisposable
     /// </summary>
     private async Task TryEnableLanModeAsync(CancellationToken ct)
     {
+        LogStatusThrottled("lanmode", "Enabling LAN mode via SSH...");
+
         _lanModeService = new LanModeService();
         _lanModeService.StatusChanged += (s, msg) => { }; // Suppress - main loop handles logging
 
@@ -711,8 +721,13 @@ public class PrinterThread : IDisposable
 
         if (!result.WasAlreadyOpen)
         {
+            LogStatusThrottled("lanmode", "LAN mode enabled, waiting for services to start...");
             // LAN mode just enabled - wait for MQTT to become available
             await Task.Delay(5000, ct);
+        }
+        else
+        {
+            LogStatusThrottled("lanmode", "LAN mode already enabled");
         }
     }
 
@@ -1018,6 +1033,7 @@ public class PrinterThread : IDisposable
                         ResetLogThrottling(); // Reset throttling on successful recovery
                         _streamFailedAt = DateTime.MinValue;
                         _state = PrinterState.Running; // Ensure state is Running after recovery
+                        _obicoClient?.SetPrinterOffline(false); // Printer is back online
                     }
                     _lastSeenOnline = DateTime.UtcNow;
                     _streamFailedAt = DateTime.MinValue; // Reset failure tracking
@@ -1053,6 +1069,9 @@ public class PrinterThread : IDisposable
                     {
                         _streamFailedAt = DateTime.UtcNow;
                         _state = PrinterState.Retrying; // Update state so UI reflects recovery mode
+
+                        // Mark printer offline to suppress Obico/Janus logging during recovery
+                        _obicoClient?.SetPrinterOffline(true);
                     }
 
                     var failureDuration = DateTime.UtcNow - _streamFailedAt;
@@ -1090,7 +1109,8 @@ public class PrinterThread : IDisposable
                         }
                         else
                         {
-                            // Printer not available - trigger full restart
+                            // Printer not available - notify Obico client and trigger full restart
+                            _obicoClient?.SetPrinterOffline(true);
                             throw new Exception($"Stream failed and printer not available after {failureDuration.TotalMinutes:F1} minutes");
                         }
                     }

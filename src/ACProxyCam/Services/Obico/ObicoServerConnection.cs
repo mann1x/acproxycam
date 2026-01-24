@@ -31,6 +31,11 @@ public class ObicoServerConnection : IDisposable
     private DateTime _lastStatusUpdate = DateTime.MinValue;
 
     /// <summary>
+    /// Enable verbose WebSocket logging for troubleshooting.
+    /// </summary>
+    public bool Verbose { get; set; }
+
+    /// <summary>
     /// Fired when WebSocket connection state changes.
     /// </summary>
     public event EventHandler<bool>? ConnectionStateChanged;
@@ -215,7 +220,8 @@ public class ObicoServerConnection : IDisposable
     {
         try
         {
-            Console.WriteLine($"[Obico WS] Received: {message.Substring(0, Math.Min(500, message.Length))}...");
+            if (Verbose)
+                Console.WriteLine($"[Obico WS] Received: {message.Substring(0, Math.Min(500, message.Length))}...");
 
             var json = JsonNode.Parse(message);
             if (json == null)
@@ -246,13 +252,12 @@ public class ObicoServerConnection : IDisposable
 
                     if (!string.IsNullOrEmpty(config.Host) && config.Port > 0)
                     {
-                        Console.WriteLine($"[Obico WS] Streaming config received: host={config.Host}, port={config.Port}, stream_id={config.StreamId}");
                         StreamingConfigReceived?.Invoke(this, config);
                     }
                 }
-                catch (Exception ex)
+                catch
                 {
-                    Console.WriteLine($"[Obico WS] Failed to parse streaming config: {ex.Message}");
+                    // Ignore parse errors for streaming config
                 }
             }
 
@@ -263,7 +268,6 @@ public class ObicoServerConnection : IDisposable
                 var janusStr = janusMsg.GetValue<string>();
                 if (!string.IsNullOrEmpty(janusStr))
                 {
-                    Console.WriteLine($"[Obico WS] Janus message received");
                     JanusMessageReceived?.Invoke(this, janusStr);
                 }
             }
@@ -318,7 +322,8 @@ public class ObicoServerConnection : IDisposable
                         obicoCmd.BedOff = argsNode["bed_off"]?.GetValue<bool>();
                     }
 
-                    Console.WriteLine($"[Obico WS] Command received: {cmd} (initiator: {obicoCmd.Initiator})");
+                    if (Verbose)
+                        Console.WriteLine($"[Obico WS] Command received: {cmd} (initiator: {obicoCmd.Initiator})");
                     CommandReceived?.Invoke(this, obicoCmd);
                 }
             }
@@ -336,12 +341,14 @@ public class ObicoServerConnection : IDisposable
     {
         if (!_isConnected)
         {
-            Console.WriteLine("[Obico WS] Cannot send - not connected");
+            if (Verbose)
+                Console.WriteLine("[Obico WS] Cannot send - not connected");
             return;
         }
 
         var json = JsonSerializer.Serialize(message);
-        Console.WriteLine($"[Obico WS] Sending: {json.Substring(0, Math.Min(500, json.Length))}...");
+        if (Verbose)
+            Console.WriteLine($"[Obico WS] Sending: {json.Substring(0, Math.Min(500, json.Length))}...");
         _sendQueue.TryAdd(json);
     }
 
@@ -564,7 +571,8 @@ public class ObicoServerConnection : IDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Obico] Snapshot upload failed: {ex.Message}");
+            if (Verbose)
+                Console.WriteLine($"[Obico] Snapshot upload failed: {ex.Message}");
             throw new ObicoApiException($"Post snapshot failed: {ex.Message}", ex);
         }
     }
