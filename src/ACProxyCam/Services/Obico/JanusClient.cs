@@ -48,6 +48,9 @@ public class JanusClient : IDisposable
     // Keepalive error suppression - avoid log spam when connection is down
     private int _consecutiveKeepaliveErrors;
 
+    // Verbose logging for debugging
+    public bool Verbose { get; set; }
+
     // Default Janus ports (as used by moonraker-obico)
     public const int DEFAULT_JANUS_WS_PORT = 8188;  // Standard Janus WebSocket port
 
@@ -204,7 +207,8 @@ public class JanusClient : IDisposable
         {
             var buffer = Encoding.UTF8.GetBytes(message);
             await _webSocket.SendAsync(buffer, WebSocketMessageType.Text, true, ct);
-            Log($"Sent to Janus: {message.Substring(0, Math.Min(100, message.Length))}...");
+            if (Verbose)
+                Log($"Sent to Janus: {message.Substring(0, Math.Min(100, message.Length))}...");
         }
         catch (Exception ex)
         {
@@ -628,10 +632,18 @@ public class JanusClient : IDisposable
             var janusType = json["janus"]?.GetValue<string>() ?? "";
             var transaction = json["transaction"]?.GetValue<string>();
 
-            // Log interesting messages (not keepalive acks)
-            if (janusType != "ack")
+            // Log interesting messages with appropriate detail level
+            // Skip common message types that are handled elsewhere or not interesting:
+            // - ack: just acknowledgments
+            // - success/event: handled by pending requests
+            // - keepalive: internal maintenance
+            // - webrtcup/hangup: logged better below with more context
+            if (janusType == "error")
             {
-                Log($"Received from Janus: {janusType}");
+                // Log full error details
+                var errorCode = json["error"]?["code"]?.GetValue<int>() ?? 0;
+                var errorReason = json["error"]?["reason"]?.GetValue<string>() ?? "unknown";
+                Log($"Janus error: code={errorCode}, reason={errorReason}");
             }
 
             // Track WebRTC connection state to pause/resume streaming
@@ -642,18 +654,19 @@ public class JanusClient : IDisposable
                 if (!_webrtcUp)
                 {
                     _webrtcUp = true;
-                    Log("WebRTC connection UP - resuming streaming");
+                    Log("WebRTC viewer connected");
                     WebRtcStateChanged?.Invoke(this, true);
                 }
             }
             else if (janusType == "hangup")
             {
                 // WebRTC connection dropped - browser disconnected or DTLS failed
+                // Note: DTLS alert is normal when browser closes tab or navigates away
                 var reason = json["reason"]?.GetValue<string>() ?? "unknown";
                 if (_webrtcUp)
                 {
                     _webrtcUp = false;
-                    Log($"WebRTC connection DOWN (reason: {reason}) - pausing streaming");
+                    Log($"WebRTC viewer disconnected ({reason})");
                     WebRtcStateChanged?.Invoke(this, false);
                 }
             }
@@ -686,7 +699,8 @@ public class JanusClient : IDisposable
             // This is critical for WebRTC signaling - web UI needs success/error responses
             if (!isOwnRequest && janusType != "ack" && janusType != "keepalive")
             {
-                Log($"Forwarding Janus message to Obico: {janusType}");
+                // Don't log every forwarded message - too verbose
+                // Error and hangup are already logged above with more context
                 JanusMessageReceived?.Invoke(this, json);
             }
         }

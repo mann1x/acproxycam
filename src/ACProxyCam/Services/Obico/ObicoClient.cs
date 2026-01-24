@@ -58,6 +58,9 @@ public class ObicoClient : IDisposable
     private volatile bool _printerOffline;
     private DateTime _lastOfflineLogTime = DateTime.MinValue;
 
+    // Verbose logging (set via ACPROXYCAM_VERBOSE=1 environment variable)
+    private readonly bool _verbose;
+
     // Snapshot callback (set by PrinterThread if camera is enabled)
     private Func<byte[]?>? _getSnapshotCallback;
 
@@ -136,6 +139,7 @@ public class ObicoClient : IDisposable
     {
         _printerConfig = printerConfig;
         _moonraker = new MoonrakerApiClient(printerConfig.Ip, printerConfig.Firmware.MoonrakerPort);
+        _verbose = Environment.GetEnvironmentVariable("ACPROXYCAM_VERBOSE") == "1";
 
         // Wire up Moonraker events
         _moonraker.StatusUpdateReceived += OnMoonrakerStatusUpdate;
@@ -171,6 +175,7 @@ public class ObicoClient : IDisposable
                     _ffmpegDecoder,
                     GetJanusServerAddress()!,
                     _janusClient.VideoPort);
+                _h264Streamer.Verbose = _verbose;
                 _h264Streamer.StatusChanged += (s, msg) => Log(msg);
                 await _h264Streamer.StartAsync();
                 Log($"H.264 streaming started (stream_id={_janusClient.StreamId}, video_port={_janusClient.VideoPort})");
@@ -331,6 +336,7 @@ public class ObicoClient : IDisposable
 
             // Create Janus client with appropriate streaming mode
             _janusClient = new JanusClient(janusServer, streamMode);
+            _janusClient.Verbose = _verbose;
             _janusClient.StatusChanged += (s, msg) => Log(msg);
             _janusClient.JanusMessageReceived += OnJanusMessageFromJanus;
             _janusClient.WebRtcStateChanged += OnWebRtcStateChanged;
@@ -352,6 +358,7 @@ public class ObicoClient : IDisposable
                         _ffmpegDecoder,
                         janusServer,
                         _janusClient.VideoPort);
+                    _h264Streamer.Verbose = _verbose;
                     _h264Streamer.StatusChanged += (s, msg) => Log(msg);
                     await _h264Streamer.StartAsync();
 
@@ -470,7 +477,8 @@ public class ObicoClient : IDisposable
         {
             // Relay the message to Janus as-is
             // The browser creates its own Janus session via this relay
-            Log($"Relaying Janus message from Obico to Janus: {janusJson.Substring(0, Math.Min(100, janusJson.Length))}...");
+            if (_verbose)
+                Log($"Relaying Janus message from Obico to Janus: {janusJson.Substring(0, Math.Min(100, janusJson.Length))}...");
             await _janusClient.SendToJanusAsync(janusJson, _cts?.Token ?? CancellationToken.None);
         }
         catch (Exception ex)
@@ -511,7 +519,8 @@ public class ObicoClient : IDisposable
 
         if (_obicoServer?.IsConnected == true)
         {
-            Log($"Relaying Janus message from local Janus to Obico");
+            if (_verbose)
+                Log($"Relaying Janus message from local Janus to Obico");
             _obicoServer.SendJanusMessage(janusMsg.ToJsonString());
         }
     }

@@ -46,6 +46,9 @@ public class H264RtpStreamer : IDisposable
     private byte[]? _ppsNal;
     private bool _spsPpsParsed;
 
+    // Verbose logging for debugging
+    public bool Verbose { get; set; }
+
     public event EventHandler<string>? StatusChanged;
 
     public bool IsStreaming => _isStreaming;
@@ -164,8 +167,8 @@ public class H264RtpStreamer : IDisposable
             // Update timestamp (90kHz clock, ~3000 ticks per frame at 30fps)
             _timestamp += 3000;
 
-            // Log stats periodically
-            if ((DateTime.UtcNow - _lastLogTime).TotalSeconds >= 30)
+            // Log stats periodically (only in verbose mode)
+            if (Verbose && (DateTime.UtcNow - _lastLogTime).TotalSeconds >= 30)
             {
                 var elapsed = (DateTime.UtcNow - _lastLogTime).TotalSeconds;
                 var kbps = (_bytesSent * 8.0 / 1000.0) / elapsed;
