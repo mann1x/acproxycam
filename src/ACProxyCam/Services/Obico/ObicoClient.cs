@@ -130,8 +130,28 @@ public class ObicoClient : IDisposable
         }
         else
         {
-            Log("Printer marked online - resuming status updates");
-            // Janus will be restarted when stream recovers via StartJanusAsync
+            Log("Printer marked online - resuming status updates and restarting Janus");
+
+            // Restart Janus streaming when printer comes back online
+            if (_printerConfig.CameraEnabled && _printerConfig.Obico.Enabled && _janusEnabled)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        // Small delay to let stream stabilize
+                        await Task.Delay(2000);
+                        if (!_printerOffline && _isRunning)
+                        {
+                            await StartJanusAsync();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"Error restarting Janus: {ex.Message}");
+                    }
+                });
+            }
         }
     }
 
@@ -589,6 +609,13 @@ public class ObicoClient : IDisposable
                 UpdateStatusFromMoonraker(statusData);
                 _currentStatus.Status.State.Flags.Ready = klippyState == "ready";
                 _currentStatus.Status.State.Flags.Error = klippyState == "error";
+                _currentStatus.Status.State.Flags.ClosedOrError = klippyState != "ready";
+
+                // Override State.Text based on klippy state when in error
+                if (klippyState == "error")
+                {
+                    _currentStatus.Status.State.Text = "Error";
+                }
             }
 
             // Check if a print is already in progress (e.g., service restart during print)
@@ -814,6 +841,16 @@ public class ObicoClient : IDisposable
             _currentStatus.Status.State.Flags.Ready = state == "ready";
             _currentStatus.Status.State.Flags.Error = state == "error";
             _currentStatus.Status.State.Flags.ClosedOrError = state != "ready";
+
+            // Update State.Text based on klippy state
+            if (state == "error")
+            {
+                _currentStatus.Status.State.Text = "Error";
+            }
+            else if (state == "ready" && !_currentStatus.Status.State.Flags.Printing)
+            {
+                _currentStatus.Status.State.Text = "Operational";
+            }
         }
 
         Log($"Klippy state: {state}");
