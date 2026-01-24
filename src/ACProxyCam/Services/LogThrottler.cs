@@ -188,18 +188,20 @@ public class LogThrottler
 
 /// <summary>
 /// Static helper for FFmpeg log throttling with stderr output.
+/// More aggressive throttling than general logs since FFmpeg can spam thousands of errors on disconnect.
 /// </summary>
 public static class FfmpegLogThrottler
 {
     private static readonly ConcurrentDictionary<string, ThrottleState> _states = new();
     private static readonly object _lock = new();
 
-    private const int InitialThreshold = 5;
-    private const int MediumInterval = 20;
-    private const int MediumThreshold = 400;
-    private const int LargeInterval = 100;
-    private const int LargeThreshold = 10000;
-    private static readonly TimeSpan DailyInterval = TimeSpan.FromHours(24);
+    // More aggressive throttling for FFmpeg - only log first occurrence, then summary
+    private const int InitialThreshold = 1;       // Only log first occurrence
+    private const int MediumInterval = 100;       // Then every 100th
+    private const int MediumThreshold = 1000;     // Until 1000 total
+    private const int LargeInterval = 1000;       // Then every 1000th
+    private const int LargeThreshold = 100000;    // Until 100000 total
+    private static readonly TimeSpan DailyInterval = TimeSpan.FromHours(1); // Suppress for 1 hour, not 24
 
     /// <summary>
     /// Check if an FFmpeg log message should be output and return the formatted message.
