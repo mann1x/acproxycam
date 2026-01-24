@@ -132,6 +132,18 @@ public class ObicoClient : IDisposable
         {
             Log("Printer marked online - resuming status updates and restarting Janus");
 
+            // Reset status flags to operational state
+            lock (_statusLock)
+            {
+                _currentStatus.Status.State.Text = "Operational";
+                _currentStatus.Status.State.Flags.Operational = true;
+                _currentStatus.Status.State.Flags.Ready = true;
+                _currentStatus.Status.State.Flags.ClosedOrError = false;
+            }
+
+            // Send status update to Obico to clear offline state
+            SendStatusUpdate(force: true);
+
             // Restart Janus streaming when printer comes back online
             if (_printerConfig.CameraEnabled && _printerConfig.Obico.Enabled && _janusEnabled)
             {
@@ -1045,10 +1057,9 @@ public class ObicoClient : IDisposable
         }
         else if (connected && _printerOffline)
         {
-            Log("Moonraker reconnected - printer back online");
-            _printerOffline = false;
-
-            // Status will be updated by normal Moonraker status events
+            // Log only - the ReconnectionLoopAsync handles the full reconnection sequence:
+            // InitializeStatusAsync, status flags reset, Obico status update, and Janus restart
+            Log("Moonraker WebSocket reconnected - reconnection loop will complete initialization");
         }
     }
 
@@ -1176,6 +1187,51 @@ public class ObicoClient : IDisposable
                     Log("Reconnecting to Moonraker...");
                     await _moonraker.ConnectWebSocketAsync(ct);
                     await _moonraker.SubscribeToObicoObjectsAsync();
+
+                    // Re-initialize status from current Moonraker state
+                    // This clears stale "Offline" state and updates flags
+                    await InitializeStatusAsync();
+
+                    // Clear printer offline flag
+                    _printerOffline = false;
+
+                    // Reset status flags to operational state
+                    lock (_statusLock)
+                    {
+                        // Don't override if InitializeStatusAsync set specific state (e.g., Error)
+                        if (_currentStatus.Status.State.Text == "Offline")
+                        {
+                            _currentStatus.Status.State.Text = "Operational";
+                        }
+                        _currentStatus.Status.State.Flags.Operational = true;
+                        _currentStatus.Status.State.Flags.ClosedOrError = false;
+                    }
+
+                    // Send updated status to Obico immediately (if connected)
+                    if (_obicoServer?.IsConnected == true)
+                    {
+                        SendStatusUpdate(includeSettings: true, force: true);
+                    }
+
+                    // Restart Janus streaming
+                    if (_printerConfig.CameraEnabled && _printerConfig.Obico.Enabled)
+                    {
+                        Log("Restarting Janus after Moonraker reconnection...");
+                        try
+                        {
+                            // Small delay to let stream stabilize
+                            await Task.Delay(2000, ct);
+                            if (_isRunning && !_printerOffline)
+                            {
+                                await StartJanusAsync();
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"Error restarting Janus: {ex.Message}");
+                        }
+                    }
+
                     Log("Reconnected to Moonraker");
                 }
 
