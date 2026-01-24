@@ -233,6 +233,15 @@ public class IpcClient : IDisposable
     }
 
     /// <summary>
+    /// Reload configuration (daemon will reload config and restart printers as needed).
+    /// </summary>
+    public async Task<(bool Success, string? Error)> ReloadConfigAsync()
+    {
+        var response = await SendAsync(IpcCommands.ReloadConfig);
+        return (response.Success, response.Error);
+    }
+
+    /// <summary>
     /// Get LED status for a printer.
     /// </summary>
     public async Task<(bool Success, LedStatus? Data, string? Error)> GetLedStatusAsync(string name)

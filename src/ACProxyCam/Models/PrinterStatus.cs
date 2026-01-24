@@ -37,6 +37,9 @@ public class PrinterStatus
 
     // Camera LED status
     public LedStatus? CameraLed { get; set; }
+
+    // Obico status
+    public ObicoStatus ObicoStatus { get; set; } = new();
 }
 
 public enum PrinterState
@@ -101,4 +104,50 @@ public class LedStatus
     /// LED brightness (0-100).
     /// </summary>
     public int Brightness { get; set; }
+}
+
+/// <summary>
+/// Obico integration status.
+/// </summary>
+public class ObicoStatus
+{
+    /// <summary>
+    /// Whether Obico integration is enabled for this printer.
+    /// </summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>
+    /// Whether the printer is linked to Obico server.
+    /// </summary>
+    public bool IsLinked { get; set; }
+
+    /// <summary>
+    /// Current Obico client state.
+    /// </summary>
+    public string State { get; set; } = "Stopped";
+
+    /// <summary>
+    /// Whether connected to Obico server WebSocket.
+    /// </summary>
+    public bool ServerConnected { get; set; }
+
+    /// <summary>
+    /// Whether connected to Moonraker API.
+    /// </summary>
+    public bool MoonrakerConnected { get; set; }
+
+    /// <summary>
+    /// Obico account tier (Pro or Free).
+    /// </summary>
+    public bool IsPro { get; set; }
+
+    /// <summary>
+    /// Target FPS for snapshot uploads.
+    /// </summary>
+    public int TargetFps { get; set; }
+
+    /// <summary>
+    /// Last error message if any.
+    /// </summary>
+    public string? LastError { get; set; }
 }

@@ -40,11 +40,22 @@ public unsafe class FfmpegDecoder : IDisposable
     /// Raised when stream is detected as stalled (no new frames or PTS not advancing).
     /// </summary>
     public event EventHandler? StreamStalled;
+    /// <summary>
+    /// Raised when a raw H.264 packet is received (before decoding).
+    /// Used for RTP streaming to share the source stream.
+    /// </summary>
+    public event EventHandler<RawPacketEventArgs>? RawPacketReceived;
 
     public bool IsRunning => _isRunning;
     public int Width { get; private set; }
     public int Height { get; private set; }
     public int FramesDecoded { get; private set; }
+
+    /// <summary>
+    /// H.264 extradata (contains SPS and PPS in AVCC format).
+    /// Available after stream opens.
+    /// </summary>
+    public byte[]? Extradata { get; private set; }
 
     /// <summary>
     /// Current PTS (presentation timestamp) of the stream.
@@ -290,6 +301,15 @@ public unsafe class FfmpegDecoder : IDisposable
 
                     if (packet->stream_index == _videoStreamIndex)
                     {
+                        // Emit raw packet for RTP streaming before decoding
+                        if (RawPacketReceived != null)
+                        {
+                            byte[] packetData = new byte[packet->size];
+                            Marshal.Copy((IntPtr)packet->data, packetData, 0, packet->size);
+                            bool isKeyframe = (packet->flags & ffmpeg.AV_PKT_FLAG_KEY) != 0;
+                            RawPacketReceived?.Invoke(this, new RawPacketEventArgs(packetData, isKeyframe, packet->pts, packet->dts));
+                        }
+
                         DecodePacket(packet);
                     }
 
@@ -381,6 +401,14 @@ public unsafe class FfmpegDecoder : IDisposable
         {
             StatusChanged?.Invoke(this, $"Failed to open codec: {GetErrorMessage(ret)}");
             return false;
+        }
+
+        // Extract extradata (contains SPS/PPS for H.264)
+        if (_codecContext->extradata != null && _codecContext->extradata_size > 0)
+        {
+            Extradata = new byte[_codecContext->extradata_size];
+            Marshal.Copy((IntPtr)_codecContext->extradata, Extradata, 0, _codecContext->extradata_size);
+            StatusChanged?.Invoke(this, $"Extradata available: {_codecContext->extradata_size} bytes");
         }
 
         return true;
@@ -552,5 +580,39 @@ public class FrameEventArgs : EventArgs
         Width = width;
         Height = height;
         Stride = stride;
+    }
+}
+
+/// <summary>
+/// Event args containing raw H.264 packet data (before decoding).
+/// </summary>
+public class RawPacketEventArgs : EventArgs
+{
+    /// <summary>
+    /// Raw H.264 NAL unit data.
+    /// </summary>
+    public byte[] Data { get; }
+
+    /// <summary>
+    /// Whether this packet contains a keyframe (IDR).
+    /// </summary>
+    public bool IsKeyframe { get; }
+
+    /// <summary>
+    /// Presentation timestamp.
+    /// </summary>
+    public long Pts { get; }
+
+    /// <summary>
+    /// Decoding timestamp.
+    /// </summary>
+    public long Dts { get; }
+
+    public RawPacketEventArgs(byte[] data, bool isKeyframe, long pts, long dts)
+    {
+        Data = data;
+        IsKeyframe = isKeyframe;
+        Pts = pts;
+        Dts = dts;
     }
 }

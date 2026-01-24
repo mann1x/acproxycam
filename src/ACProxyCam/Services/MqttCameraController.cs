@@ -55,6 +55,7 @@ public class MqttCameraController : IAsyncDisposable
     private const string LightTopicTemplate = "anycubic/anycubicCloud/v1/web/printer/{0}/{1}/light";
     private const string InfoTopicTemplate = "anycubic/anycubicCloud/v1/web/printer/{0}/{1}/info";
     private const string TempTopicTemplate = "anycubic/anycubicCloud/v1/web/printer/{0}/{1}/tempature";
+    private const string PrintTopicTemplate = "anycubic/anycubicCloud/v1/web/printer/{0}/{1}/print";
 
     // Response topic patterns
     private const string LightReportSuffix = "/light/report";
@@ -503,6 +504,34 @@ public class MqttCameraController : IAsyncDisposable
     }
 
     /// <summary>
+    /// Build the MQTT topic for print control.
+    /// </summary>
+    private static string BuildPrintTopic(string modelCode, string deviceId)
+    {
+        return string.Format(PrintTopicTemplate, modelCode, deviceId);
+    }
+
+    /// <summary>
+    /// Build the print command payload.
+    /// </summary>
+    private static (string Payload, string MsgId) BuildPrintCommand(string action, string? taskId = null)
+    {
+        var msgId = Guid.NewGuid().ToString();
+        var command = new Dictionary<string, object?>
+        {
+            ["type"] = "print",
+            ["action"] = action,
+            ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["msgid"] = msgId,
+            ["data"] = new Dictionary<string, object?>
+            {
+                ["taskid"] = taskId ?? "-1"
+            }
+        };
+        return (JsonSerializer.Serialize(command), msgId);
+    }
+
+    /// <summary>
     /// Build the camera command payload.
     /// </summary>
     private static (string Payload, string MsgId) BuildVideoCommand(string action)
@@ -609,6 +638,54 @@ public class MqttCameraController : IAsyncDisposable
         catch (Exception ex)
         {
             StatusChanged?.Invoke(this, $"Failed to send camera command: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Send a print stop command to sync native Anycubic firmware.
+    /// This should be called after Moonraker's CANCEL_PRINT has been processed
+    /// to ensure the native firmware also knows the print has been cancelled.
+    /// </summary>
+    public async Task<bool> SendPrintStopAsync(
+        string deviceId,
+        string? modelCode = null,
+        string? taskId = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_mqttClient == null || !_mqttClient.IsConnected)
+        {
+            StatusChanged?.Invoke(this, "Cannot send print stop: not connected to MQTT");
+            return false;
+        }
+
+        var effectiveModelCode = modelCode ?? _detectedModelCode;
+        if (string.IsNullOrEmpty(effectiveModelCode))
+        {
+            StatusChanged?.Invoke(this, "Cannot send print stop: model code not available");
+            return false;
+        }
+
+        var topic = BuildPrintTopic(effectiveModelCode, deviceId);
+        var (payload, msgId) = BuildPrintCommand("stop", taskId);
+
+        StatusChanged?.Invoke(this, "Sending native firmware STOP command...");
+
+        try
+        {
+            var message = new MqttApplicationMessageBuilder()
+                .WithTopic(topic)
+                .WithPayload(payload)
+                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+                .Build();
+
+            await _mqttClient.PublishAsync(message, cancellationToken);
+            StatusChanged?.Invoke(this, "Native firmware stop command sent");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            StatusChanged?.Invoke(this, $"Failed to send native firmware stop: {ex.Message}");
             return false;
         }
     }

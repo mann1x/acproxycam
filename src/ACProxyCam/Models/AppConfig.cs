@@ -22,6 +22,12 @@ public class AppConfig
     [JsonPropertyName("logLevel")]
     public string LogLevel { get; set; } = "Information";
 
+    /// <summary>
+    /// Global Obico integration settings.
+    /// </summary>
+    [JsonPropertyName("obico")]
+    public GlobalObicoConfig Obico { get; set; } = new();
+
     [JsonPropertyName("printers")]
     public List<PrinterConfig> Printers { get; set; } = new();
 }
@@ -115,4 +121,23 @@ public class PrinterConfig
     /// </summary>
     [JsonPropertyName("standbyLedTimeoutMinutes")]
     public int StandbyLedTimeoutMinutes { get; set; } = 20;
+
+    /// <summary>
+    /// Whether camera proxy is enabled. When false, only Obico integration runs (if enabled).
+    /// Default: true for backwards compatibility.
+    /// </summary>
+    [JsonPropertyName("cameraEnabled")]
+    public bool CameraEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Per-printer Obico integration settings.
+    /// </summary>
+    [JsonPropertyName("obico")]
+    public PrinterObicoConfig Obico { get; set; } = new();
+
+    /// <summary>
+    /// Detected firmware information (auto-populated via SSH).
+    /// </summary>
+    [JsonPropertyName("firmware")]
+    public FirmwareInfo Firmware { get; set; } = new();
 }

@@ -132,14 +132,29 @@ When adding a printer, optional connectivity check verifies:
 2. SSH port (default 22) reachable
 3. MQTT port (default 9883) reachable
 4. Camera stream port (18088) reachable
+5. Native API port (18086) - used by Anycubic firmware for print control
 
 ## Test Environment
 
-| Host | Architecture | IP | SSH User |
-|------|-------------|-----|----------|
-| DietPi (arm64) | linux-arm64 | 192.168.178.12 | claude_test |
-| DietPi (x64) | linux-x64 | 192.168.178.2 | claude_test |
-| Printer | Anycubic Kobra S1 | 192.168.178.43 | root (password: rockchip) |
+| Host | Architecture | IP | SSH User | Services |
+|------|-------------|-----|----------|----------|
+| DietPi (arm64) | linux-arm64 | 192.168.178.12 | claude_test | ACProxyCam daemon |
+| DietPi (x64) | linux-x64 | 192.168.178.2 | claude_test | Obico server (Docker: `obico-server-web-1`), Janus (native) |
+| Printer | Anycubic Kobra S1 | 192.168.178.43 | root (password: rockchip) | Camera stream 18088, Native API 18086 |
+
+### Debugging Tools
+
+The `tools/` directory contains scripts for monitoring printer communication:
+
+```bash
+# Monitor MQTT messages (requires verbose logging enabled in daemon)
+ssh claude_test@192.168.178.12 "sudo journalctl -u acproxycam -f | grep --line-buffered 'MQTT MSG'"
+
+# Monitor native API traffic on port 18086
+ssh claude_test@192.168.178.12 "sudo tcpdump -i any host 192.168.178.43 and port 18086 -A -s 0"
+```
+
+See `tools/README.md` for details on enabling verbose MQTT logging.
 
 ### Automated Testing with Expect
 

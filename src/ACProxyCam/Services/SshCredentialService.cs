@@ -1,5 +1,6 @@
 // SshCredentialService.cs - Retrieves MQTT credentials from printer via SSH
 
+using ACProxyCam.Models;
 using Renci.SshNet;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -321,6 +322,102 @@ public class SshCredentialService
             catch
             {
                 return null;
+            }
+        }, cancellationToken);
+    }
+
+    /// <summary>
+    /// Detect firmware type and version on the printer via SSH.
+    /// </summary>
+    public async Task<FirmwareInfo> DetectFirmwareAsync(
+        string printerIp,
+        int sshPort = 22,
+        string sshUser = "root",
+        string sshPassword = "rockchip",
+        CancellationToken cancellationToken = default)
+    {
+        StatusChanged?.Invoke(this, $"Detecting firmware on {printerIp}...");
+
+        return await Task.Run(() =>
+        {
+            var result = new FirmwareInfo
+            {
+                Type = FirmwareType.Unknown,
+                DetectedAt = DateTime.UtcNow
+            };
+
+            try
+            {
+                using var client = new SshClient(printerIp, sshPort, sshUser, sshPassword);
+                client.ConnectionInfo.Timeout = TimeSpan.FromSeconds(SshTimeoutSeconds);
+
+                client.Connect();
+
+                if (!client.IsConnected)
+                {
+                    StatusChanged?.Invoke(this, "SSH connection failed");
+                    return result;
+                }
+
+                // Check for Rinkhals by reading version file
+                var versionCommand = client.RunCommand("cat /useremain/rinkhals/.version 2>/dev/null");
+
+                if (versionCommand.ExitStatus == 0 && !string.IsNullOrWhiteSpace(versionCommand.Result))
+                {
+                    result.Type = FirmwareType.Rinkhals;
+                    result.Version = versionCommand.Result.Trim();
+                    result.MoonrakerAvailable = true;
+                    result.MoonrakerPort = 7125;
+                    result.ConfigPath = "/userdata/app/gk/printer_data/config/";
+
+                    StatusChanged?.Invoke(this, $"Detected Rinkhals firmware v{result.Version}");
+
+                    // Verify Moonraker is actually running
+                    var moonrakerCheck = client.RunCommand("curl -s -o /dev/null -w '%{http_code}' http://localhost:7125/server/info 2>/dev/null || echo '000'");
+                    if (moonrakerCheck.ExitStatus == 0)
+                    {
+                        var httpCode = moonrakerCheck.Result.Trim();
+                        result.MoonrakerAvailable = httpCode == "200";
+                        if (!result.MoonrakerAvailable)
+                        {
+                            StatusChanged?.Invoke(this, $"Rinkhals detected but Moonraker not responding (HTTP {httpCode})");
+                        }
+                    }
+                }
+                else
+                {
+                    // Check if it's stock Anycubic firmware
+                    var gklibCheck = client.RunCommand("pgrep -x gklib >/dev/null 2>&1 && echo 'running' || echo 'not found'");
+
+                    if (gklibCheck.Result.Trim() == "running")
+                    {
+                        result.Type = FirmwareType.StockAnycubic;
+                        result.MoonrakerAvailable = false;
+                        StatusChanged?.Invoke(this, "Detected stock Anycubic firmware (no Moonraker)");
+                    }
+                    else
+                    {
+                        StatusChanged?.Invoke(this, "Unknown firmware type");
+                    }
+                }
+
+                client.Disconnect();
+                return result;
+            }
+            catch (Renci.SshNet.Common.SshAuthenticationException)
+            {
+                StatusChanged?.Invoke(this, "SSH authentication failed");
+                return result;
+            }
+            catch (System.Net.Sockets.SocketException ex)
+            {
+                StatusChanged?.Invoke(this, $"Cannot connect: {ex.Message}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke(this, $"Error detecting firmware: {ex.Message}");
+                return result;
             }
         }, cancellationToken);
     }

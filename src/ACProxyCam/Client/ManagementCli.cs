@@ -2,6 +2,8 @@
 
 using ACProxyCam.Daemon;
 using ACProxyCam.Models;
+using ACProxyCam.Services;
+using ACProxyCam.Services.Obico;
 using Spectre.Console;
 
 namespace ACProxyCam.Client;
@@ -12,11 +14,13 @@ namespace ACProxyCam.Client;
 public class ManagementCli
 {
     private readonly IConsoleUI _ui;
+    private readonly bool _useSimpleUi;
     private IpcClient? _ipcClient;
 
     public ManagementCli(IConsoleUI ui)
     {
         _ui = ui;
+        _useSimpleUi = ui is SimpleConsoleUI;
     }
 
     public async Task<int> RunAsync()
@@ -764,67 +768,77 @@ WantedBy=multi-user.target
         TogglePause,
         ShowDetails,
         ToggleLed,
-        BedMesh
+        BedMesh,
+        Obico
     }
 
     private async Task<int> ManagementLoopAsync()
     {
         while (true)
         {
-            // Clear and render dashboard using Live display
-            AnsiConsole.Clear();
-
             MenuAction action = MenuAction.None;
 
-            await AnsiConsole.Live(Text.Empty)
-                .AutoClear(false)
-                .StartAsync(async ctx =>
-                {
-                    var lastRefresh = DateTime.MinValue;
+            if (_useSimpleUi)
+            {
+                // Simple text-based menu for automation
+                action = await SimpleManagementMenuAsync();
+            }
+            else
+            {
+                // Clear and render dashboard using Live display
+                AnsiConsole.Clear();
 
-                    while (action == MenuAction.None)
+                await AnsiConsole.Live(Text.Empty)
+                    .AutoClear(false)
+                    .StartAsync(async ctx =>
                     {
-                        // Build and render dashboard
-                        var dashboard = await BuildDashboardAsync();
-                        ctx.UpdateTarget(dashboard);
-                        lastRefresh = DateTime.UtcNow;
+                        var lastRefresh = DateTime.MinValue;
 
-                        // Wait for key input with timeout for auto-refresh
                         while (action == MenuAction.None)
                         {
-                            // Check for timeout - need to refresh
-                            if ((DateTime.UtcNow - lastRefresh).TotalMilliseconds >= RefreshIntervalMs)
-                                break;
+                            // Build and render dashboard
+                            var dashboard = await BuildDashboardAsync();
+                            ctx.UpdateTarget(dashboard);
+                            lastRefresh = DateTime.UtcNow;
 
-                            // Check for key input (non-blocking)
-                            if (Console.KeyAvailable)
+                            // Wait for key input with timeout for auto-refresh
+                            while (action == MenuAction.None)
                             {
-                                var key = Console.ReadKey(true).Key;
-                                action = key switch
-                                {
-                                    ConsoleKey.Q => MenuAction.Quit,
-                                    ConsoleKey.Escape => MenuAction.Quit,
-                                    ConsoleKey.S => MenuAction.ToggleService,
-                                    ConsoleKey.R => MenuAction.RestartService,
-                                    ConsoleKey.U => MenuAction.Uninstall,
-                                    ConsoleKey.L => MenuAction.ChangeInterfaces,
-                                    ConsoleKey.A => MenuAction.AddPrinter,
-                                    ConsoleKey.D => MenuAction.DeletePrinter,
-                                    ConsoleKey.M => MenuAction.ModifyPrinter,
-                                    ConsoleKey.Spacebar => MenuAction.TogglePause,
-                                    ConsoleKey.Enter => MenuAction.ShowDetails,
-                                    ConsoleKey.T => MenuAction.ToggleLed,
-                                    ConsoleKey.B => MenuAction.BedMesh,
-                                    _ => MenuAction.None
-                                };
-                                break; // Exit inner loop to refresh or handle action
-                            }
+                                // Check for timeout - need to refresh
+                                if ((DateTime.UtcNow - lastRefresh).TotalMilliseconds >= RefreshIntervalMs)
+                                    break;
 
-                            // Small sleep to avoid busy-waiting
-                            await Task.Delay(50);
+                                // Check for key input (non-blocking)
+                                if (Console.KeyAvailable)
+                                {
+                                    var key = Console.ReadKey(true).Key;
+                                    action = key switch
+                                    {
+                                        ConsoleKey.Q => MenuAction.Quit,
+                                        ConsoleKey.Escape => MenuAction.Quit,
+                                        ConsoleKey.S => MenuAction.ToggleService,
+                                        ConsoleKey.R => MenuAction.RestartService,
+                                        ConsoleKey.U => MenuAction.Uninstall,
+                                        ConsoleKey.L => MenuAction.ChangeInterfaces,
+                                        ConsoleKey.A => MenuAction.AddPrinter,
+                                        ConsoleKey.D => MenuAction.DeletePrinter,
+                                        ConsoleKey.M => MenuAction.ModifyPrinter,
+                                        ConsoleKey.Spacebar => MenuAction.TogglePause,
+                                        ConsoleKey.Enter => MenuAction.ShowDetails,
+                                        ConsoleKey.T => MenuAction.ToggleLed,
+                                        ConsoleKey.B => MenuAction.BedMesh,
+                                        ConsoleKey.O => MenuAction.Obico,
+                                        _ => MenuAction.None
+                                    };
+                                    break; // Exit inner loop to refresh or handle action
+                                }
+
+                                // Small sleep to avoid busy-waiting
+                                await Task.Delay(50);
+                            }
                         }
-                    }
-                });
+                    });
+            }
 
             // Now outside Live context - handle actions that need interactive prompts
             switch (action)
@@ -843,52 +857,129 @@ WantedBy=multi-user.target
                     break;
 
                 case MenuAction.Uninstall:
-                    AnsiConsole.Clear();
+                    if (!_useSimpleUi) AnsiConsole.Clear();
                     var result = await UninstallFromMenuAsync();
                     if (result == 0) return 0;
                     break;
 
                 case MenuAction.ChangeInterfaces:
-                    AnsiConsole.Clear();
+                    if (!_useSimpleUi) AnsiConsole.Clear();
                     await ChangeInterfacesAsync();
                     break;
 
                 case MenuAction.AddPrinter:
-                    AnsiConsole.Clear();
+                    if (!_useSimpleUi) AnsiConsole.Clear();
                     await AddPrinterAsync();
                     break;
 
                 case MenuAction.DeletePrinter:
-                    AnsiConsole.Clear();
+                    if (!_useSimpleUi) AnsiConsole.Clear();
                     await DeletePrinterAsync();
                     break;
 
                 case MenuAction.ModifyPrinter:
-                    AnsiConsole.Clear();
+                    if (!_useSimpleUi) AnsiConsole.Clear();
                     await ModifyPrinterAsync();
                     break;
 
                 case MenuAction.TogglePause:
-                    AnsiConsole.Clear();
+                    if (!_useSimpleUi) AnsiConsole.Clear();
                     await TogglePrinterPauseAsync();
                     break;
 
                 case MenuAction.ShowDetails:
-                    AnsiConsole.Clear();
+                    if (!_useSimpleUi) AnsiConsole.Clear();
                     await ShowPrinterDetailsAsync();
                     break;
 
                 case MenuAction.ToggleLed:
-                    AnsiConsole.Clear();
+                    if (!_useSimpleUi) AnsiConsole.Clear();
                     await TogglePrinterLedAsync();
                     break;
 
                 case MenuAction.BedMesh:
-                    AnsiConsole.Clear();
+                    if (!_useSimpleUi) AnsiConsole.Clear();
                     await ShowBedMeshMenuFromMainAsync();
+                    break;
+
+                case MenuAction.Obico:
+                    if (!_useSimpleUi) AnsiConsole.Clear();
+                    await ShowObicoMenuAsync();
                     break;
             }
         }
+    }
+
+    /// <summary>
+    /// Simple text-based menu for automation and expect scripts.
+    /// </summary>
+    private async Task<MenuAction> SimpleManagementMenuAsync()
+    {
+        Console.Clear();
+
+        // Get status
+        var (statusSuccess, status, _) = await _ipcClient!.GetStatusAsync();
+        var (printersSuccess, printers, _) = await _ipcClient!.ListPrintersAsync();
+
+        var serviceRunning = statusSuccess && status?.Running == true;
+
+        // Display simple text dashboard
+        Console.WriteLine("========================================");
+        Console.WriteLine($"  ACProxyCam v{Program.Version}");
+        Console.WriteLine("========================================");
+        Console.WriteLine();
+        Console.WriteLine($"Service: {(serviceRunning ? "Running" : "Stopped")}");
+        Console.WriteLine($"Printers: {printers?.Count ?? 0}");
+        Console.WriteLine();
+
+        // List printers
+        if (printers != null && printers.Count > 0)
+        {
+            Console.WriteLine("Printers:");
+            foreach (var printer in printers)
+            {
+                var state = printer.State.ToString();
+                var led = printer.CameraLed?.IsOn == true ? "On" : "Off";
+                Console.WriteLine($"  - {printer.Name}: {state} (LED: {led})");
+            }
+            Console.WriteLine();
+        }
+
+        // Menu options
+        Console.WriteLine("Menu:");
+        Console.WriteLine("  s - Stop/Start service");
+        Console.WriteLine("  r - Restart service");
+        Console.WriteLine("  a - Add printer");
+        Console.WriteLine("  d - Delete printer");
+        Console.WriteLine("  m - Modify printer");
+        Console.WriteLine("  t - Toggle LED");
+        Console.WriteLine("  b - BedMesh menu");
+        Console.WriteLine("  o - Obico menu");
+        Console.WriteLine("  q - Quit");
+        Console.WriteLine();
+        Console.Write("Select option: ");
+
+        // Read single character
+        var keyInfo = Console.ReadKey(false);
+        Console.WriteLine();
+
+        return keyInfo.Key switch
+        {
+            ConsoleKey.Q => MenuAction.Quit,
+            ConsoleKey.S => MenuAction.ToggleService,
+            ConsoleKey.R => MenuAction.RestartService,
+            ConsoleKey.U => MenuAction.Uninstall,
+            ConsoleKey.L => MenuAction.ChangeInterfaces,
+            ConsoleKey.A => MenuAction.AddPrinter,
+            ConsoleKey.D => MenuAction.DeletePrinter,
+            ConsoleKey.M => MenuAction.ModifyPrinter,
+            ConsoleKey.Spacebar => MenuAction.TogglePause,
+            ConsoleKey.Enter => MenuAction.ShowDetails,
+            ConsoleKey.T => MenuAction.ToggleLed,
+            ConsoleKey.B => MenuAction.BedMesh,
+            ConsoleKey.O => MenuAction.Obico,
+            _ => MenuAction.None
+        };
     }
 
     private async Task<Rows> BuildDashboardAsync()
@@ -1008,7 +1099,7 @@ WantedBy=multi-user.target
 
         // === PRINTER CONTROLS ===
         renderables.Add(new Markup(
-            "[grey]Printers:[/] [white][[A]][/][grey]dd[/]  [white][[D]][/][grey]elete[/]  [white][[M]][/][grey]odify[/]  [white][[Space]][/][grey]Pause[/]  [white][[T]][/][grey]LED[/]  [white][[B]][/][grey]edMesh[/]  [white][[Enter]][/][grey]Details[/]"
+            "[grey]Printers:[/] [white][[A]][/][grey]dd[/]  [white][[D]][/][grey]elete[/]  [white][[M]][/][grey]odify[/]  [white][[Space]][/][grey]Pause[/]  [white][[T]][/][grey]LED[/]  [white][[B]][/][grey]edMesh[/]  [white][[O]][/][grey]bico[/]  [white][[Enter]][/][grey]Details[/]"
         ));
 
         return new Rows(renderables);
@@ -1737,6 +1828,608 @@ WantedBy=multi-user.target
         else
         {
             AnsiConsole.MarkupLine("[grey]Press any key to return...[/]");
+        }
+    }
+
+    private async Task ShowObicoMenuAsync()
+    {
+        var (success, printers, _) = await _ipcClient!.ListPrintersAsync();
+
+        if (!success || printers == null || printers.Count == 0)
+        {
+            _ui.WriteWarning("No printers configured.");
+            await Task.Delay(1500);
+            return;
+        }
+
+        // Load config to check Obico settings
+        var config = await ConfigManager.LoadAsync();
+
+        int lastSelectedIndex = 0;
+        var menuChoices = new[] { "Link printer to Obico", "Unlink printer", "View Obico status", "Configure settings", "Detect firmware" };
+
+        while (true)
+        {
+            _ui.Clear();
+            _ui.WriteRule("Obico Integration");
+            _ui.WriteLine();
+
+            var (choice, selectedIndex) = _ui.SelectOneWithEscapeAndIndex("Select action:", menuChoices, lastSelectedIndex);
+
+            if (choice == null)
+                return;
+
+            lastSelectedIndex = selectedIndex;
+
+            switch (choice)
+            {
+                case "Link printer to Obico":
+                    await LinkPrinterToObicoAsync(config, printers);
+                    config = await ConfigManager.LoadAsync(); // Reload after changes
+                    break;
+
+                case "Unlink printer":
+                    await UnlinkPrinterFromObicoAsync(config, printers);
+                    config = await ConfigManager.LoadAsync();
+                    break;
+
+                case "View Obico status":
+                    await ShowObicoStatusAsync(config, printers);
+                    break;
+
+                case "Configure settings":
+                    await ConfigureObicoSettingsAsync(config, printers);
+                    config = await ConfigManager.LoadAsync();
+                    break;
+
+                case "Detect firmware":
+                    await DetectFirmwareAsync(config, printers);
+                    config = await ConfigManager.LoadAsync();
+                    break;
+            }
+        }
+    }
+
+    private async Task LinkPrinterToObicoAsync(AppConfig config, List<PrinterStatus> printers)
+    {
+        _ui.Clear();
+        _ui.WriteRule("Link Printer to Obico");
+        _ui.WriteLine();
+
+        // Select printer
+        var printerNames = config.Printers.Select(p => p.Name).ToArray();
+        if (printerNames.Length == 0)
+        {
+            _ui.WriteWarning("No printers configured.");
+            _ui.WaitForKey();
+            return;
+        }
+
+        var selectedName = _ui.SelectOne("Select printer to link:", printerNames);
+        if (selectedName == null)
+            return;
+
+        var printerConfig = config.Printers.First(p => p.Name == selectedName);
+
+        // Check if already linked
+        if (printerConfig.Obico.IsLinked)
+        {
+            _ui.WriteWarning($"Printer '{selectedName}' is already linked to Obico.");
+            if (!_ui.Confirm("Unlink and re-link?", false))
+                return;
+
+            printerConfig.Obico.AuthToken = "";
+        }
+
+        // Check if Rinkhals firmware is detected
+        if (printerConfig.Firmware.Type != Models.FirmwareType.Rinkhals)
+        {
+            _ui.WriteWarning("Obico integration requires Rinkhals firmware with Moonraker.");
+
+            if (_ui.Confirm("Detect firmware now?", true))
+            {
+                await DetectFirmwareForPrinterAsync(printerConfig);
+                await ConfigManager.SaveAsync(config);
+
+                if (printerConfig.Firmware.Type != Models.FirmwareType.Rinkhals)
+                {
+                    _ui.WriteError("Rinkhals not detected. Please install Rinkhals firmware first.");
+                    _ui.WaitForKey();
+                    return;
+                }
+            }
+            else
+            {
+                return;
+            }
+        }
+
+        // Select Obico server
+        _ui.WriteLine();
+        var serverChoice = _ui.SelectOne("Select Obico server:", new[]
+        {
+            "Obico Cloud (app.obico.io) - Recommended",
+            "Self-hosted server"
+        });
+
+        string serverUrl;
+        if (serverChoice?.Contains("Self-hosted") == true)
+        {
+            serverUrl = _ui.Ask("Enter server URL (e.g., http://192.168.1.100:3334):");
+            if (string.IsNullOrWhiteSpace(serverUrl))
+                return;
+
+            // Normalize URL
+            if (!serverUrl.StartsWith("http://") && !serverUrl.StartsWith("https://"))
+                serverUrl = "http://" + serverUrl;
+
+            // Test connection
+            _ui.WriteInfo("Testing connection...");
+            using var testClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+            try
+            {
+                var response = await testClient.GetAsync(serverUrl.TrimEnd('/') + "/api/v1/");
+                _ui.WriteSuccess("Connection OK");
+            }
+            catch (Exception ex)
+            {
+                _ui.WriteError($"Cannot connect to server: {ex.Message}");
+                _ui.WaitForKey();
+                return;
+            }
+        }
+        else
+        {
+            serverUrl = "https://app.obico.io";
+        }
+
+        printerConfig.Obico.ServerUrl = serverUrl;
+        printerConfig.Obico.Enabled = true;
+
+        // Generate device ID if not set
+        if (string.IsNullOrEmpty(printerConfig.Obico.ObicoDeviceId))
+        {
+            printerConfig.Obico.ObicoDeviceId = Guid.NewGuid().ToString();
+        }
+
+        // Try auto-discovery first
+        _ui.WriteLine();
+        _ui.WriteInfo("Starting auto-discovery...");
+        _ui.WriteInfo("Open Obico web interface and click 'Link Printer'");
+        _ui.WriteInfo("Obico should automatically find this printer.");
+        _ui.WriteLine();
+
+        var linkingService = new ObicoLinkingService();
+        string? authToken = null;
+        bool linkingCompleted = false;
+
+        // Subscribe to linking completed event
+        linkingService.LinkingCompleted += (s, e) =>
+        {
+            if (e.DeviceId == printerConfig.Obico.ObicoDeviceId)
+            {
+                authToken = e.AuthToken;
+                linkingCompleted = true;
+            }
+        };
+
+        linkingService.StatusChanged += (s, msg) => _ui.WriteInfo($"  {msg}");
+
+        try
+        {
+            linkingService.Start();
+
+            // Start discovery announcement
+            var cts = new CancellationTokenSource();
+            var discoveryTask = linkingService.StartDiscoveryAsync(printerConfig, serverUrl, cts.Token);
+
+            _ui.WriteLine();
+            _ui.WriteInfo("Waiting for Obico to discover the printer...");
+            _ui.WriteInfo("(Press Enter to switch to manual 6-digit code entry)");
+            _ui.WriteLine();
+
+            // Wait for discovery or user input
+            var waitTask = Task.Run(async () =>
+            {
+                var timeout = DateTime.UtcNow.AddMinutes(5);
+                while (!linkingCompleted && DateTime.UtcNow < timeout && !cts.Token.IsCancellationRequested)
+                {
+                    await Task.Delay(500, cts.Token);
+                }
+            });
+
+            // Check for user input to switch to manual mode
+            while (!linkingCompleted && !waitTask.IsCompleted)
+            {
+                if (Console.KeyAvailable)
+                {
+                    var key = Console.ReadKey(true);
+                    if (key.Key == ConsoleKey.Enter)
+                    {
+                        _ui.WriteWarning("Switching to manual linking...");
+                        cts.Cancel();
+                        break;
+                    }
+                }
+                await Task.Delay(100);
+            }
+
+            // If auto-discovery succeeded
+            if (linkingCompleted && !string.IsNullOrEmpty(authToken))
+            {
+                printerConfig.Obico.AuthToken = authToken;
+                await ConfigManager.SaveAsync(config);
+
+                _ui.WriteSuccess($"Printer '{selectedName}' linked to Obico via auto-discovery!");
+
+                // Reload config in daemon so it picks up the new Obico settings
+                await ReloadDaemonConfigAsync();
+
+                _ui.WaitForKey();
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            _ui.WriteWarning($"Auto-discovery failed: {ex.Message}");
+        }
+        finally
+        {
+            linkingService.Stop();
+            linkingService.Dispose();
+        }
+
+        // Fall back to manual linking with our passcode
+        // Generate fresh device ID to get a new passcode
+        _ui.WriteLine();
+        _ui.WriteInfo("Manual linking - generating new one-time passcode...");
+        _ui.WriteLine();
+
+        // Generate fresh credentials for manual linking
+        printerConfig.Obico.ObicoDeviceId = Guid.NewGuid().ToString("N");
+
+        // Restart discovery service for manual linking
+        using var manualLinkingService = new Services.Obico.ObicoLinkingService();
+        var manualCts = new CancellationTokenSource();
+        var manualLinkCompleted = false;
+        string? manualAuthToken = null;
+        string? currentPasscode = null;
+
+        manualLinkingService.StatusChanged += (s, msg) =>
+        {
+            // Extract and display passcode
+            if (msg.Contains("One-time passcode:"))
+            {
+                var parts = msg.Split("One-time passcode:");
+                if (parts.Length > 1)
+                {
+                    currentPasscode = parts[1].Trim();
+                    _ui.WriteLine();
+                    _ui.WriteMarkup($"[yellow]  >>> Enter this code in Obico app: [/][cyan]{currentPasscode}[/][yellow] <<<[/]");
+                    _ui.WriteLine();
+                    _ui.WriteLine();
+                    _ui.WriteLine("1. In the Obico app, click 'Link Printer'");
+                    _ui.WriteLine("2. Click 'Switch to Manual Linking'");
+                    _ui.WriteMarkup($"3. Enter the code: [cyan]{currentPasscode}[/]");
+                    _ui.WriteLine();
+                }
+            }
+            else if (!msg.Contains("passcode"))
+            {
+                _ui.WriteLine($" {msg}");
+            }
+        };
+
+        manualLinkingService.LinkingCompleted += (s, e) =>
+        {
+            manualLinkCompleted = true;
+            manualAuthToken = e.AuthToken;
+        };
+
+        try
+        {
+            manualLinkingService.Start();
+            var manualDiscoveryTask = manualLinkingService.StartDiscoveryAsync(printerConfig, serverUrl, manualCts.Token);
+
+            _ui.WriteInfo("Waiting for you to enter the passcode in Obico app...");
+            _ui.WriteInfo("(Press Escape to cancel)");
+            _ui.WriteLine();
+
+            // Wait for linking or user cancel
+            var manualTimeout = DateTime.UtcNow.AddMinutes(10);
+            while (!manualLinkCompleted && DateTime.UtcNow < manualTimeout && !manualCts.Token.IsCancellationRequested)
+            {
+                if (Console.KeyAvailable)
+                {
+                    var key = Console.ReadKey(true);
+                    if (key.Key == ConsoleKey.Escape)
+                    {
+                        _ui.WriteWarning("Cancelled.");
+                        manualCts.Cancel();
+                        break;
+                    }
+                }
+                await Task.Delay(100);
+            }
+
+            if (manualLinkCompleted && !string.IsNullOrEmpty(manualAuthToken))
+            {
+                printerConfig.Obico.AuthToken = manualAuthToken;
+                await ConfigManager.SaveAsync(config);
+
+                _ui.WriteSuccess($"Printer '{selectedName}' linked to Obico!");
+
+                // Reload config in daemon so it picks up the new Obico settings
+                await ReloadDaemonConfigAsync();
+
+                _ui.WaitForKey();
+                return;
+            }
+
+            if (!manualCts.Token.IsCancellationRequested)
+            {
+                _ui.WriteError("Linking timeout. Please try again.");
+            }
+            _ui.WaitForKey();
+            return;
+        }
+        catch (Exception ex)
+        {
+            _ui.WriteError($"Manual linking failed: {ex.Message}");
+            _ui.WaitForKey();
+            return;
+        }
+        finally
+        {
+            manualCts.Cancel();
+            manualLinkingService.Stop();
+        }
+
+        // This code path is no longer used - keeping for reference
+        // The old flow asked for code FROM app, but correct flow is to give code TO app
+        #pragma warning disable CS0162
+        string? code = null;
+        if (false) // Dead code - old flow
+        {
+            code = _ui.Ask("Enter 6-digit code from Obico app:");
+        }
+        #pragma warning restore CS0162
+        if (string.IsNullOrWhiteSpace(code))
+            return;
+
+        // Verify code (legacy path - not used)
+        _ui.WriteInfo("Verifying code...");
+
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+            var response = await client.GetAsync(
+                $"{serverUrl.TrimEnd('/')}/api/v1/octo/verify/?code={code.Trim()}");
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _ui.WriteError("Invalid or expired code. Please try again.");
+                _ui.WaitForKey();
+                return;
+            }
+
+            var json = await response.Content.ReadAsStringAsync();
+            var verifyResponse = System.Text.Json.JsonSerializer.Deserialize<Services.Obico.VerifyResponse>(json);
+
+            if (verifyResponse?.Printer?.AuthToken == null)
+            {
+                _ui.WriteError("Server did not return auth token.");
+                _ui.WaitForKey();
+                return;
+            }
+
+            // Save configuration (legacy path)
+            printerConfig.Obico.AuthToken = verifyResponse.Printer.AuthToken;
+            printerConfig.Obico.IsPro = verifyResponse.Printer.IsPro;
+            printerConfig.Obico.ObicoName = verifyResponse.Printer.Name;
+            printerConfig.Obico.TargetFps = verifyResponse.Printer.IsPro ? 25 : 5;
+
+            await ConfigManager.SaveAsync(config);
+
+            _ui.WriteSuccess($"Printer '{selectedName}' linked to Obico successfully!");
+            _ui.WriteInfo($"Obico name: {verifyResponse.Printer.Name}");
+            _ui.WriteInfo($"Account type: {(verifyResponse.Printer.IsPro ? "Pro" : "Free")}");
+            _ui.WriteLine();
+            _ui.WriteWarning("Restart the service for changes to take effect.");
+        }
+        catch (Exception ex)
+        {
+            _ui.WriteError($"Error linking printer: {ex.Message}");
+        }
+
+        _ui.WaitForKey();
+    }
+
+    private async Task UnlinkPrinterFromObicoAsync(AppConfig config, List<PrinterStatus> printers)
+    {
+        _ui.Clear();
+        _ui.WriteRule("Unlink Printer from Obico");
+        _ui.WriteLine();
+
+        // Find linked printers
+        var linkedPrinters = config.Printers.Where(p => p.Obico.IsLinked).ToList();
+
+        if (linkedPrinters.Count == 0)
+        {
+            _ui.WriteWarning("No printers are linked to Obico.");
+            _ui.WaitForKey();
+            return;
+        }
+
+        var printerNames = linkedPrinters.Select(p => p.Name).ToArray();
+        var selectedName = _ui.SelectOne("Select printer to unlink:", printerNames);
+        if (selectedName == null)
+            return;
+
+        if (!_ui.Confirm($"Unlink '{selectedName}' from Obico?", false))
+            return;
+
+        var printerConfig = config.Printers.First(p => p.Name == selectedName);
+        printerConfig.Obico.AuthToken = "";
+        printerConfig.Obico.DeviceSecret = "";
+        printerConfig.Obico.IsPro = false;
+        printerConfig.Obico.ObicoName = "";
+
+        await ConfigManager.SaveAsync(config);
+
+        _ui.WriteSuccess($"Printer '{selectedName}' unlinked from Obico.");
+        _ui.WriteWarning("Restart the service for changes to take effect.");
+        _ui.WaitForKey();
+    }
+
+    private async Task ShowObicoStatusAsync(AppConfig config, List<PrinterStatus> printers)
+    {
+        _ui.Clear();
+        _ui.WriteRule("Obico Status");
+        _ui.WriteLine();
+
+        foreach (var printer in config.Printers)
+        {
+            var isLinked = printer.Obico.IsLinked;
+            var statusColor = isLinked ? "green" : "grey";
+            var statusText = isLinked ? "Linked" : "Not linked";
+
+            _ui.WriteMarkup($"[white]{printer.Name}[/]");
+            _ui.WriteLine();
+            _ui.WriteMarkup($"  Status: [{statusColor}]{statusText}[/]");
+            _ui.WriteLine();
+
+            if (isLinked)
+            {
+                _ui.WriteLine($"  Server: {printer.Obico.ServerUrl}");
+                _ui.WriteLine($"  Obico name: {printer.Obico.ObicoName}");
+                _ui.WriteLine($"  Account: {(printer.Obico.IsPro ? "Pro" : "Free")}");
+                _ui.WriteLine($"  Snapshots: {(printer.Obico.SnapshotsEnabled ? "Enabled" : "Disabled")} ({printer.Obico.TargetFps} FPS)");
+            }
+
+            _ui.WriteLine($"  Firmware: {printer.Firmware.Type} {printer.Firmware.Version}");
+            _ui.WriteLine($"  Moonraker: {(printer.Firmware.MoonrakerAvailable ? "Available" : "Not available")}");
+            _ui.WriteLine();
+        }
+
+        _ui.WaitForKey();
+        await Task.CompletedTask;
+    }
+
+    private async Task ConfigureObicoSettingsAsync(AppConfig config, List<PrinterStatus> printers)
+    {
+        _ui.Clear();
+        _ui.WriteRule("Configure Obico Settings");
+        _ui.WriteLine();
+
+        // Select printer
+        var printerNames = config.Printers.Select(p => p.Name).ToArray();
+        var selectedName = _ui.SelectOne("Select printer to configure:", printerNames);
+        if (selectedName == null)
+            return;
+
+        var printerConfig = config.Printers.First(p => p.Name == selectedName);
+
+        while (true)
+        {
+            _ui.Clear();
+            _ui.WriteRule($"Obico Settings - {selectedName}");
+            _ui.WriteLine();
+
+            var choices = new[]
+            {
+                $"Enable/Disable Obico: {(printerConfig.Obico.Enabled ? "Enabled" : "Disabled")}",
+                $"Enable/Disable Snapshots: {(printerConfig.Obico.SnapshotsEnabled ? "Enabled" : "Disabled")}",
+                $"Target FPS: {printerConfig.Obico.TargetFps}",
+                "Detect firmware",
+                "Back"
+            };
+
+            var choice = _ui.SelectOne("Select setting:", choices);
+            if (choice == null || choice == "Back")
+                break;
+
+            if (choice.StartsWith("Enable/Disable Obico"))
+            {
+                printerConfig.Obico.Enabled = !printerConfig.Obico.Enabled;
+            }
+            else if (choice.StartsWith("Enable/Disable Snapshots"))
+            {
+                printerConfig.Obico.SnapshotsEnabled = !printerConfig.Obico.SnapshotsEnabled;
+            }
+            else if (choice.StartsWith("Target FPS"))
+            {
+                var fpsStr = _ui.Ask($"Enter target FPS (1-25, current: {printerConfig.Obico.TargetFps}):");
+                if (int.TryParse(fpsStr, out var fps) && fps >= 1 && fps <= 25)
+                {
+                    printerConfig.Obico.TargetFps = fps;
+                }
+            }
+            else if (choice == "Detect firmware")
+            {
+                await DetectFirmwareForPrinterAsync(printerConfig);
+            }
+
+            await ConfigManager.SaveAsync(config);
+        }
+    }
+
+    private async Task DetectFirmwareAsync(AppConfig config, List<PrinterStatus> printers)
+    {
+        _ui.Clear();
+        _ui.WriteRule("Detect Firmware");
+        _ui.WriteLine();
+
+        // Select printer
+        var printerNames = config.Printers.Select(p => p.Name).ToArray();
+        if (printerNames.Length == 0)
+        {
+            _ui.WriteWarning("No printers configured.");
+            _ui.WaitForKey();
+            return;
+        }
+
+        var selectedName = _ui.SelectOne("Select printer:", printerNames);
+        if (selectedName == null)
+            return;
+
+        var printerConfig = config.Printers.First(p => p.Name == selectedName);
+
+        await DetectFirmwareForPrinterAsync(printerConfig);
+
+        // Save updated config
+        await ConfigManager.SaveAsync(config);
+        _ui.WriteSuccess("Firmware info saved to config.");
+        _ui.WaitForKey();
+    }
+
+    private async Task DetectFirmwareForPrinterAsync(PrinterConfig printerConfig)
+    {
+        _ui.WriteInfo($"Detecting firmware on {printerConfig.Ip}...");
+
+        var sshService = new Services.SshCredentialService();
+        sshService.StatusChanged += (s, msg) => _ui.WriteInfo($"  {msg}");
+
+        var firmware = await sshService.DetectFirmwareAsync(
+            printerConfig.Ip,
+            printerConfig.SshPort,
+            printerConfig.SshUser,
+            string.IsNullOrEmpty(printerConfig.SshPassword) ? "rockchip" : printerConfig.SshPassword);
+
+        printerConfig.Firmware = firmware;
+
+        if (firmware.Type == Models.FirmwareType.Rinkhals)
+        {
+            _ui.WriteSuccess($"Detected Rinkhals {firmware.Version}");
+            _ui.WriteInfo($"Moonraker: {(firmware.MoonrakerAvailable ? "Available" : "Not running")}");
+        }
+        else if (firmware.Type == Models.FirmwareType.StockAnycubic)
+        {
+            _ui.WriteWarning("Detected stock Anycubic firmware (no Moonraker)");
+        }
+        else
+        {
+            _ui.WriteWarning("Unknown firmware type");
         }
     }
 
@@ -2982,6 +3675,35 @@ WantedBy=multi-user.target
         catch
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Reload daemon configuration via IPC so changes take effect immediately.
+    /// </summary>
+    private async Task ReloadDaemonConfigAsync()
+    {
+        if (!IpcClient.IsDaemonRunning())
+        {
+            _ui.WriteLine();
+            _ui.WriteInfo("Daemon not running - changes will take effect on next start.");
+            return;
+        }
+
+        _ui.WriteLine();
+        _ui.WriteInfo("Reloading daemon configuration...");
+
+        using var ipc = new IpcClient();
+        var (success, error) = await ipc.ReloadConfigAsync();
+
+        if (success)
+        {
+            _ui.WriteSuccess("Configuration reloaded - Obico integration is now active.");
+        }
+        else
+        {
+            _ui.WriteWarning($"Could not reload config: {error}");
+            _ui.WriteWarning("Restart the service manually for changes to take effect.");
         }
     }
 

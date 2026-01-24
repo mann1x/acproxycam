@@ -5,6 +5,7 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using ACProxyCam.Models;
 using ACProxyCam.Services;
+using ACProxyCam.Services.Obico;
 
 namespace ACProxyCam.Daemon;
 
@@ -38,11 +39,13 @@ public class PrinterThread : IDisposable
     private MqttCameraController? _mqttController;
     private FfmpegDecoder? _decoder;
     private MjpegServer? _mjpegServer;
+    private ObicoClient? _obicoClient;
 
     // Status details
     private readonly SshStatus _sshStatus = new();
     private readonly MqttStatus _mqttStatus = new();
     private readonly StreamStatus _streamStatus = new();
+    private readonly Models.ObicoStatus _obicoStatus = new();
 
     // LED auto-control state
     private string? _printerMqttState;
@@ -193,11 +196,11 @@ public class PrinterThread : IDisposable
                 MjpegPort = Config.MjpegPort,
                 DeviceType = Config.DeviceType,
                 State = _state,
-                ConnectedClients = _mjpegServer?.ConnectedClients ?? 0,
+                ConnectedClients = (_mjpegServer?.ConnectedClients ?? 0) + (_mjpegServer?.HasExternalStreamingClient == true ? 1 : 0),
                 IsPaused = _isPaused,
                 CpuAffinity = _cpuAffinity,
-                CurrentFps = (_mjpegServer?.ConnectedClients ?? 0) > 0 ? Config.MaxFps : Config.IdleFps,
-                IsIdle = (_mjpegServer?.ConnectedClients ?? 0) == 0,
+                CurrentFps = ((_mjpegServer?.ConnectedClients ?? 0) > 0 || _mjpegServer?.HasExternalStreamingClient == true) ? Config.MaxFps : Config.IdleFps,
+                IsIdle = (_mjpegServer?.ConnectedClients ?? 0) == 0 && _mjpegServer?.HasExternalStreamingClient != true,
                 IsOnline = _state == PrinterState.Running,
                 LastError = _lastError,
                 LastErrorAt = _lastErrorAt,
@@ -207,7 +210,8 @@ public class PrinterThread : IDisposable
                 MqttStatus = _mqttStatus,
                 StreamStatus = _streamStatus,
                 PrinterMqttState = _printerMqttState,
-                CameraLed = _cachedLedStatus
+                CameraLed = _cachedLedStatus,
+                ObicoStatus = _obicoStatus
             };
         }
     }
@@ -380,14 +384,38 @@ public class PrinterThread : IDisposable
                     await RefreshPrinterInfoAsync(ct);
                 }
 
-                // Step 2: MQTT - Connect and detect model code if needed
-                await ConnectMqttAndStartCameraAsync(ct);
+                // Step 2: MQTT - Connect and detect model code if needed (for camera)
+                if (Config.CameraEnabled)
+                {
+                    await ConnectMqttAndStartCameraAsync(ct);
+                }
 
-                // Step 3: Start MJPEG server
-                StartMjpegServer();
+                // Step 3: Start MJPEG server (if camera enabled)
+                if (Config.CameraEnabled)
+                {
+                    StartMjpegServer();
+                }
 
-                // Step 4: Start FFmpeg decoder and streaming loop
-                await RunStreamingLoopAsync(ct);
+                // Step 4: Start FFmpeg decoder and streaming loop (if camera enabled)
+                // Obico client will be started after the stream is running (see DecodingStarted event)
+                if (Config.CameraEnabled)
+                {
+                    await RunStreamingLoopAsync(ct);
+                }
+                else
+                {
+                    // Camera disabled - start Obico client directly (Obico-only mode)
+                    _state = PrinterState.Running;
+                    _lastSeenOnline = DateTime.UtcNow;
+                    LogStatus("Running in Obico-only mode (camera disabled)");
+
+                    await StartObicoClientAsync(ct);
+
+                    while (!ct.IsCancellationRequested && !_isPaused)
+                    {
+                        await Task.Delay(1000, ct);
+                    }
+                }
             }
             catch (OperationCanceledException)
             {
@@ -590,6 +618,7 @@ public class PrinterThread : IDisposable
         // Subscribe to printer state updates from MQTT messages
         _mqttController.PrinterStateReceived += OnPrinterStateReceived;
 
+
         try
         {
             await _mqttController.ConnectAsync(
@@ -728,6 +757,141 @@ public class PrinterThread : IDisposable
         LogStatus($"MJPEG server listening on {addressList} (maxFps={Config.MaxFps}, idleFps={Config.IdleFps}, quality={Config.JpegQuality})");
     }
 
+    /// <summary>
+    /// Start the Obico client if enabled and firmware supports it.
+    /// </summary>
+    private async Task StartObicoClientAsync(CancellationToken ct)
+    {
+        // Update basic status
+        _obicoStatus.Enabled = Config.Obico.Enabled;
+        _obicoStatus.IsLinked = Config.Obico.IsLinked;
+        _obicoStatus.IsPro = Config.Obico.IsPro;
+        _obicoStatus.TargetFps = Config.Obico.TargetFps;
+
+        if (!Config.Obico.Enabled)
+        {
+            _obicoStatus.State = "Disabled";
+            LogStatus("Obico: Not enabled (use CLI to configure)");
+            return;
+        }
+
+        if (!Config.Firmware.MoonrakerAvailable)
+        {
+            _obicoStatus.State = "No Moonraker";
+            LogStatus("Obico: Skipping - Moonraker not available (requires Rinkhals firmware)");
+            return;
+        }
+
+        if (!Config.Obico.IsLinked)
+        {
+            _obicoStatus.State = "Not Linked";
+            LogStatus("Obico: Skipping - printer not linked to Obico server");
+            return;
+        }
+
+        try
+        {
+            LogStatus("Starting Obico client...");
+            _obicoStatus.State = "Starting";
+
+            _obicoClient = new ObicoClient(Config);
+            _obicoClient.StatusChanged += (s, msg) => LogStatus($"Obico: {msg}");
+            _obicoClient.StateChanged += OnObicoStateChanged;
+            _obicoClient.ConfigUpdated += OnObicoConfigUpdated;
+
+            // Wire up Janus streaming state to MJPEG server for full-rate encoding
+            if (_mjpegServer != null)
+            {
+                _obicoClient.JanusStreamingChanged += (s, streaming) =>
+                {
+                    _mjpegServer.HasExternalStreamingClient = streaming;
+                    LogStatus($"Janus streaming {(streaming ? "started" : "stopped")} - MJPEG encoding at {(streaming ? "full" : "idle")} rate");
+                };
+            }
+
+            // Wire up native firmware sync for print cancellation from Obico
+            _obicoClient.NativePrintStopRequested += async (s, e) =>
+            {
+                if (_mqttController != null && !string.IsNullOrEmpty(Config.DeviceId))
+                {
+                    LogStatus("Syncing native Anycubic firmware: sending print stop via MQTT");
+                    await _mqttController.SendPrintStopAsync(Config.DeviceId, Config.ModelCode);
+                }
+            };
+
+            // Set snapshot callback if camera is enabled
+            if (Config.CameraEnabled && _mjpegServer != null)
+            {
+                _obicoClient.SetSnapshotCallback(() => _mjpegServer.GetLastJpegFrame());
+            }
+
+            await _obicoClient.StartAsync(ct);
+
+            _obicoStatus.State = _obicoClient.State.ToString();
+            _obicoStatus.ServerConnected = _obicoClient.State == ObicoClientState.Running;
+            LogStatus($"Obico client started (state: {_obicoClient.State})");
+        }
+        catch (Exception ex)
+        {
+            _obicoStatus.State = "Failed";
+            _obicoStatus.LastError = ex.Message;
+            LogStatus($"Obico client failed to start: {ex.Message}");
+            // Don't throw - Obico failure shouldn't stop the camera
+        }
+    }
+
+    private void OnObicoStateChanged(object? sender, ObicoClientState state)
+    {
+        _obicoStatus.State = state.ToString();
+        _obicoStatus.ServerConnected = state == ObicoClientState.Running;
+
+        // When ObicoClient fails (Moonraker not available), try to enable LAN mode
+        // This handles the case where printer reboots and Moonraker doesn't start until LAN mode is enabled
+        if (state == ObicoClientState.Failed && Config.AutoLanMode)
+        {
+            LogStatus("Obico client failed - attempting to enable LAN mode...");
+            _ = TryEnableLanModeAndRestartObicoAsync();
+        }
+    }
+
+    /// <summary>
+    /// Try to enable LAN mode and restart Obico client.
+    /// Called when Obico client fails due to Moonraker not being available.
+    /// </summary>
+    private async Task TryEnableLanModeAndRestartObicoAsync()
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+            await TryEnableLanModeAsync(cts.Token);
+
+            // Wait a bit for Moonraker to start after LAN mode is enabled
+            LogStatus("LAN mode enabled, waiting for Moonraker to start...");
+            await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
+
+            // Restart Obico client
+            if (_obicoClient != null)
+            {
+                LogStatus("Restarting Obico client...");
+                await _obicoClient.StopAsync();
+                await _obicoClient.StartAsync(cts.Token);
+                LogStatus($"Obico client restarted (state: {_obicoClient.State})");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogStatus($"Failed to enable LAN mode and restart Obico: {ex.Message}");
+        }
+    }
+
+    private void OnObicoConfigUpdated(object? sender, EventArgs e)
+    {
+        // Forward to ConfigChanged to persist changes (e.g., tier update)
+        _obicoStatus.IsPro = Config.Obico.IsPro;
+        _obicoStatus.TargetFps = Config.Obico.TargetFps;
+        ConfigChanged?.Invoke(this, EventArgs.Empty);
+    }
+
     private async Task RunStreamingLoopAsync(CancellationToken ct)
     {
         _streamStatus.Connected = false;
@@ -752,7 +916,7 @@ public class PrinterThread : IDisposable
             _streamStatus.Height = args.Height;
             _mjpegServer?.PushFrame(args.Data, args.Width, args.Height, args.Stride);
         };
-        _decoder.DecodingStarted += (s, e) =>
+        _decoder.DecodingStarted += async (s, e) =>
         {
             _streamStatus.Connected = true;
             _streamStatus.Width = _decoder.Width;
@@ -762,6 +926,24 @@ public class PrinterThread : IDisposable
             _streamStartedAt = DateTime.UtcNow; // Track when stream started for stabilization
             _streamStalled = false;
             LogStatus($"Stream running: {_decoder.Width}x{_decoder.Height}");
+
+            // Start Obico client now that the printer/stream is ready
+            // This ensures LAN mode is properly enabled before Obico tries to connect to Moonraker
+            if (_obicoClient == null && Config.Obico.Enabled)
+            {
+                try
+                {
+                    await StartObicoClientAsync(ct);
+                }
+                catch (Exception ex)
+                {
+                    LogStatus($"Failed to start Obico client: {ex.Message}");
+                }
+            }
+
+            // Pass decoder to Obico client for H.264 RTP streaming (shares source stream)
+            // Must be called after ObicoClient is started so Janus is ready
+            _obicoClient?.SetDecoder(_decoder);
         };
         _decoder.DecodingStopped += (s, e) =>
         {
@@ -1261,6 +1443,22 @@ public class PrinterThread : IDisposable
 
     private async Task CleanupServicesAsync()
     {
+        // Stop Obico client first (it may depend on other services)
+        if (_obicoClient != null)
+        {
+            try
+            {
+                _obicoClient.StateChanged -= OnObicoStateChanged;
+                _obicoClient.ConfigUpdated -= OnObicoConfigUpdated;
+                await _obicoClient.StopAsync();
+            }
+            catch { }
+            _obicoClient.Dispose();
+            _obicoClient = null;
+            _obicoStatus.State = "Stopped";
+            _obicoStatus.ServerConnected = false;
+        }
+
         // Stop decoder
         if (_decoder != null)
         {

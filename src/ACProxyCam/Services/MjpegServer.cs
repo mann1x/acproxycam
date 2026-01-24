@@ -63,6 +63,12 @@ public class MjpegServer : IDisposable
     public int IdleFps { get; set; } = 1;
 
     /// <summary>
+    /// Whether an external streaming client (e.g., Obico/Janus) needs full-rate frames.
+    /// When true, frames are encoded at MaxFps even if no HTTP clients are connected.
+    /// </summary>
+    public bool HasExternalStreamingClient { get; set; } = false;
+
+    /// <summary>
     /// Callback to get current LED status. Returns null if not available.
     /// </summary>
     public Func<CancellationToken, Task<LedStatus?>>? GetLedStatusAsync { get; set; }
@@ -71,6 +77,18 @@ public class MjpegServer : IDisposable
     /// Callback to set LED state. Returns true on success.
     /// </summary>
     public Func<bool, CancellationToken, Task<bool>>? SetLedAsync { get; set; }
+
+    /// <summary>
+    /// Get the last encoded JPEG frame. Returns null if no frame available.
+    /// Used by Obico client for snapshot uploads.
+    /// </summary>
+    public byte[]? GetLastJpegFrame()
+    {
+        lock (_frameLock)
+        {
+            return _lastJpegFrame;
+        }
+    }
 
     // MJPEG boundary string
     private const string Boundary = "--mjpegboundary";
@@ -173,9 +191,10 @@ public class MjpegServer : IDisposable
         try
         {
             var now = DateTime.UtcNow;
-            var hasClients = ConnectedClients > 0;
+            var hasClients = ConnectedClients > 0 || HasExternalStreamingClient;
 
             // Determine target FPS based on whether clients are connected
+            // (includes HTTP clients and external streaming clients like Obico/Janus)
             var targetFps = hasClients ? MaxFps : IdleFps;
 
             // Skip frame if we're encoding too fast

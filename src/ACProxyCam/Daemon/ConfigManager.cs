@@ -38,6 +38,13 @@ public static class ConfigManager
             printer.SshPassword = DecryptIfNeeded(printer.SshPassword);
             printer.MqttUsername = DecryptIfNeeded(printer.MqttUsername);
             printer.MqttPassword = DecryptIfNeeded(printer.MqttPassword);
+
+            // Decrypt Obico auth token
+            if (printer.Obico != null)
+            {
+                printer.Obico.AuthToken = DecryptIfNeeded(printer.Obico.AuthToken);
+                printer.Obico.DeviceSecret = DecryptIfNeeded(printer.Obico.DeviceSecret);
+            }
         }
 
         return config;
@@ -65,6 +72,11 @@ public static class ConfigManager
             ListenInterfaces = config.ListenInterfaces,
             LogToFile = config.LogToFile,
             LogLevel = config.LogLevel,
+            Obico = new GlobalObicoConfig
+            {
+                DiscoveryPort = config.Obico.DiscoveryPort,
+                DefaultServerUrl = config.Obico.DefaultServerUrl
+            },
             Printers = config.Printers.Select(p => new PrinterConfig
             {
                 Name = p.Name,
@@ -85,7 +97,29 @@ public static class ConfigManager
                 SendStopCommand = p.SendStopCommand,
                 AutoLanMode = p.AutoLanMode,
                 LedAutoControl = p.LedAutoControl,
-                StandbyLedTimeoutMinutes = p.StandbyLedTimeoutMinutes
+                StandbyLedTimeoutMinutes = p.StandbyLedTimeoutMinutes,
+                CameraEnabled = p.CameraEnabled,
+                Obico = new PrinterObicoConfig
+                {
+                    Enabled = p.Obico.Enabled,
+                    ServerUrl = p.Obico.ServerUrl,
+                    AuthToken = EncryptIfNeeded(p.Obico.AuthToken),
+                    ObicoDeviceId = p.Obico.ObicoDeviceId,
+                    DeviceSecret = EncryptIfNeeded(p.Obico.DeviceSecret),
+                    TargetFps = p.Obico.TargetFps,
+                    SnapshotsEnabled = p.Obico.SnapshotsEnabled,
+                    IsPro = p.Obico.IsPro,
+                    ObicoName = p.Obico.ObicoName
+                },
+                Firmware = new FirmwareInfo
+                {
+                    Type = p.Firmware.Type,
+                    Version = p.Firmware.Version,
+                    MoonrakerAvailable = p.Firmware.MoonrakerAvailable,
+                    MoonrakerPort = p.Firmware.MoonrakerPort,
+                    ConfigPath = p.Firmware.ConfigPath,
+                    DetectedAt = p.Firmware.DetectedAt
+                }
             }).ToList()
         };
 
