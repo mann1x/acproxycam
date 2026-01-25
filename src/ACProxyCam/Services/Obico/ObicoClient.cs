@@ -820,10 +820,11 @@ public class ObicoClient : IDisposable
 
             // total_duration = total elapsed time (including pauses, heating)
             // print_duration = actual printing time (used for remaining time calculation)
-            var totalDurationNode = printStats["total_duration"];
-            if (totalDurationNode != null)
+            // Use print_duration for time remaining calculation since the estimate is based on printing time only
+            var printDurationNode = printStats["print_duration"];
+            if (printDurationNode != null)
             {
-                _currentStatus.Status.Progress.PrintTime = (int)totalDurationNode.GetValue<double>();
+                _currentStatus.Status.Progress.PrintTime = (int)printDurationNode.GetValue<double>();
             }
 
             // Update layer info from print_stats.info
@@ -843,9 +844,18 @@ public class ObicoClient : IDisposable
         var vsd = status["virtual_sdcard"];
         if (vsd != null)
         {
-            var progress = vsd["progress"]?.GetValue<double>() ?? 0;
-            _currentStatus.Status.Progress.Completion = progress * 100;
-            _currentStatus.Status.Progress.FilePos = vsd["file_position"]?.GetValue<long>();
+            // Only update completion when progress is actually present in the update
+            // WebSocket updates may not include all fields every time
+            var progressNode = vsd["progress"];
+            if (progressNode != null)
+            {
+                var progress = progressNode.GetValue<double>();
+                _currentStatus.Status.Progress.Completion = progress * 100;
+            }
+
+            var filePosNode = vsd["file_position"];
+            if (filePosNode != null)
+                _currentStatus.Status.Progress.FilePos = filePosNode.GetValue<long>();
 
             // Get total estimated time from WebSocket update or use cached value
             var totalTime = vsd["total_time"]?.GetValue<int>() ?? _estimatedTotalTime;
