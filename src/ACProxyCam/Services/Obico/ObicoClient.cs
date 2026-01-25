@@ -58,10 +58,6 @@ public class ObicoClient : IDisposable
     private volatile bool _printerOffline;
     private DateTime _lastOfflineLogTime = DateTime.MinValue;
 
-    // Flag to track if we detected an ongoing print during initialization
-    // This is used to send PrintStarted event after connecting to Obico
-    private bool _detectedOngoingPrint;
-
     // Verbose logging (set via ACPROXYCAM_VERBOSE=1 environment variable)
     private readonly bool _verbose;
 
@@ -325,15 +321,6 @@ public class ObicoClient : IDisposable
             // Send initial status with settings AFTER Janus is started
             // This ensures stream_id is included in webcam settings
             SendStatusUpdate(includeSettings: true);
-
-            // If we detected an ongoing print during initialization, send PrintStarted event
-            // This ensures Obico starts tracking the print that was already in progress
-            if (_detectedOngoingPrint)
-            {
-                _detectedOngoingPrint = false;
-                SendPrintEvent("PrintStarted");
-                Log($"Sent PrintStarted for ongoing print: {_currentFilename}");
-            }
 
             // Start background tasks
             _statusUpdateTask = Task.Run(() => StatusUpdateLoopAsync(_cts!.Token), _cts!.Token);
@@ -636,7 +623,14 @@ public class ObicoClient : IDisposable
             lock (_statusLock)
             {
                 UpdateStatusFromMoonraker(statusData);
-                _currentStatus.Status.State.Flags.Ready = klippyState == "ready";
+
+                // Only override Ready to false when klippy is not ready
+                // (UpdateStatusFromMoonraker already set Ready based on print_stats.state == "standby")
+                // Don't set Ready=true here - that would override the correct false value when printing!
+                if (klippyState != "ready")
+                {
+                    _currentStatus.Status.State.Flags.Ready = false;
+                }
                 _currentStatus.Status.State.Flags.Error = klippyState == "error";
                 _currentStatus.Status.State.Flags.ClosedOrError = klippyState != "ready";
 
@@ -656,21 +650,54 @@ public class ObicoClient : IDisposable
 
                 if (state == "printing" || state == "paused")
                 {
-                    // Get the actual print start time from Moonraker's job history
-                    // This is critical - Obico server uses this timestamp as a unique identifier
-                    // Using current time would create a new print record on every reconnect
-                    var printStartTs = await FetchPrintStartTimeAsync();
-                    if (printStartTs.HasValue)
+                    // First, try to load saved print timestamp from previous session
+                    // This ensures we use the same timestamp across service restarts
+                    // IMPORTANT: We trust the saved timestamp when filename matches because:
+                    // 1. Obico server uses timestamp as ext_id to identify prints
+                    // 2. Moonraker on Anycubic changes start_time when pause/resume occurs
+                    // 3. If we recalculate, we get a different timestamp that Obico won't recognize
+                    var (savedFilename, savedTimestamp) = await LoadPrintStateAsync();
+                    var printDuration = printStats["print_duration"]?.GetValue<double>() ?? 0;
+                    var useSavedState = false;
+
+                    if (savedTimestamp.HasValue && savedFilename == filename)
                     {
-                        _currentPrintTs = printStartTs.Value;
-                        _printStartTime = DateTimeOffset.FromUnixTimeSeconds(printStartTs.Value).UtcDateTime;
+                        // Same filename - trust the saved timestamp
+                        // Only reject if the print clearly just started (duration < 60s means it's a fresh print)
+                        if (printDuration < 60)
+                        {
+                            // Fresh print with same filename - this is a new print, not continuation
+                            Log($"Saved timestamp rejected (print just started: {printDuration:F0}s), calculating new timestamp");
+                        }
+                        else
+                        {
+                            // Ongoing print - use saved timestamp to maintain Obico tracking
+                            _currentPrintTs = savedTimestamp.Value;
+                            _printStartTime = DateTimeOffset.FromUnixTimeSeconds(savedTimestamp.Value).UtcDateTime;
+                            Log($"Using saved print timestamp: {savedTimestamp.Value} for {filename} (print_duration={printDuration:F0}s)");
+                            useSavedState = true;
+                        }
                     }
-                    else
+
+                    if (!useSavedState)
                     {
-                        // Fallback to current time if job history unavailable (shouldn't happen)
-                        Log("Warning: Could not fetch print start time from job history, using current time");
-                        _currentPrintTs = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                        _printStartTime = DateTime.UtcNow;
+                        // No saved state, different filename, or fresh print - calculate from Moonraker
+                        var printStartTs = await FetchPrintStartTimeAsync();
+                        if (printStartTs.HasValue)
+                        {
+                            _currentPrintTs = printStartTs.Value;
+                            _printStartTime = DateTimeOffset.FromUnixTimeSeconds(printStartTs.Value).UtcDateTime;
+                            // Save for future restarts
+                            await SavePrintStateAsync(filename!, printStartTs.Value);
+                        }
+                        else
+                        {
+                            // Fallback to current time if job history unavailable (shouldn't happen)
+                            Log("Warning: Could not fetch print start time from job history, using current time");
+                            _currentPrintTs = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                            _printStartTime = DateTime.UtcNow;
+                            await SavePrintStateAsync(filename!, _currentPrintTs.Value);
+                        }
                     }
                     _currentFilename = filename;
 
@@ -708,9 +735,6 @@ public class ObicoClient : IDisposable
                         }
                     }
 
-                    // Mark that we need to send PrintStarted event after connecting to Obico
-                    _detectedOngoingPrint = true;
-
                     Log($"Detected ongoing print: {filename} (state: {state})");
                 }
                 else
@@ -725,6 +749,7 @@ public class ObicoClient : IDisposable
                     _printStartTime = null;
                     _currentFilename = null;
                     _estimatedTotalTime = null;
+                    ClearPrintState();  // Clear persisted state file
 
                     // Also clear job info and progress in status
                     lock (_statusLock)
@@ -811,7 +836,9 @@ public class ObicoClient : IDisposable
                     // Clear error flags and set operational when not in error
                     _currentStatus.Status.State.Flags.Error = false;
                     _currentStatus.Status.State.Flags.ClosedOrError = false;
-                    _currentStatus.Status.State.Flags.Ready = state == "standby";
+                    // Ready = true for all idle states (standby, complete, cancelled)
+                    // This matches moonraker-obico: ready when STATE_OPERATIONAL
+                    _currentStatus.Status.State.Flags.Ready = state == "standby" || state == "complete" || state == "cancelled";
                     _currentStatus.Status.State.Flags.Operational = true;
                 }
             }
@@ -828,7 +855,9 @@ public class ObicoClient : IDisposable
 
             // Update job info with filename only when actively printing
             // (don't show job info when idle even if Moonraker has last printed filename)
-            if (!string.IsNullOrEmpty(_currentFilename) && _currentPrintTs.HasValue)
+            // NOTE: Use _currentStatus.CurrentPrintTs (set inside lock) instead of _currentPrintTs
+            // to avoid race condition where _currentPrintTs visibility is not guaranteed
+            if (!string.IsNullOrEmpty(_currentFilename) && _currentStatus.CurrentPrintTs.HasValue)
             {
                 _currentStatus.Status.Job = new ObicoJob
                 {
@@ -903,19 +932,26 @@ public class ObicoClient : IDisposable
                 var elapsed = _currentStatus.Status.Progress.PrintTime.Value;
                 var estimated = _estimatedTotalTime.Value;
 
-                // Calculate projected estimate based on actual progress
-                // projected = elapsed / progress (e.g., 20min at 50% -> projected 40min total)
-                // If projected > estimated, the print is running slower than expected - update estimate
-                if (_currentStatus.Status.Progress.Completion.HasValue)
+                // Only adjust estimate if elapsed time exceeds original estimate (print running long)
+                // Don't project from early progress - at low % the projection is unreliable
+                // because it includes heating, homing, first layer calibration, etc.
+                if (elapsed > estimated)
                 {
-                    var progress = _currentStatus.Status.Progress.Completion.Value / 100.0; // Convert from percentage
-                    if (progress > 0.01) // Avoid division by zero or very small progress
+                    // Print has exceeded original estimate - use projection if we have enough data
+                    if (_currentStatus.Status.Progress.Completion.HasValue)
                     {
-                        var projectedEstimate = (int)(elapsed / progress);
-                        if (projectedEstimate > estimated)
+                        var progress = _currentStatus.Status.Progress.Completion.Value / 100.0;
+                        if (progress > 0.10) // Only trust projection at 10%+ progress
                         {
+                            var projectedEstimate = (int)(elapsed / progress);
                             estimated = projectedEstimate;
-                            _estimatedTotalTime = estimated; // Update our stored estimate
+                            _estimatedTotalTime = estimated;
+                        }
+                        else
+                        {
+                            // Not enough progress for reliable projection, just extend a bit
+                            estimated = elapsed + 60; // Add 1 minute buffer
+                            _estimatedTotalTime = estimated;
                         }
                     }
                 }
@@ -954,7 +990,15 @@ public class ObicoClient : IDisposable
 
         // Update timestamp
         _currentStatus.Status.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        _currentStatus.CurrentPrintTs = _currentPrintTs;
+
+        // Only sync _currentStatus.CurrentPrintTs when _currentPrintTs has a valid value
+        // This prevents race conditions where _currentPrintTs visibility is not guaranteed
+        // (e.g., set by InitializeStatusAsync outside the lock but not yet visible to this thread)
+        // The authoritative set happens in InitializeStatusAsync and HandlePrintStateChangeAsync
+        if (_currentPrintTs.HasValue)
+        {
+            _currentStatus.CurrentPrintTs = _currentPrintTs;
+        }
     }
 
     private string MapPrintState(string moonrakerState)
@@ -975,7 +1019,12 @@ public class ObicoClient : IDisposable
     {
         lock (_statusLock)
         {
-            _currentStatus.Status.State.Flags.Ready = state == "ready";
+            // Only override Ready to false when klippy is not ready
+            // Don't set Ready=true here - let UpdateStatusFromMoonraker handle it based on print_stats.state
+            if (state != "ready")
+            {
+                _currentStatus.Status.State.Flags.Ready = false;
+            }
             _currentStatus.Status.State.Flags.Error = state == "error";
             _currentStatus.Status.State.Flags.ClosedOrError = state != "ready";
 
@@ -1047,6 +1096,7 @@ public class ObicoClient : IDisposable
             _printStartTime = null;
             _currentFilename = null;
             _estimatedTotalTime = null;
+            ClearPrintState();  // Clear persisted state file
 
             // Update state flags immediately to ensure Obico UI shows correct state
             lock (_statusLock)
@@ -1182,6 +1232,76 @@ public class ObicoClient : IDisposable
             return null;
         }
     }
+
+    #region Print State Persistence
+    // Save/load print timestamp to survive service restarts
+    // This ensures we send the same current_print_ts to Obico after restart
+
+    private const string PrintStateDir = "/var/lib/acproxycam";
+
+    private string GetPrintStateFilePath()
+    {
+        var safeName = _printerConfig.Name.Replace("/", "_").Replace("\\", "_");
+        return Path.Combine(PrintStateDir, $"{safeName}_print.json");
+    }
+
+    private async Task SavePrintStateAsync(string filename, long timestamp)
+    {
+        try
+        {
+            if (!Directory.Exists(PrintStateDir))
+                Directory.CreateDirectory(PrintStateDir);
+
+            var state = new { filename, timestamp };
+            var json = System.Text.Json.JsonSerializer.Serialize(state);
+            await File.WriteAllTextAsync(GetPrintStateFilePath(), json);
+            Log($"Saved print state: {filename} @ {timestamp}");
+        }
+        catch (Exception ex)
+        {
+            Log($"Failed to save print state: {ex.Message}");
+        }
+    }
+
+    private async Task<(string? filename, long? timestamp)> LoadPrintStateAsync()
+    {
+        try
+        {
+            var path = GetPrintStateFilePath();
+            if (!File.Exists(path))
+                return (null, null);
+
+            var json = await File.ReadAllTextAsync(path);
+            var state = System.Text.Json.JsonSerializer.Deserialize<JsonNode>(json);
+            var filename = state?["filename"]?.GetValue<string>();
+            var timestamp = state?["timestamp"]?.GetValue<long>();
+            return (filename, timestamp);
+        }
+        catch (Exception ex)
+        {
+            Log($"Failed to load print state: {ex.Message}");
+            return (null, null);
+        }
+    }
+
+    private void ClearPrintState()
+    {
+        try
+        {
+            var path = GetPrintStateFilePath();
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+                Log("Cleared saved print state");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Failed to clear print state: {ex.Message}");
+        }
+    }
+
+    #endregion
 
     private DateTime _lastLayerZRefresh = DateTime.MinValue;
 
@@ -2056,7 +2176,8 @@ public class ObicoClient : IDisposable
 
         if (includeSettings)
         {
-            Log($"Sending initial status with settings (state={update.Status.State.Text}, ready={update.Status.State.Flags.Ready}, currentPrintTs={update.CurrentPrintTs?.ToString() ?? "null"}, printing={update.Status.State.Flags.Printing})");
+            var jobFilename = update.Status.Job?.File?.Name ?? "null";
+            Log($"Sending initial status with settings (state={update.Status.State.Text}, ready={update.Status.State.Flags.Ready}, currentPrintTs={update.CurrentPrintTs?.ToString() ?? "null"}, printing={update.Status.State.Flags.Printing}, job.file.name={jobFilename})");
         }
 
         if (includeSettings)
