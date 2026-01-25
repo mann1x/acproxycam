@@ -900,7 +900,27 @@ public class ObicoClient : IDisposable
             // Calculate remaining time
             if (_estimatedTotalTime.HasValue && _currentStatus.Status.Progress.PrintTime.HasValue)
             {
-                var remaining = _estimatedTotalTime.Value - _currentStatus.Status.Progress.PrintTime.Value;
+                var elapsed = _currentStatus.Status.Progress.PrintTime.Value;
+                var estimated = _estimatedTotalTime.Value;
+
+                // Calculate projected estimate based on actual progress
+                // projected = elapsed / progress (e.g., 20min at 50% -> projected 40min total)
+                // If projected > estimated, the print is running slower than expected - update estimate
+                if (_currentStatus.Status.Progress.Completion.HasValue)
+                {
+                    var progress = _currentStatus.Status.Progress.Completion.Value / 100.0; // Convert from percentage
+                    if (progress > 0.01) // Avoid division by zero or very small progress
+                    {
+                        var projectedEstimate = (int)(elapsed / progress);
+                        if (projectedEstimate > estimated)
+                        {
+                            estimated = projectedEstimate;
+                            _estimatedTotalTime = estimated; // Update our stored estimate
+                        }
+                    }
+                }
+
+                var remaining = estimated - elapsed;
                 _currentStatus.Status.Progress.PrintTimeLeft = remaining > 0 ? remaining : 0;
             }
 
