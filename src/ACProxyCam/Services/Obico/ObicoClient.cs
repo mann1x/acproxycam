@@ -58,6 +58,10 @@ public class ObicoClient : IDisposable
     private volatile bool _printerOffline;
     private DateTime _lastOfflineLogTime = DateTime.MinValue;
 
+    // Flag to track if we detected an ongoing print during initialization
+    // This is used to send PrintStarted event after connecting to Obico
+    private bool _detectedOngoingPrint;
+
     // Verbose logging (set via ACPROXYCAM_VERBOSE=1 environment variable)
     private readonly bool _verbose;
 
@@ -321,6 +325,15 @@ public class ObicoClient : IDisposable
             // Send initial status with settings AFTER Janus is started
             // This ensures stream_id is included in webcam settings
             SendStatusUpdate(includeSettings: true);
+
+            // If we detected an ongoing print during initialization, send PrintStarted event
+            // This ensures Obico starts tracking the print that was already in progress
+            if (_detectedOngoingPrint)
+            {
+                _detectedOngoingPrint = false;
+                SendPrintEvent("PrintStarted");
+                Log($"Sent PrintStarted for ongoing print: {_currentFilename}");
+            }
 
             // Start background tasks
             _statusUpdateTask = Task.Run(() => StatusUpdateLoopAsync(_cts!.Token), _cts!.Token);
@@ -659,6 +672,17 @@ public class ObicoClient : IDisposable
 
                     // Fetch file metadata for maxZ display
                     await FetchFileMetadataAsync();
+
+                    // Update the status object with the print timestamp
+                    // This must be done after setting _currentPrintTs since UpdateStatusFromMoonraker
+                    // was called before we detected the ongoing print
+                    lock (_statusLock)
+                    {
+                        _currentStatus.CurrentPrintTs = _currentPrintTs;
+                    }
+
+                    // Mark that we need to send PrintStarted event after connecting to Obico
+                    _detectedOngoingPrint = true;
 
                     Log($"Detected ongoing print: {filename} (state: {state})");
                 }
@@ -999,6 +1023,12 @@ public class ObicoClient : IDisposable
         }
         else if (previouslyPrinting && e.State == "printing")
         {
+            // Re-fetch estimated time if not set (can happen after service restart during pause)
+            if (!_estimatedTotalTime.HasValue)
+            {
+                await FetchEstimatedTotalTimeAsync();
+            }
+
             SendPrintEvent("PrintResumed");
             Log("Print resumed");
         }
@@ -1077,15 +1107,17 @@ public class ObicoClient : IDisposable
                     var position = gcodeMove["gcode_position"];
                     if (position is JsonArray posArray && posArray.Count >= 3)
                     {
-                        _currentStatus.Status.CurrentZ = posArray[2]?.GetValue<double>();
+                        var zValue = posArray[2]?.GetValue<double>();
+                        _currentStatus.Status.CurrentZ = zValue;
+                        if (_verbose)
+                            Log($"Z position updated: {zValue}");
                     }
                 }
             }
         }
         catch (Exception ex)
         {
-            // Silently ignore - will retry on next status update
-            System.Diagnostics.Debug.WriteLine($"Failed to refresh layer/Z info: {ex.Message}");
+            Log($"Failed to refresh layer/Z info: {ex.Message}");
         }
     }
 
@@ -1878,7 +1910,7 @@ public class ObicoClient : IDisposable
 
         if (includeSettings)
         {
-            Log($"Sending initial status with settings (state={update.Status.State.Text}, ready={update.Status.State.Flags.Ready})");
+            Log($"Sending initial status with settings (state={update.Status.State.Text}, ready={update.Status.State.Flags.Ready}, currentPrintTs={update.CurrentPrintTs?.ToString() ?? "null"}, printing={update.Status.State.Flags.Printing})");
         }
 
         if (includeSettings)
