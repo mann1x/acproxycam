@@ -132,13 +132,17 @@ public class ObicoClient : IDisposable
         {
             Log("Printer marked online - resuming status updates and restarting Janus");
 
-            // Reset status flags to operational state
+            // Clear the offline-specific state but don't override actual printer state
+            // The actual state (Operational, Error, etc.) should come from Moonraker status updates
+            // Only clear the "Offline" text if that's what was set
             lock (_statusLock)
             {
-                _currentStatus.Status.State.Text = "Operational";
-                _currentStatus.Status.State.Flags.Operational = true;
-                _currentStatus.Status.State.Flags.Ready = true;
-                _currentStatus.Status.State.Flags.ClosedOrError = false;
+                if (_currentStatus.Status.State.Text == "Offline")
+                {
+                    _currentStatus.Status.State.Text = "Operational";
+                    _currentStatus.Status.State.Flags.Operational = true;
+                    _currentStatus.Status.State.Flags.ClosedOrError = false;
+                }
             }
 
             // Send status update to Obico to clear offline state
@@ -658,6 +662,29 @@ public class ObicoClient : IDisposable
 
                     Log($"Detected ongoing print: {filename} (state: {state})");
                 }
+                else
+                {
+                    // Clear any stale print state from previous session
+                    // This handles the case where printer was rebooted during a print
+                    if (_currentPrintTs.HasValue)
+                    {
+                        Log($"Clearing stale print state (current state: {state})");
+                    }
+                    _currentPrintTs = null;
+                    _printStartTime = null;
+                    _currentFilename = null;
+                    _estimatedTotalTime = null;
+
+                    // Also clear job info and progress in status
+                    lock (_statusLock)
+                    {
+                        _currentStatus.Status.Job = null;
+                        _currentStatus.Status.FileMetadata = null;
+                        _currentStatus.Status.CurrentLayer = null;
+                        _currentStatus.Status.CurrentZ = null;
+                        _currentStatus.Status.Progress = new ObicoProgress();
+                    }
+                }
             }
         }
         catch (Exception ex)
@@ -718,7 +745,24 @@ public class ObicoClient : IDisposable
                 _currentStatus.Status.State.Text = MapPrintState(state);
                 _currentStatus.Status.State.Flags.Printing = state == "printing";
                 _currentStatus.Status.State.Flags.Paused = state == "paused";
-                _currentStatus.Status.State.Flags.Ready = state == "standby";
+
+                // Set/clear error flags based on print_stats state
+                // (error can occur from thermal runaway, filament error, etc.)
+                if (state == "error")
+                {
+                    _currentStatus.Status.State.Flags.Error = true;
+                    _currentStatus.Status.State.Flags.ClosedOrError = true;
+                    _currentStatus.Status.State.Flags.Ready = false;
+                    _currentStatus.Status.State.Flags.Operational = false;
+                }
+                else
+                {
+                    // Clear error flags and set operational when not in error
+                    _currentStatus.Status.State.Flags.Error = false;
+                    _currentStatus.Status.State.Flags.ClosedOrError = false;
+                    _currentStatus.Status.State.Flags.Ready = state == "standby";
+                    _currentStatus.Status.State.Flags.Operational = true;
+                }
             }
 
             var filenameNode = printStats["filename"];
@@ -1209,16 +1253,18 @@ public class ObicoClient : IDisposable
                     // Clear printer offline flag
                     _printerOffline = false;
 
-                    // Reset status flags to operational state
+                    // Only clear Offline-specific state, don't override actual printer state
+                    // InitializeStatusAsync already set the correct state from Moonraker
                     lock (_statusLock)
                     {
-                        // Don't override if InitializeStatusAsync set specific state (e.g., Error)
+                        // Only reset to Operational if we were showing Offline
+                        // Preserve Error state if that's what Moonraker reported
                         if (_currentStatus.Status.State.Text == "Offline")
                         {
                             _currentStatus.Status.State.Text = "Operational";
+                            _currentStatus.Status.State.Flags.Operational = true;
+                            _currentStatus.Status.State.Flags.ClosedOrError = false;
                         }
-                        _currentStatus.Status.State.Flags.Operational = true;
-                        _currentStatus.Status.State.Flags.ClosedOrError = false;
                     }
 
                     // Send updated status to Obico immediately (if connected)
