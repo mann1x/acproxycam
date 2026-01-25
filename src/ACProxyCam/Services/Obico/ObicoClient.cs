@@ -656,10 +656,22 @@ public class ObicoClient : IDisposable
 
                 if (state == "printing" || state == "paused")
                 {
-                    // Restore print state - use current time as print start since we don't know the actual start time
-                    // This ensures Obico continues tracking the print
-                    _currentPrintTs = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                    _printStartTime = DateTime.UtcNow;
+                    // Get the actual print start time from Moonraker's job history
+                    // This is critical - Obico server uses this timestamp as a unique identifier
+                    // Using current time would create a new print record on every reconnect
+                    var printStartTs = await FetchPrintStartTimeAsync();
+                    if (printStartTs.HasValue)
+                    {
+                        _currentPrintTs = printStartTs.Value;
+                        _printStartTime = DateTimeOffset.FromUnixTimeSeconds(printStartTs.Value).UtcDateTime;
+                    }
+                    else
+                    {
+                        // Fallback to current time if job history unavailable (shouldn't happen)
+                        Log("Warning: Could not fetch print start time from job history, using current time");
+                        _currentPrintTs = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                        _printStartTime = DateTime.UtcNow;
+                    }
                     _currentFilename = filename;
 
                     // Fetch estimated total time
@@ -673,12 +685,27 @@ public class ObicoClient : IDisposable
                     // Fetch file metadata for maxZ display
                     await FetchFileMetadataAsync();
 
-                    // Update the status object with the print timestamp
+                    // Update the status object with the print timestamp and job info
                     // This must be done after setting _currentPrintTs since UpdateStatusFromMoonraker
                     // was called before we detected the ongoing print
                     lock (_statusLock)
                     {
                         _currentStatus.CurrentPrintTs = _currentPrintTs;
+
+                        // Set job info with filename - this is required by Obico server
+                        // The server will reject the print if filename is missing
+                        if (!string.IsNullOrEmpty(_currentFilename))
+                        {
+                            _currentStatus.Status.Job = new ObicoJob
+                            {
+                                File = new ObicoJobFile
+                                {
+                                    Name = _currentFilename,
+                                    Display = _currentFilename,
+                                    Path = _currentFilename
+                                }
+                            };
+                        }
                     }
 
                     // Mark that we need to send PrintStarted event after connecting to Obico
@@ -1062,6 +1089,80 @@ public class ObicoClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// Fetch the actual print start time from Moonraker's job history.
+    /// This is critical for Obico integration - the server uses this timestamp as a unique identifier.
+    ///
+    /// For Anycubic/Rinkhals printers, Moonraker uses monotonic time (seconds since boot) instead of
+    /// Unix epoch for timestamps. We convert this to Unix epoch by calculating the boot time.
+    /// </summary>
+    private async Task<long?> FetchPrintStartTimeAsync()
+    {
+        try
+        {
+            // Query the most recent job from Moonraker's history
+            var result = await _moonraker.GetAsync<JsonNode>("/server/history/list?order=desc&limit=1");
+            var jobs = result?["jobs"]?.AsArray();
+            if (jobs != null && jobs.Count > 0)
+            {
+                var job = jobs[0];
+                var startTime = job?["start_time"]?.GetValue<double>();
+                if (startTime.HasValue && startTime.Value > 0)
+                {
+                    // Check if this looks like a relative time (monotonic/uptime) rather than Unix epoch
+                    // Unix timestamps for 2020+ are > 1577836800, relative times would be much smaller
+                    if (startTime.Value < 100000000) // Less than ~3 years in seconds
+                    {
+                        // This is likely monotonic time (seconds since boot), not Unix epoch
+                        // Convert to Unix epoch using current time and eventtime (uptime)
+                        var currentUptime = await GetCurrentUptimeAsync();
+                        if (currentUptime.HasValue)
+                        {
+                            var bootTimeUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (long)currentUptime.Value;
+                            var printStartUnix = bootTimeUnix + (long)startTime.Value;
+                            Log($"Print start time: {startTime.Value}s (uptime) -> {printStartUnix} (Unix epoch)");
+                            return printStartUnix;
+                        }
+                        else
+                        {
+                            // Fallback: can't determine uptime, use relative time as-is
+                            Log($"Warning: Could not convert relative start_time to Unix epoch, using as-is: {startTime.Value}");
+                            return (long)startTime.Value;
+                        }
+                    }
+                    else
+                    {
+                        // Already a Unix timestamp
+                        Log($"Print start time from job history: {startTime.Value} (Unix timestamp)");
+                        return (long)startTime.Value;
+                    }
+                }
+            }
+            Log("No jobs found in Moonraker history");
+        }
+        catch (Exception ex)
+        {
+            Log($"Failed to fetch print start time from job history: {ex.Message}");
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Get current system uptime from Moonraker's eventtime.
+    /// </summary>
+    private async Task<double?> GetCurrentUptimeAsync()
+    {
+        try
+        {
+            var result = await _moonraker.GetAsync<JsonNode>("/printer/objects/query?print_stats");
+            return result?["eventtime"]?.GetValue<double>();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private DateTime _lastLayerZRefresh = DateTime.MinValue;
 
     private async Task RefreshLayerAndZInfoAsync()
@@ -1073,8 +1174,9 @@ public class ObicoClient : IDisposable
 
         try
         {
+            // Include model_size_z in the query for maxZ updates (Anycubic printers populate this)
             var result = await _moonraker.GetAsync<JsonNode>(
-                "/printer/objects/query?print_stats=info&virtual_sdcard=current_layer,total_layer&gcode_move=gcode_position");
+                "/printer/objects/query?print_stats=info&virtual_sdcard=current_layer,total_layer,model_size_z&gcode_move=gcode_position");
             var status = result?["status"];
             if (status == null) return;
 
@@ -1107,6 +1209,20 @@ public class ObicoClient : IDisposable
                         var totalLayer = vsd["total_layer"]?.GetValue<int>();
                         if (totalLayer.HasValue)
                             SetTotalLayerCount(totalLayer.Value);
+                    }
+
+                    // Update maxZ from model_size_z if available and not already set
+                    // This handles cases where the file metadata wasn't available at print start
+                    // (e.g., files sent directly to printer via Anycubic slicer)
+                    var modelSizeZ = vsd["model_size_z"]?.GetValue<double>();
+                    if (modelSizeZ.HasValue && modelSizeZ.Value > 0)
+                    {
+                        var currentMaxZ = GetMaxZ();
+                        if (currentMaxZ == null || currentMaxZ.Value <= 0)
+                        {
+                            SetMaxZ(modelSizeZ.Value);
+                            Log($"Updated maxZ from virtual_sdcard: {modelSizeZ.Value:F2}mm");
+                        }
                     }
                 }
 
@@ -2059,7 +2175,17 @@ public class ObicoClient : IDisposable
     }
 
     /// <summary>
+    /// Get maxZ from the nested file_metadata.analysis.printingArea structure.
+    /// </summary>
+    private double? GetMaxZ()
+    {
+        return _currentStatus.Status.FileMetadata?.Analysis?.PrintingArea?.MaxZ;
+    }
+
+    /// <summary>
     /// Fetch file metadata (object_height) for maxZ display.
+    /// Falls back to virtual_sdcard.model_size_z for Anycubic printers where
+    /// files are sent directly to the printer and not through Moonraker's file system.
     /// </summary>
     private async Task FetchFileMetadataAsync()
     {
@@ -2069,15 +2195,10 @@ public class ObicoClient : IDisposable
             return;
         }
 
+        // First try Moonraker's file metadata
         try
         {
-            // MoonrakerApiClient.GetAsync already extracts the "result" from the response
             var metadata = await _moonraker.GetAsync<JsonNode>($"/server/files/metadata?filename={Uri.EscapeDataString(_currentFilename)}");
-            if (metadata == null)
-            {
-                Log($"FetchFileMetadata: No metadata returned");
-                return;
-            }
             var objectHeight = metadata?["object_height"]?.GetValue<double>();
             if (objectHeight.HasValue && objectHeight.Value > 0)
             {
@@ -2086,16 +2207,35 @@ public class ObicoClient : IDisposable
                     SetMaxZ(objectHeight.Value);
                 }
                 Log($"File metadata: maxZ={objectHeight.Value:F2}mm");
-            }
-            else
-            {
-                Log($"FetchFileMetadata: object_height not found or zero");
+                return;
             }
         }
         catch (Exception ex)
         {
-            Log($"Failed to fetch file metadata: {ex.Message}");
+            Log($"Moonraker file metadata not available: {ex.Message}");
         }
+
+        // Fallback: Try virtual_sdcard.model_size_z (Anycubic printers populate this)
+        try
+        {
+            var result = await _moonraker.GetAsync<JsonNode>("/printer/objects/query?virtual_sdcard=model_size_z");
+            var modelSizeZ = result?["status"]?["virtual_sdcard"]?["model_size_z"]?.GetValue<double>();
+            if (modelSizeZ.HasValue && modelSizeZ.Value > 0)
+            {
+                lock (_statusLock)
+                {
+                    SetMaxZ(modelSizeZ.Value);
+                }
+                Log($"File metadata from virtual_sdcard: maxZ={modelSizeZ.Value:F2}mm");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Failed to fetch model_size_z from virtual_sdcard: {ex.Message}");
+        }
+
+        Log("FetchFileMetadata: maxZ not available from any source");
     }
 
     #endregion
