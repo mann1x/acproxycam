@@ -111,6 +111,46 @@ Key code in `MqttCameraController.cs`:
 - **MQTT topic detection**: Regex pattern in `MqttCameraController.cs` extracts model code from subscribed topics.
 - **Default SSH creds**: `root/rockchip` for Anycubic printers.
 
+## Obico Reference Implementation Tracking
+
+The Obico integration in ACProxyCam was developed by studying the reference implementations:
+- **moonraker-obico** - Official Moonraker agent for Obico
+- **obico-server** - Obico server backend
+- **rinkhals** - Klipper/Moonraker integration for Anycubic printers
+
+### Reference Commits File
+
+**Location**: `src/ACProxyCam/Services/Obico/REFERENCE_COMMITS.md`
+
+This file tracks the exact git commits used when developing the Obico integration. When upstream projects are updated, compare diffs from these commits to identify changes that may need to be ported to ACProxyCam.
+
+### Local Reference Repositories
+
+Reference source code is cloned to `D:\INSTALL\acproxycam\obico\`:
+- `moonraker-obico/` - https://github.com/TheSpaghettiDetective/moonraker-obico
+- `obico-server/` - https://github.com/TheSpaghettiDetective/obico-server
+- `rinkhals/` - https://github.com/jbatonnet/Rinkhals
+
+### Checking for Updates
+
+```bash
+cd D:\INSTALL\acproxycam\obico
+
+# Check moonraker-obico for changes since tracked commit
+cd moonraker-obico && git fetch origin
+git log df0005c2f1a9137d3fbb44a5139caa9f8843ed92..origin/main --oneline
+
+# Check obico-server for changes
+cd ../obico-server && git fetch origin
+git log 9b73caa7b373e89fd23bf2fed646e629ee602640..origin/master --oneline
+
+# Check rinkhals for changes
+cd ../rinkhals && git fetch origin
+git log deab69a5208e1a88075ffb13b9433a86d46f93cc..origin/main --oneline
+```
+
+After porting relevant changes to ACProxyCam, update the commit hashes in `REFERENCE_COMMITS.md`.
+
 ## CLI Input Validation
 
 The management CLI (`ManagementCli.cs`) validates all inputs:
