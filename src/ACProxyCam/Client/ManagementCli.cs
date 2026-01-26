@@ -1001,13 +1001,15 @@ WantedBy=multi-user.target
             .AddColumn(new TableColumn("Service").Centered())
             .AddColumn(new TableColumn("Printers").Centered())
             .AddColumn(new TableColumn("Active").Centered())
+            .AddColumn(new TableColumn("Idling").Centered())
             .AddColumn(new TableColumn("Clients").Centered());
 
         headerTable.AddRow(
             $"[grey]v{Program.Version}[/]",
             serviceStatus,
             $"[bold]{status?.PrinterCount ?? 0}[/]",
-            $"[green]{status?.ActiveStreamers ?? 0}[/] / [grey]{status?.InactiveStreamers ?? 0}[/]",
+            $"[green]{status?.ActiveStreamers ?? 0}[/]",
+            $"[grey]{status?.InactiveStreamers ?? 0}[/]",
             $"[cyan]{status?.TotalClients ?? 0}[/]"
         );
 
