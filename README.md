@@ -112,6 +112,7 @@ Once a printer is configured and running, access the streams at:
 |----------|-----|-------------|
 | MJPEG Stream | `http://server-ip:8080/stream` | Live video stream |
 | Snapshot | `http://server-ip:8080/snapshot` | Current frame as JPEG |
+| H.264 WebSocket | `ws://server-ip:8080/h264` | H.264 stream for jmuxer |
 | Status | `http://server-ip:8080/status` | JSON status info |
 | HLS (LL-HLS) | `http://server-ip:8080/hls/playlist.m3u8` | Low-Latency HLS stream (~1-2s latency) |
 | HLS (Legacy) | `http://server-ip:8080/hls/legacy.m3u8` | Standard HLS for older players |
@@ -119,17 +120,52 @@ Once a printer is configured and running, access the streams at:
 | LED On | `http://server-ip:8080/led/on` | POST: Turn LED on |
 | LED Off | `http://server-ip:8080/led/off` | POST: Turn LED off |
 
-Configure the stream URLs in Mainsail/Fluidd webcam settings.
+### Mainsail/Fluidd Configuration
+
+**MJPEG Stream (Default):**
+
+Configure the webcam in Mainsail/Fluidd UI settings with:
+- Stream URL: `http://<acproxycam-ip>:8080/stream`
+- Snapshot URL: `http://<acproxycam-ip>:8080/snapshot`
+
+**H.264 Stream (jmuxer - Lower CPU Usage):**
+
+For H.264 streaming via jmuxer, add this to `moonraker.conf` or `moonraker.custom.conf`:
+
+```ini
+[webcam Webcam]
+enabled: True
+service: jmuxer-stream
+target_fps: 10
+target_fps_idle: 5
+stream_url: ws://192.168.178.12:8081/h264
+snapshot_url: http://192.168.178.12:8081/snapshot
+rotation: 0
+```
+
+Replace the IP and port with your ACProxyCam server address.
 
 ### HLS Streaming
 
 ACProxyCam provides HLS (HTTP Live Streaming) endpoints for players that don't support MJPEG:
 
-- **LL-HLS** (`/hls/playlist.m3u8`) - Low-Latency HLS with partial segments for reduced latency (~1-2 seconds). Works with modern players like hls.js, Safari, and Home Assistant.
+- **LL-HLS** (`/hls/playlist.m3u8`) - Low-Latency HLS with partial segments for reduced latency (~1-2 seconds). Works with modern players like hls.js and Safari.
 
 - **Legacy HLS** (`/hls/legacy.m3u8`) - Standard HLS v3 for older players. Compatible with MPC-HC (Media Player Classic).
 
-> **Note:** The legacy HLS endpoint has known compatibility issues with VLC and PotPlayer due to strict timing requirements in these players. Use MPC-HC or the LL-HLS endpoint with hls.js-based players instead.
+**Player Compatibility:**
+
+| Player | LL-HLS | Legacy HLS |
+|--------|--------|------------|
+| Safari | Yes | Yes |
+| hls.js (web) | Yes | Yes |
+| MPC-HC | N/A | Yes |
+| VLC | No | No |
+| PotPlayer | No | No |
+
+> **Note:** VLC and PotPlayer have strict timing requirements that cause issues with our HLS implementation. Use MPC-HC or a browser-based hls.js player instead.
+
+**HomeAssistant Note:** HA's stream integration **produces** HLS from RTSP/H.264 sources - it does not consume HLS as input. For HA camera integration, use the MJPEG platform (see [HomeAssistant Integration](#homeassistant-integration)).
 
 ## BedMesh Calibration & Analysis
 
@@ -245,11 +281,44 @@ Example configuration:
 
 ## HomeAssistant Integration
 
-You can integrate the camera LED control with HomeAssistant as a switch.
+You can integrate the camera and LED control with HomeAssistant.
 
-### REST Switch Configuration
+### Camera Integration
 
-Add this to your `configuration.yaml`:
+**Option 1: MJPEG IP Camera (Built-in, Recommended)**
+
+Use the MJPEG IP Camera integration via the UI:
+
+1. Go to **Settings > Devices & Services > Add Integration**
+2. Search for "MJPEG IP Camera" and select it
+3. Configure the camera:
+   - **MJPEG URL:** `http://<acproxycam-ip>:8081/stream`
+   - **Still image URL:** `http://<acproxycam-ip>:8081/snapshot`
+   - **Username/Password:** Leave empty (no authentication required)
+   - **Verify SSL certificate:** Unchecked
+4. Click **Submit**
+
+![MJPEG IP Camera Configuration](docs/ha-mjpeg-config.png)
+
+**Option 2: WebRTC Camera (HACS - For HLS Streaming)**
+
+For HLS streaming with lower latency, install the [WebRTC Camera](https://github.com/AlexxIT/WebRTC) custom component from HACS:
+
+1. Install HACS if not already installed
+2. In HACS, search for "WebRTC Camera" and install it
+3. Restart Home Assistant
+4. Add a WebRTC card to your dashboard with HLS URL:
+
+```yaml
+type: custom:webrtc-camera
+url: http://<acproxycam-ip>:8081/hls/playlist.m3u8
+```
+
+> **Note:** HomeAssistant's built-in Generic Camera integration expects RTSP for its "Stream source URL" field - it does not consume HLS as input. Use the MJPEG IP Camera integration or WebRTC card for ACProxyCam.
+
+### LED Switch Configuration
+
+Add the LED control switch to your `configuration.yaml`:
 
 ```yaml
 sensor:
@@ -258,6 +327,7 @@ sensor:
     resource: http://192.168.178.12:8081/led
     scan_interval: 5
     value_template: "{{ value_json.state }}"
+    verify_ssl: false
 
 rest_command:
   kobra_s1_led_on:
@@ -281,15 +351,16 @@ switch:
 
 Replace `192.168.178.12:8081` with your ACProxyCam server IP and port.
 
+> **Important:** The `verify_ssl: false` is required for the REST sensor to avoid SSL context issues with HTTP URLs.
+
 After adding the configuration:
 1. Go to **Developer Tools > YAML > Check Configuration**
 2. Click **Restart** to apply the changes
 3. Find `switch.kobra_s1_camera_led` in **Settings > Devices & Services > Entities**
 
-### Dashboard Tile Card
+### Dashboard Cards
 
-Add a Tile card to your dashboard for quick LED control:
-
+**LED Control Tile:**
 ```yaml
 type: tile
 entity: switch.kobra_s1_camera_led
@@ -303,7 +374,7 @@ icon_tap_action:
 features_position: inline
 ```
 
-You can add this via **Edit Dashboard > Add Card > Manual** and paste the YAML.
+You can add these via **Edit Dashboard > Add Card > Manual** and paste the YAML.
 
 ## Systemd Service
 

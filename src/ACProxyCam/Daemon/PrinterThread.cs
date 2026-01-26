@@ -198,13 +198,13 @@ public class PrinterThread : IDisposable
                 MjpegPort = Config.MjpegPort,
                 DeviceType = Config.DeviceType,
                 State = _state,
-                ConnectedClients = (_mjpegServer?.ConnectedClients ?? 0) + (_mjpegServer?.HasExternalStreamingClient == true ? 1 : 0),
+                ConnectedClients = (_mjpegServer?.ConnectedClients ?? 0) + (_mjpegServer?.H264WebSocketClients ?? 0) + (_mjpegServer?.HasExternalStreamingClient == true ? 1 : 0),
                 H264WebSocketClients = _mjpegServer?.H264WebSocketClients ?? 0,
                 HlsReady = _mjpegServer?.HlsReady ?? false,
                 IsPaused = _isPaused,
                 CpuAffinity = _cpuAffinity,
-                CurrentFps = ((_mjpegServer?.ConnectedClients ?? 0) > 0 || _mjpegServer?.HasExternalStreamingClient == true) ? Config.MaxFps : Config.IdleFps,
-                IsIdle = (_mjpegServer?.ConnectedClients ?? 0) == 0 && _mjpegServer?.HasExternalStreamingClient != true,
+                CurrentFps = ((_mjpegServer?.ConnectedClients ?? 0) > 0 || (_mjpegServer?.H264WebSocketClients ?? 0) > 0 || _mjpegServer?.HasExternalStreamingClient == true) ? Config.MaxFps : Config.IdleFps,
+                IsIdle = (_mjpegServer?.ConnectedClients ?? 0) == 0 && (_mjpegServer?.H264WebSocketClients ?? 0) == 0 && _mjpegServer?.HasExternalStreamingClient != true,
                 IsOnline = _state == PrinterState.Running,
                 LastError = _lastError,
                 LastErrorAt = _lastErrorAt,
@@ -1096,15 +1096,16 @@ public class PrinterThread : IDisposable
                     }
 
                     // Camera keepalive: resend startCapture to prevent frame rate throttling
-                    // Only when there are active consumers (MJPEG clients or HLS activity)
+                    // Only when there are active consumers (MJPEG, H.264 WebSocket, HLS, or Janus viewers)
                     if (Config.CameraKeepaliveSeconds > 0 &&
                         (DateTime.UtcNow - lastCameraKeepalive).TotalSeconds >= Config.CameraKeepaliveSeconds)
                     {
                         lastCameraKeepalive = DateTime.UtcNow;
                         var mjpegClients = _mjpegServer?.ConnectedClients ?? 0;
+                        var h264Clients = _mjpegServer?.H264WebSocketClients ?? 0;
                         var hasExternal = _mjpegServer?.HasExternalStreamingClient ?? false;
                         var hasHls = _mjpegServer?.HasHlsActivity ?? false;
-                        var hasConsumers = mjpegClients > 0 || hasExternal || hasHls;
+                        var hasConsumers = mjpegClients > 0 || h264Clients > 0 || hasExternal || hasHls;
 
                         if (hasConsumers)
                         {
@@ -1112,7 +1113,7 @@ public class PrinterThread : IDisposable
                         }
                         else
                         {
-                            LogStatusThrottled("camera_keepalive_skip", $"Keepalive skipped: no consumers (MJPEG={mjpegClients}, External={hasExternal}, HLS={hasHls})");
+                            LogStatusThrottled("camera_keepalive_skip", $"Keepalive skipped: no consumers (MJPEG={mjpegClients}, H264={h264Clients}, External={hasExternal}, HLS={hasHls})");
                         }
                     }
 

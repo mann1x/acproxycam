@@ -71,8 +71,8 @@ public class ObicoClient : IDisposable
     public event EventHandler<ObicoClientState>? StateChanged;
     public event EventHandler? ConfigUpdated;
     /// <summary>
-    /// Fired when Janus streaming state changes. True = streaming active, False = stopped.
-    /// Used by MJPEG server to maintain full-rate encoding during Janus streaming.
+    /// Fired when Janus WebRTC viewer connects/disconnects. True = viewer connected, False = disconnected.
+    /// Used to track actual streaming clients for keepalive and encoding rate control.
     /// </summary>
     public event EventHandler<bool>? JanusStreamingChanged;
 
@@ -417,7 +417,7 @@ public class ObicoClient : IDisposable
             }
 
             _janusEnabled = true;
-            JanusStreamingChanged?.Invoke(this, true);
+            // Note: JanusStreamingChanged is fired in OnWebRtcStateChanged when a viewer actually connects
         }
         catch (Exception ex)
         {
@@ -525,11 +525,14 @@ public class ObicoClient : IDisposable
 
     /// <summary>
     /// Handle WebRTC state changes from Janus client.
-    /// For MJPEG mode: pauses/resumes streaming to avoid broken frames during browser reconnection.
-    /// For H.264 mode: no action needed since FFmpeg runs independently.
+    /// Fires JanusStreamingChanged to track actual viewer connections.
+    /// For MJPEG mode: also pauses/resumes streaming to avoid broken frames during browser reconnection.
     /// </summary>
     private void OnWebRtcStateChanged(object? sender, bool webRtcUp)
     {
+        // Notify that viewer connected/disconnected (for client tracking and keepalive logic)
+        JanusStreamingChanged?.Invoke(this, webRtcUp);
+
         // Only pause/resume MJPEG streamer - H.264 streamer runs independently via FFmpeg
         if (_janusStreamer != null)
         {

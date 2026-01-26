@@ -546,10 +546,10 @@ public class MjpegServer : IDisposable
         try
         {
             var now = DateTime.UtcNow;
-            var hasClients = ConnectedClients > 0 || HasExternalStreamingClient || HasHlsActivity;
+            var hasClients = ConnectedClients > 0 || H264WebSocketClients > 0 || HasExternalStreamingClient || HasHlsActivity;
 
             // Determine target FPS based on whether clients are connected
-            // (includes HTTP clients and external streaming clients like Obico/Janus)
+            // (includes MJPEG, H.264 WebSocket, external streaming clients like Obico/Janus, and HLS)
             var targetFps = hasClients ? MaxFps : IdleFps;
 
             // Skip frame if we're encoding too fast
@@ -947,7 +947,9 @@ public class MjpegServer : IDisposable
         var status = new
         {
             running = IsRunning,
-            clients = ConnectedClients,
+            clients = ConnectedClients + H264WebSocketClients,
+            mjpegClients = ConnectedClients,
+            h264Clients = H264WebSocketClients,
             frameWidth = _frameWidth,
             frameHeight = _frameHeight,
             hasFrame = _lastJpegFrame != null,
