@@ -43,6 +43,10 @@ public class PrinterConfig
     [JsonPropertyName("ip")]
     public string Ip { get; set; } = "";
 
+    /// <summary>
+    /// HTTP server port for all streaming endpoints (snapshot, status, LED control, MJPEG, H.264, HLS).
+    /// Note: Property name kept as "mjpegPort" for backwards compatibility with existing configs.
+    /// </summary>
     [JsonPropertyName("mjpegPort")]
     public int MjpegPort { get; set; } = 8080;
 
@@ -130,12 +134,37 @@ public class PrinterConfig
     public bool CameraEnabled { get; set; } = true;
 
     /// <summary>
+    /// Enable H.264 WebSocket streaming endpoint (/h264).
+    /// Used by Mainsail/Fluidd jmuxer for low-CPU streaming.
+    /// Default: true.
+    /// </summary>
+    [JsonPropertyName("h264StreamerEnabled")]
+    public bool H264StreamerEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Enable HLS streaming endpoints (/hls/*).
+    /// Provides standard HLS streaming for Home Assistant and browsers.
+    /// Default: true.
+    /// </summary>
+    [JsonPropertyName("hlsEnabled")]
+    public bool HlsEnabled { get; set; } = true;
+
+    /// <summary>
     /// Enable Low-Latency HLS (LL-HLS) streaming. Reduces latency from ~4-5s to ~1-2s.
     /// Requires HLS v10 compatible player (Safari, hls.js). Falls back gracefully.
+    /// Only effective when HlsEnabled is true.
     /// Default: true.
     /// </summary>
     [JsonPropertyName("llHlsEnabled")]
     public bool LlHlsEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Enable MJPEG streaming endpoint (/stream).
+    /// CPU-intensive as it requires decoding H.264 and encoding JPEG.
+    /// Default: false (for new printers; existing configs default to true for backwards compatibility).
+    /// </summary>
+    [JsonPropertyName("mjpegStreamerEnabled")]
+    public bool MjpegStreamerEnabled { get; set; } = true;
 
     /// <summary>
     /// Duration of LL-HLS partial segments in milliseconds.

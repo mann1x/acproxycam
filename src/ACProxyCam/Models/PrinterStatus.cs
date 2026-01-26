@@ -14,13 +14,20 @@ public class PrinterStatus
     public PrinterState State { get; set; } = PrinterState.Stopped;
     public int ConnectedClients { get; set; }
     public int H264WebSocketClients { get; set; }
+    public int HlsClients { get; set; }
     public bool HlsReady { get; set; }
     public bool IsPaused { get; set; }
 
     // Performance settings
     public int CpuAffinity { get; set; } = -1;
-    public int CurrentFps { get; set; }  // Current target FPS (MaxFps or IdleFps based on clients)
-    public bool IsIdle { get; set; }     // True if running at IdleFps (no clients)
+    public int IncomingH264Fps { get; set; }  // Detected incoming H.264 stream FPS
+    public int JpegQuality { get; set; }      // MJPEG encoding quality (from config)
+
+    // Streamer enable flags (from config)
+    public bool H264StreamerEnabled { get; set; }
+    public bool HlsEnabled { get; set; }
+    public bool LlHlsEnabled { get; set; }
+    public bool MjpegStreamerEnabled { get; set; }
 
     // Detailed status
     public bool IsOnline { get; set; }

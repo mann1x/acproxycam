@@ -1000,8 +1000,7 @@ WantedBy=multi-user.target
             .AddColumn(new TableColumn("[bold purple]ACProxyCam[/]").Centered())
             .AddColumn(new TableColumn("Service").Centered())
             .AddColumn(new TableColumn("Printers").Centered())
-            .AddColumn(new TableColumn("Active").Centered())
-            .AddColumn(new TableColumn("Idling").Centered())
+            .AddColumn(new TableColumn("Running").Centered())
             .AddColumn(new TableColumn("Clients").Centered());
 
         headerTable.AddRow(
@@ -1009,7 +1008,6 @@ WantedBy=multi-user.target
             serviceStatus,
             $"[bold]{status?.PrinterCount ?? 0}[/]",
             $"[green]{status?.ActiveStreamers ?? 0}[/]",
-            $"[grey]{status?.InactiveStreamers ?? 0}[/]",
             $"[cyan]{status?.TotalClients ?? 0}[/]"
         );
 
@@ -1040,8 +1038,8 @@ WantedBy=multi-user.target
                 .AddColumn(new TableColumn("[bold]IP/Hostname[/]"))
                 .AddColumn(new TableColumn("[bold]Port[/]").Centered())
                 .AddColumn(new TableColumn("[bold]Resolution[/]").Centered())
-                .AddColumn(new TableColumn("[bold]FPS[/]").Centered())
-                .AddColumn(new TableColumn("[bold]CPU[/]").Centered())
+                .AddColumn(new TableColumn("[bold]H264 FPS[/]").Centered())
+                .AddColumn(new TableColumn("[bold]MJPEG Qlt[/]").Centered())
                 .AddColumn(new TableColumn("[bold]LED[/]").Centered())
                 .AddColumn(new TableColumn("[bold]Status[/]").Centered())
                 .AddColumn(new TableColumn("[bold]Clients[/]").Centered());
@@ -1062,13 +1060,25 @@ WantedBy=multi-user.target
                     ? $"{p.StreamStatus.Width}x{p.StreamStatus.Height}"
                     : "[grey]-[/]";
 
-                var fpsDisplay = p.IsIdle
-                    ? (p.CurrentFps == 0 ? "[grey]off[/]" : $"[grey]{p.CurrentFps}[/]")
-                    : (p.CurrentFps == 0 ? "[green]max[/]" : $"[green]{p.CurrentFps}[/]");
-                var cpuDisplay = p.CpuAffinity >= 0 ? $"[cyan]{p.CpuAffinity}[/]" : "[grey]-[/]";
-                var clientsDisplay = p.ConnectedClients > 0
-                    ? $"[green]{p.ConnectedClients}[/]"
-                    : "[grey]0[/]";
+                // Incoming H264 FPS (integer)
+                var fpsDisplay = p.IncomingH264Fps > 0
+                    ? $"[green]{p.IncomingH264Fps}[/]"
+                    : "[grey]-[/]";
+
+                // MJPEG Quality (only if MJPEG streamer is enabled)
+                var qualityDisplay = p.MjpegStreamerEnabled
+                    ? $"[cyan]{p.JpegQuality}[/]"
+                    : "[grey]-[/]";
+
+                // Clients per endpoint type
+                var clientParts = new List<string>();
+                if (p.ConnectedClients > 0)
+                    clientParts.Add($"[yellow]M{p.ConnectedClients - p.H264WebSocketClients - p.HlsClients}[/]");
+                if (p.H264WebSocketClients > 0)
+                    clientParts.Add($"[cyan]H{p.H264WebSocketClients}[/]");
+                if (p.HlsClients > 0)
+                    clientParts.Add($"[green]L{p.HlsClients}[/]");
+                var clientsDisplay = clientParts.Count > 0 ? string.Join(" ", clientParts) : "[grey]0[/]";
 
                 // LED status display
                 var ledDisplay = p.CameraLed == null
@@ -1089,7 +1099,7 @@ WantedBy=multi-user.target
                     $"[cyan]{p.MjpegPort}[/]",
                     resolution,
                     fpsDisplay,
-                    cpuDisplay,
+                    qualityDisplay,
                     ledDisplay,
                     $"[{statusColor}]{statusIcon} {p.State}[/]",
                     clientsDisplay
@@ -1333,9 +1343,9 @@ WantedBy=multi-user.target
         var ip = AskValidatedString("Printer IP/hostname:", ValidateIpAddress);
         if (ip == null) return;
 
-        // Get MJPEG port (validated, with retry on conflict)
-        var mjpegPort = await AskPortWithRetryAsync("MJPEG listening port:", 8080, name);
-        if (mjpegPort == null) return;
+        // Get HTTP port (validated, with retry on conflict)
+        var httpPort = await AskPortWithRetryAsync("HTTP port:", 8080, name);
+        if (httpPort == null) return;
 
         // SSH settings
         var sshPort = AskValidatedPort("SSH port:", 22);
@@ -1363,19 +1373,30 @@ WantedBy=multi-user.target
             standbyLedTimeout = AskValidatedInt("Standby LED timeout (minutes):", 1, 1440, 20);
         }
 
-        // Encoding settings (optional, show defaults)
+        // Streamer enable settings
         _ui.WriteLine();
-        _ui.WriteInfo("Encoding settings (press Enter for defaults):");
-        var maxFps = AskValidatedInt("Max FPS (0=unlimited):", 0, 120, 10);
-        var idleFps = AskValidatedInt("Idle FPS (0=disabled):", 0, 30, 1);
-        var jpegQuality = AskValidatedInt("JPEG quality:", 1, 100, 80);
+        var h264Enabled = _ui.Confirm("Enable the H264 Streamer?", true);
+        var hlsEnabled = _ui.Confirm("Enable the HLS Streamer?", true);
+        var llHlsEnabled = hlsEnabled && _ui.Confirm("Enable the LowLatency-HLS Streamer?", true);
+        _ui.WriteLine();
+        var mjpegEnabled = _ui.Confirm("Enable the MJPEG Streamer?", false);
+
+        // MJPEG Encoding settings (only if MJPEG enabled)
+        var maxFps = 15;
+        var jpegQuality = 80;
+        if (mjpegEnabled)
+        {
+            _ui.WriteInfo("MJPEG Encoding settings:");
+            maxFps = AskValidatedInt("Max FPS:", 0, 120, 15);
+            jpegQuality = AskValidatedInt("JPEG quality:", 1, 100, 80);
+        }
 
         // Create printer config
         var config = new PrinterConfig
         {
             Name = name,
             Ip = ip,
-            MjpegPort = mjpegPort.Value,
+            MjpegPort = httpPort.Value,
             SshPort = sshPort.Value,
             SshUser = sshUser,
             SshPassword = sshPassword,
@@ -1383,8 +1404,11 @@ WantedBy=multi-user.target
             AutoLanMode = autoLanMode,
             LedAutoControl = ledAutoControl,
             StandbyLedTimeoutMinutes = standbyLedTimeout,
+            H264StreamerEnabled = h264Enabled,
+            HlsEnabled = hlsEnabled,
+            LlHlsEnabled = llHlsEnabled,
+            MjpegStreamerEnabled = mjpegEnabled,
             MaxFps = maxFps,
-            IdleFps = idleFps,
             JpegQuality = jpegQuality
         };
 
@@ -1408,9 +1432,13 @@ WantedBy=multi-user.target
         if (success)
         {
             _ui.WriteSuccess("Printer added successfully!");
-            _ui.WriteInfo($"MJPEG stream: http://<server>:{mjpegPort}/stream");
-            _ui.WriteInfo($"H.264 WebSocket (Mainsail/Fluidd): ws://<server>:{mjpegPort}/h264");
-            _ui.WriteInfo($"HLS (Home Assistant/browser): http://<server>:{mjpegPort}/hls/playlist.m3u8");
+            _ui.WriteInfo($"HTTP endpoints: http://<server>:{httpPort}/snapshot, /status, /led");
+            if (h264Enabled)
+                _ui.WriteInfo($"H.264 WebSocket: ws://<server>:{httpPort}/h264");
+            if (hlsEnabled)
+                _ui.WriteInfo($"HLS: http://<server>:{httpPort}/hls/playlist.m3u8");
+            if (mjpegEnabled)
+                _ui.WriteInfo($"MJPEG stream: http://<server>:{httpPort}/stream");
         }
         else
         {
@@ -1498,8 +1526,8 @@ WantedBy=multi-user.target
         var ip = AskValidatedString($"IP/hostname [{existingConfig.Ip}]:", ValidateIpAddress, existingConfig.Ip);
         if (ip == null) return;
 
-        var mjpegPort = await AskPortWithRetryAsync($"MJPEG port [{existingConfig.MjpegPort}]:", existingConfig.MjpegPort, originalName, originalPort);
-        if (mjpegPort == null) return;
+        var httpPort = await AskPortWithRetryAsync($"HTTP port [{existingConfig.MjpegPort}]:", existingConfig.MjpegPort, originalName, originalPort);
+        if (httpPort == null) return;
 
         var sshPort = AskValidatedPort($"SSH port [{existingConfig.SshPort}]:", existingConfig.SshPort);
         if (sshPort == null) return;
@@ -1523,25 +1551,39 @@ WantedBy=multi-user.target
             standbyLedTimeout = AskValidatedInt($"Standby LED timeout (minutes) [{existingConfig.StandbyLedTimeoutMinutes}]:", 1, 1440, existingConfig.StandbyLedTimeoutMinutes);
         }
 
-        // Encoding settings
+        // Streamer enable settings
         _ui.WriteLine();
-        _ui.WriteInfo("Encoding settings:");
-        var maxFps = AskValidatedInt($"Max FPS [{existingConfig.MaxFps}]:", 0, 120, existingConfig.MaxFps);
-        var idleFps = AskValidatedInt($"Idle FPS [{existingConfig.IdleFps}]:", 0, 30, existingConfig.IdleFps);
-        var jpegQuality = AskValidatedInt($"JPEG quality [{existingConfig.JpegQuality}]:", 1, 100, existingConfig.JpegQuality);
+        var h264Enabled = _ui.Confirm($"Enable the H264 Streamer [{(existingConfig.H264StreamerEnabled ? "Yes" : "No")}]?", existingConfig.H264StreamerEnabled);
+        var hlsEnabled = _ui.Confirm($"Enable the HLS Streamer [{(existingConfig.HlsEnabled ? "Yes" : "No")}]?", existingConfig.HlsEnabled);
+        var llHlsEnabled = hlsEnabled && _ui.Confirm($"Enable the LowLatency-HLS Streamer [{(existingConfig.LlHlsEnabled ? "Yes" : "No")}]?", existingConfig.LlHlsEnabled);
+        _ui.WriteLine();
+        var mjpegEnabled = _ui.Confirm($"Enable the MJPEG Streamer [{(existingConfig.MjpegStreamerEnabled ? "Yes" : "No")}]?", existingConfig.MjpegStreamerEnabled);
+
+        // MJPEG Encoding settings (only if MJPEG enabled)
+        var maxFps = existingConfig.MaxFps;
+        var jpegQuality = existingConfig.JpegQuality;
+        if (mjpegEnabled)
+        {
+            _ui.WriteInfo("MJPEG Encoding settings:");
+            maxFps = AskValidatedInt($"Max FPS [{existingConfig.MaxFps}]:", 0, 120, existingConfig.MaxFps);
+            jpegQuality = AskValidatedInt($"JPEG quality [{existingConfig.JpegQuality}]:", 1, 100, existingConfig.JpegQuality);
+        }
 
         // Update config
         existingConfig.Name = newName;
         existingConfig.Ip = ip;
-        existingConfig.MjpegPort = mjpegPort.Value;
+        existingConfig.MjpegPort = httpPort.Value;
         existingConfig.SshPort = sshPort.Value;
         existingConfig.SshUser = sshUser;
         existingConfig.MqttPort = mqttPort.Value;
         existingConfig.AutoLanMode = autoLanMode;
         existingConfig.LedAutoControl = ledAutoControl;
         existingConfig.StandbyLedTimeoutMinutes = standbyLedTimeout;
+        existingConfig.H264StreamerEnabled = h264Enabled;
+        existingConfig.HlsEnabled = hlsEnabled;
+        existingConfig.LlHlsEnabled = llHlsEnabled;
+        existingConfig.MjpegStreamerEnabled = mjpegEnabled;
         existingConfig.MaxFps = maxFps;
-        existingConfig.IdleFps = idleFps;
         existingConfig.JpegQuality = jpegQuality;
 
         var (modifySuccess, error) = await _ipcClient.ModifyPrinterAsync(originalName, existingConfig);
@@ -1738,16 +1780,24 @@ WantedBy=multi-user.target
             .AddColumn(new TableColumn($"[bold]{detailedStatus.Name}[/]{deviceTypeDisplay}{positionIndicator}").Centered());
 
         headerTable.AddRow($"[{statusColor}]{statusIcon} {detailedStatus.State}[/]");
-        var clientsDisplay = $"[cyan]{detailedStatus.ConnectedClients}[/] MJPEG";
+
+        // Build client display with breakdown per endpoint type
+        var clientParts = new List<string>();
+        var mjpegOnlyClients = detailedStatus.ConnectedClients - detailedStatus.H264WebSocketClients - detailedStatus.HlsClients;
+        if (mjpegOnlyClients > 0 && detailedStatus.MjpegStreamerEnabled)
+            clientParts.Add($"[yellow]{mjpegOnlyClients}[/] MJPEG");
         if (detailedStatus.H264WebSocketClients > 0)
-        {
-            clientsDisplay += $" [grey]│[/] [cyan]{detailedStatus.H264WebSocketClients}[/] H264";
-        }
-        if (detailedStatus.HlsReady)
-        {
-            clientsDisplay += " [grey]│[/] [green]HLS[/]";
-        }
-        headerTable.AddRow($"[grey]{detailedStatus.Ip}:{detailedStatus.MjpegPort}[/] │ {clientsDisplay} │ [white]{resolution}[/]");
+            clientParts.Add($"[cyan]{detailedStatus.H264WebSocketClients}[/] H264");
+        if (detailedStatus.HlsClients > 0)
+            clientParts.Add($"[green]{detailedStatus.HlsClients}[/] HLS");
+        var clientsDisplay = clientParts.Count > 0 ? string.Join(" [grey]│[/] ", clientParts) : "[grey]0 clients[/]";
+
+        // Add FPS info
+        var fpsDisplay = detailedStatus.IncomingH264Fps > 0
+            ? $"[green]{detailedStatus.IncomingH264Fps}[/] fps"
+            : "[grey]- fps[/]";
+
+        headerTable.AddRow($"[grey]{detailedStatus.Ip}:{detailedStatus.MjpegPort}[/] │ {clientsDisplay} │ {fpsDisplay} │ [white]{resolution}[/]");
 
         AnsiConsole.Write(headerTable);
 
@@ -1757,7 +1807,7 @@ WantedBy=multi-user.target
             .BorderColor(Color.Grey)
             .AddColumn(new TableColumn("[bold]Connection[/]").Width(20))
             .AddColumn(new TableColumn("[bold]Stream[/]").Width(20))
-            .AddColumn(new TableColumn("[bold]Encoding[/]").Width(18))
+            .AddColumn(new TableColumn("[bold]Streamers[/]").Width(18))
             .AddColumn(new TableColumn("[bold]LED[/]").Width(14));
 
         // Connection column
@@ -1772,14 +1822,14 @@ WantedBy=multi-user.target
         var streamStatus = detailedStatus.StreamStatus.Connected ? "[green]●[/] Streaming" : "[grey]○[/] Stopped";
         var framesDecoded = detailedStatus.StreamStatus.FramesDecoded.ToString("N0");
 
-        // Encoding column (from config)
-        var maxFps = configSuccess && printerConfig != null ? printerConfig.MaxFps.ToString() : "-";
-        var idleFps = configSuccess && printerConfig != null ? printerConfig.IdleFps.ToString() : "-";
-        var quality = configSuccess && printerConfig != null ? printerConfig.JpegQuality.ToString() : "-";
-        var stopCmd = configSuccess && printerConfig != null && printerConfig.SendStopCommand ? "[green]Yes[/]" : "[grey]No[/]";
+        // Streamers column (enable status from config/status)
+        var h264Status = detailedStatus.H264StreamerEnabled ? "[green]●[/]" : "[grey]○[/]";
+        var hlsStatus = detailedStatus.HlsEnabled ? "[green]●[/]" : "[grey]○[/]";
+        var llHlsStatus = detailedStatus.LlHlsEnabled ? "[green]●[/]" : "[grey]○[/]";
+        var mjpegStatus = detailedStatus.MjpegStreamerEnabled ? "[green]●[/]" : "[grey]○[/]";
 
         // LED column
-        var ledStatus = detailedStatus.CameraLed == null
+        var ledStatusDisplay = detailedStatus.CameraLed == null
             ? "[grey]?[/]"
             : detailedStatus.CameraLed.IsOn
                 ? $"[yellow]● On[/] ({detailedStatus.CameraLed.Brightness}%)"
@@ -1788,10 +1838,10 @@ WantedBy=multi-user.target
         var ledTimeout = configSuccess && printerConfig != null ? $"{printerConfig.StandbyLedTimeoutMinutes}m" : "-";
 
         // Build rows
-        mainTable.AddRow($"SSH  {sshStatus}", streamStatus, $"Max FPS: {maxFps}", ledStatus);
-        mainTable.AddRow($"MQTT {mqttStatus}", $"Frames: {framesDecoded}", $"Idle: {idleFps}", $"Auto: {ledAuto}");
-        mainTable.AddRow($"Cam  {camStatus}", "", $"Quality: {quality}", $"Timeout: {ledTimeout}");
-        mainTable.AddRow($"LAN  {lanMode}", "", $"Stop: {stopCmd}", "");
+        mainTable.AddRow($"SSH  {sshStatus}", streamStatus, $"H264:  {h264Status}", ledStatusDisplay);
+        mainTable.AddRow($"MQTT {mqttStatus}", $"Frames: {framesDecoded}", $"HLS:   {hlsStatus}", $"Auto: {ledAuto}");
+        mainTable.AddRow($"Cam  {camStatus}", "", $"LL-HLS:{llHlsStatus}", $"Timeout: {ledTimeout}");
+        mainTable.AddRow($"LAN  {lanMode}", "", $"MJPEG: {mjpegStatus}", "");
 
         AnsiConsole.Write(mainTable);
 
@@ -1801,11 +1851,32 @@ WantedBy=multi-user.target
             .BorderColor(Color.Grey)
             .AddColumn(new TableColumn("[bold]Endpoints[/]").LeftAligned());
 
-        urlTable.AddRow($"[bold]MJPEG/HTTP[/] [grey](http://<server>:{detailedStatus.MjpegPort}/)[/]");
-        urlTable.AddRow("[cyan]/stream[/]  [grey]│[/]  [cyan]/snapshot[/]  [grey]│[/]  [cyan]/status[/]  [grey]│[/]  [cyan]/led[/]  [cyan]/led/on[/]  [cyan]/led/off[/]");
-        urlTable.AddRow("");
-        urlTable.AddRow($"[bold]H.264 WebSocket[/] [grey](Mainsail/Fluidd jmuxer)[/]: [cyan]ws://<server>:{detailedStatus.MjpegPort}/h264[/]");
-        urlTable.AddRow($"[bold]HLS[/] [grey](Home Assistant/browser)[/]: [cyan]http://<server>:{detailedStatus.MjpegPort}/hls/playlist.m3u8[/]");
+        // HTTP endpoints (always available)
+        urlTable.AddRow($"[bold]HTTP[/] [grey](http://<server>:{detailedStatus.MjpegPort}/)[/]");
+        urlTable.AddRow("[cyan]/snapshot[/]  [grey]│[/]  [cyan]/status[/]  [grey]│[/]  [cyan]/led[/]  [cyan]/led/on[/]  [cyan]/led/off[/]");
+
+        // Streaming endpoints (only show if enabled)
+        if (detailedStatus.MjpegStreamerEnabled)
+        {
+            urlTable.AddRow("");
+            urlTable.AddRow($"[bold]MJPEG[/] [grey](browser, VLC)[/]: [cyan]http://<server>:{detailedStatus.MjpegPort}/stream[/]");
+        }
+
+        if (detailedStatus.H264StreamerEnabled)
+        {
+            urlTable.AddRow("");
+            urlTable.AddRow($"[bold]H.264 WebSocket[/] [grey](Mainsail/Fluidd jmuxer)[/]: [cyan]ws://<server>:{detailedStatus.MjpegPort}/h264[/]");
+        }
+
+        if (detailedStatus.HlsEnabled)
+        {
+            urlTable.AddRow("");
+            if (detailedStatus.LlHlsEnabled)
+            {
+                urlTable.AddRow($"[bold]HLS/LL-HLS[/] [grey](Home Assistant/hls.js, ~1s latency)[/]: [cyan]http://<server>:{detailedStatus.MjpegPort}/hls/playlist.m3u8[/]");
+            }
+            urlTable.AddRow($"[bold]HLS Legacy[/] [grey](VLC, ffplay)[/]: [cyan]http://<server>:{detailedStatus.MjpegPort}/hls/legacy.m3u8[/]");
+        }
 
         AnsiConsole.Write(urlTable);
 

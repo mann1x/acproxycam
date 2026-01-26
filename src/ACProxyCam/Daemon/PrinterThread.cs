@@ -191,6 +191,11 @@ public class PrinterThread : IDisposable
     {
         lock (_ledStateLock)
         {
+            var mjpegClients = _mjpegServer?.ConnectedClients ?? 0;
+            var h264Clients = _mjpegServer?.H264WebSocketClients ?? 0;
+            var hasExternal = _mjpegServer?.HasExternalStreamingClient == true;
+            var hlsActive = _mjpegServer?.HasHlsActivity == true;
+
             return new PrinterStatus
             {
                 Name = Config.Name,
@@ -198,13 +203,18 @@ public class PrinterThread : IDisposable
                 MjpegPort = Config.MjpegPort,
                 DeviceType = Config.DeviceType,
                 State = _state,
-                ConnectedClients = (_mjpegServer?.ConnectedClients ?? 0) + (_mjpegServer?.H264WebSocketClients ?? 0) + (_mjpegServer?.HasExternalStreamingClient == true ? 1 : 0),
-                H264WebSocketClients = _mjpegServer?.H264WebSocketClients ?? 0,
+                ConnectedClients = mjpegClients + h264Clients + (hasExternal ? 1 : 0) + (hlsActive ? 1 : 0),
+                H264WebSocketClients = h264Clients,
+                HlsClients = hlsActive ? 1 : 0,
                 HlsReady = _mjpegServer?.HlsReady ?? false,
                 IsPaused = _isPaused,
                 CpuAffinity = _cpuAffinity,
-                CurrentFps = ((_mjpegServer?.ConnectedClients ?? 0) > 0 || (_mjpegServer?.H264WebSocketClients ?? 0) > 0 || _mjpegServer?.HasExternalStreamingClient == true) ? Config.MaxFps : Config.IdleFps,
-                IsIdle = (_mjpegServer?.ConnectedClients ?? 0) == 0 && (_mjpegServer?.H264WebSocketClients ?? 0) == 0 && _mjpegServer?.HasExternalStreamingClient != true,
+                IncomingH264Fps = _decoder?.MeasuredFps ?? 0,
+                JpegQuality = Config.JpegQuality,
+                H264StreamerEnabled = Config.H264StreamerEnabled,
+                HlsEnabled = Config.HlsEnabled,
+                LlHlsEnabled = Config.LlHlsEnabled,
+                MjpegStreamerEnabled = Config.MjpegStreamerEnabled,
                 IsOnline = _state == PrinterState.Running,
                 LastError = _lastError,
                 LastErrorAt = _lastErrorAt,

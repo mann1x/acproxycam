@@ -31,6 +31,12 @@ public unsafe class FfmpegDecoder : IDisposable
     private int _staleFrameCount;
     private const int StaleFrameThreshold = 30; // Consider stream stalled after 30 frames with same PTS
 
+    // Incoming H.264 FPS tracking (sliding window)
+    private int _fpsFrameCount;
+    private DateTime _fpsWindowStart = DateTime.MinValue;
+    private int _measuredFps;
+    private const int FpsWindowMs = 1000; // Calculate FPS over 1 second window
+
     public event EventHandler<FrameEventArgs>? FrameDecoded;
     public event EventHandler<string>? StatusChanged;
     public event EventHandler<Exception>? ErrorOccurred;
@@ -74,6 +80,11 @@ public unsafe class FfmpegDecoder : IDisposable
     /// </summary>
     public TimeSpan TimeSinceLastFrame =>
         _lastFrameTime == DateTime.MinValue ? TimeSpan.MaxValue : DateTime.UtcNow - _lastFrameTime;
+
+    /// <summary>
+    /// Measured incoming H.264 stream FPS (calculated over 1 second window).
+    /// </summary>
+    public int MeasuredFps => _measuredFps;
 
     private static bool _ffmpegInitialized;
     private static readonly object _initLock = new();
@@ -308,6 +319,23 @@ public unsafe class FfmpegDecoder : IDisposable
 
                     if (packet->stream_index == _videoStreamIndex)
                     {
+                        // Track incoming H.264 FPS
+                        var now = DateTime.UtcNow;
+                        if (_fpsWindowStart == DateTime.MinValue)
+                        {
+                            _fpsWindowStart = now;
+                            _fpsFrameCount = 0;
+                        }
+                        _fpsFrameCount++;
+
+                        var windowElapsed = (now - _fpsWindowStart).TotalMilliseconds;
+                        if (windowElapsed >= FpsWindowMs)
+                        {
+                            _measuredFps = (int)Math.Round(_fpsFrameCount * 1000.0 / windowElapsed);
+                            _fpsWindowStart = now;
+                            _fpsFrameCount = 0;
+                        }
+
                         // Emit raw packet for RTP streaming before decoding
                         if (RawPacketReceived != null)
                         {
