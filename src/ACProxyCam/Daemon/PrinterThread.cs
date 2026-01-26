@@ -1095,16 +1095,24 @@ public class PrinterThread : IDisposable
                         await ProcessLedAutoControlAsync(ct);
                     }
 
+                    // Update decode state based on whether anyone needs decoded frames
+                    // (MJPEG clients or Obico/Janus streaming need decoded frames; H.264 WS and HLS don't)
+                    var mjpegClients = _mjpegServer?.ConnectedClients ?? 0;
+                    var h264Clients = _mjpegServer?.H264WebSocketClients ?? 0;
+                    var hasExternal = _mjpegServer?.HasExternalStreamingClient ?? false;
+                    var hasHls = _mjpegServer?.HasHlsActivity ?? false;
+                    var needsDecode = mjpegClients > 0 || hasExternal;
+                    if (_decoder != null)
+                    {
+                        _decoder.DecodeEnabled = needsDecode;
+                    }
+
                     // Camera keepalive: resend startCapture to prevent frame rate throttling
                     // Only when there are active consumers (MJPEG, H.264 WebSocket, HLS, or Janus viewers)
                     if (Config.CameraKeepaliveSeconds > 0 &&
                         (DateTime.UtcNow - lastCameraKeepalive).TotalSeconds >= Config.CameraKeepaliveSeconds)
                     {
                         lastCameraKeepalive = DateTime.UtcNow;
-                        var mjpegClients = _mjpegServer?.ConnectedClients ?? 0;
-                        var h264Clients = _mjpegServer?.H264WebSocketClients ?? 0;
-                        var hasExternal = _mjpegServer?.HasExternalStreamingClient ?? false;
-                        var hasHls = _mjpegServer?.HasHlsActivity ?? false;
                         var hasConsumers = mjpegClients > 0 || h264Clients > 0 || hasExternal || hasHls;
 
                         if (hasConsumers)

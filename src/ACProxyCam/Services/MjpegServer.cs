@@ -45,12 +45,21 @@ public class MjpegServer : IDisposable
     // HLS streaming service
     private readonly HlsStreamingService _hlsService;
 
+    // On-demand H.264 keyframe decoder for /snapshot2
+    private readonly H264SnapshotDecoder _snapshotDecoder;
+    private byte[]? _cachedSnapshotJpeg;
+    private byte[]? _cachedSnapshotKeyframeSource; // Track which keyframe was used
+    private DateTime _lastSnapshotDecodeTime = DateTime.MinValue;
+    private readonly object _snapshotCacheLock = new();
+    private const int SnapshotMaxFps = 10; // Max 10 decodes per second
+
     public event EventHandler<string>? StatusChanged;
 
     public MjpegServer()
     {
         _hlsService = new HlsStreamingService();
         _hlsService.StatusChanged += (s, msg) => StatusChanged?.Invoke(this, msg);
+        _snapshotDecoder = new H264SnapshotDecoder();
     }
     public event EventHandler<Exception>? ErrorOccurred;
     /// <summary>
@@ -219,7 +228,7 @@ public class MjpegServer : IDisposable
 
     public void PushH264Packet(byte[] data, bool isKeyframe, long pts = 0)
     {
-        // Push to HLS streaming service
+        // Always push to HLS so segments are ready when clients connect
         try
         {
             _hlsService.PushH264Packet(data, isKeyframe, pts);
@@ -229,23 +238,17 @@ public class MjpegServer : IDisposable
             // Ignore HLS errors
         }
 
-        List<H264WebSocketClient> clients;
-        lock (_h264ClientLock)
-        {
-            if (_h264Clients.Count == 0) return;
-            clients = _h264Clients.ToList();
-        }
+        // Parse NAL units ONCE from AVCC format
+        var nalUnits = ParseNalUnits(data, _nalLengthSize);
 
+        // Update diagnostics
         _h264PacketCount++;
         if (isKeyframe) _h264KeyframeCount++;
         else _h264NonKeyframeCount++;
 
-        // Parse NAL units from AVCC format
-        var nalUnits = ParseNalUnits(data, _nalLengthSize);
         if (nalUnits.Count == 0)
         {
             _h264ParseFailCount++;
-            // Log first few bytes to diagnose format issues
             if (_h264ParseFailCount <= 3)
             {
                 var preview = data.Length >= 8
@@ -256,12 +259,10 @@ public class MjpegServer : IDisposable
             return;
         }
 
-        // Track NAL types for diagnostics
-        var currentNalTypes = nalUnits.Select(n => n.Length > 0 ? (n[0] & 0x1F) : 0).ToList();
-
         // Log diagnostics every 30 seconds
         if ((DateTime.UtcNow - _lastH264DiagLog).TotalSeconds >= 30)
         {
+            var currentNalTypes = nalUnits.Select(n => n.Length > 0 ? (n[0] & 0x1F) : 0).ToList();
             var nalTypeSummary = string.Join(",", currentNalTypes);
             var frameSize = nalUnits.Sum(n => n.Length);
             StatusChanged?.Invoke(this, $"H.264 stats: pkts={_h264PacketCount} key={_h264KeyframeCount} nonKey={_h264NonKeyframeCount} fail={_h264ParseFailCount}, nalSize={_nalLengthSize}, lastFrame=[{nalTypeSummary}] {frameSize}B");
@@ -272,8 +273,20 @@ public class MjpegServer : IDisposable
             _lastH264DiagLog = DateTime.UtcNow;
         }
 
-        // Build complete frame with Annex B format (all NAL units with start codes)
-        // jmuxer expects complete access units in each message
+        // Check if we need Annex B frame (for keyframe caching or WebSocket clients)
+        List<H264WebSocketClient>? wsClients = null;
+        lock (_h264ClientLock)
+        {
+            if (_h264Clients.Count > 0)
+                wsClients = _h264Clients.ToList();
+        }
+
+        // Only build Annex B frame if needed (keyframe for snapshot, or WebSocket clients)
+        bool needsAnnexB = isKeyframe || wsClients != null;
+        if (!needsAnnexB)
+            return;
+
+        // Build Annex B frame ONCE
         using var ms = new System.IO.MemoryStream();
 
         // Add SPS/PPS before keyframes
@@ -285,7 +298,7 @@ public class MjpegServer : IDisposable
             ms.Write(_ppsNal, 0, _ppsNal.Length);
         }
 
-        // Add all NAL units from this frame
+        // Add all NAL units
         foreach (var nal in nalUnits)
         {
             ms.Write(H264StartCode, 0, H264StartCode.Length);
@@ -294,7 +307,7 @@ public class MjpegServer : IDisposable
 
         var frameData = ms.ToArray();
 
-        // Cache keyframe for new clients (they need a keyframe to start decoding)
+        // Cache keyframe for /snapshot endpoint
         if (isKeyframe)
         {
             lock (_keyframeLock)
@@ -303,16 +316,19 @@ public class MjpegServer : IDisposable
             }
         }
 
-        // Send complete frame to all clients
-        foreach (var client in clients)
+        // Send to WebSocket clients
+        if (wsClients != null)
         {
-            try
+            foreach (var client in wsClients)
             {
-                client.SendBinaryFrame(frameData);
-            }
-            catch
-            {
-                RemoveH264Client(client);
+                try
+                {
+                    client.SendBinaryFrame(frameData);
+                }
+                catch
+                {
+                    RemoveH264Client(client);
+                }
             }
         }
     }
@@ -910,26 +926,67 @@ public class MjpegServer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Handle /snapshot request - decodes H.264 keyframe on-demand to JPEG.
+    /// This avoids continuous MJPEG encoding, saving CPU.
+    /// Rate-limited to 10fps max - multiple concurrent requests share the same decoded frame.
+    /// </summary>
     private void HandleSnapshotRequest(ClientConnection client)
     {
-        byte[]? frame;
-        lock (_frameLock)
+        // Get the cached keyframe (Annex B format with SPS/PPS)
+        byte[]? keyframeData;
+        lock (_keyframeLock)
         {
-            frame = _lastJpegFrame;
+            keyframeData = _lastKeyframe;
         }
 
-        if (frame == null)
+        if (keyframeData == null)
         {
-            // Notify that a snapshot was requested but no frame available
-            // This allows the owner to try to restart the camera
+            // No keyframe available yet
             SnapshotRequested?.Invoke(this, EventArgs.Empty);
             SendServiceUnavailable(client);
             return;
         }
 
+        byte[]? jpegData;
+
+        lock (_snapshotCacheLock)
+        {
+            var now = DateTime.UtcNow;
+            var minInterval = TimeSpan.FromSeconds(1.0 / SnapshotMaxFps);
+            var cacheValid = _cachedSnapshotJpeg != null &&
+                             (now - _lastSnapshotDecodeTime) < minInterval &&
+                             ReferenceEquals(_cachedSnapshotKeyframeSource, keyframeData);
+
+            if (cacheValid)
+            {
+                // Use cached JPEG - rate limited
+                jpegData = _cachedSnapshotJpeg;
+            }
+            else
+            {
+                // Need to decode - either cache expired or keyframe changed
+                _snapshotDecoder.JpegQuality = JpegQuality;
+                jpegData = _snapshotDecoder.DecodeKeyframeToJpeg(keyframeData);
+
+                if (jpegData != null)
+                {
+                    _cachedSnapshotJpeg = jpegData;
+                    _cachedSnapshotKeyframeSource = keyframeData;
+                    _lastSnapshotDecodeTime = now;
+                }
+            }
+        }
+
+        if (jpegData == null)
+        {
+            SendError(client, 500, "Failed to decode keyframe");
+            return;
+        }
+
         var header = "HTTP/1.1 200 OK\r\n" +
                      "Content-Type: image/jpeg\r\n" +
-                     $"Content-Length: {frame.Length}\r\n" +
+                     $"Content-Length: {jpegData.Length}\r\n" +
                      "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
                      "Pragma: no-cache\r\n" +
                      "Expires: 0\r\n" +
@@ -938,7 +995,7 @@ public class MjpegServer : IDisposable
                      "\r\n";
 
         client.TrySend(Encoding.ASCII.GetBytes(header));
-        client.TrySend(frame);
+        client.TrySend(jpegData);
         client.Dispose();
     }
 
@@ -1729,6 +1786,7 @@ public class MjpegServer : IDisposable
 
         Stop();
         _hlsService.Dispose();
+        _snapshotDecoder.Dispose();
         GC.SuppressFinalize(this);
     }
 

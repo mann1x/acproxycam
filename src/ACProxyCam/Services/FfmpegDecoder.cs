@@ -52,6 +52,12 @@ public unsafe class FfmpegDecoder : IDisposable
     public int FramesDecoded { get; private set; }
 
     /// <summary>
+    /// When false, skips CPU-intensive H.264 decode (but still emits RawPacketReceived).
+    /// Set to false when no MJPEG clients need decoded frames.
+    /// </summary>
+    public bool DecodeEnabled { get; set; } = true;
+
+    /// <summary>
     /// H.264 extradata (contains SPS and PPS in AVCC format).
     /// Available after stream opens.
     /// </summary>
@@ -327,7 +333,16 @@ public unsafe class FfmpegDecoder : IDisposable
                             RawPacketReceived?.Invoke(this, new RawPacketEventArgs(packetData, isKeyframe, ptsMs, dtsMs));
                         }
 
-                        DecodePacket(packet);
+                        // Only decode if enabled (skip CPU-intensive decode when no MJPEG clients)
+                        if (DecodeEnabled)
+                        {
+                            DecodePacket(packet);
+                        }
+                        else
+                        {
+                            // Still update timing to prevent stall detection when decode is disabled
+                            _lastFrameTime = DateTime.UtcNow;
+                        }
                     }
 
                     ffmpeg.av_packet_unref(packet);
