@@ -130,6 +130,32 @@ public class PrinterConfig
     public bool CameraEnabled { get; set; } = true;
 
     /// <summary>
+    /// Enable Low-Latency HLS (LL-HLS) streaming. Reduces latency from ~4-5s to ~1-2s.
+    /// Requires HLS v10 compatible player (Safari, hls.js). Falls back gracefully.
+    /// Default: true.
+    /// </summary>
+    [JsonPropertyName("llHlsEnabled")]
+    public bool LlHlsEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Duration of LL-HLS partial segments in milliseconds.
+    /// Smaller values = lower latency but more requests.
+    /// Recommended range: 100-500ms. Default: 200ms (Apple recommendation).
+    /// </summary>
+    [JsonPropertyName("hlsPartDurationMs")]
+    public int HlsPartDurationMs { get; set; } = 200;
+
+    /// <summary>
+    /// Interval in seconds to resend camera start command to prevent frame rate throttling.
+    /// Anycubic cameras may throttle frame rate after some time without MQTT activity.
+    /// Set to 20-30 seconds to attempt maintaining full frame rate. Default: 0 (disabled).
+    /// Only sends keepalive when there are active stream consumers (HLS/MJPEG clients).
+    /// Note: Effectiveness depends on printer firmware. May not work on all models.
+    /// </summary>
+    [JsonPropertyName("cameraKeepaliveSeconds")]
+    public int CameraKeepaliveSeconds { get; set; } = 0;
+
+    /// <summary>
     /// Per-printer Obico integration settings.
     /// </summary>
     [JsonPropertyName("obico")]

@@ -1,8 +1,10 @@
 // MjpegServer.cs - MJPEG streaming server for Linux
+// Also provides WebSocket H.264 streaming for Mainsail/Fluidd jmuxer
 // Uses SkiaSharp for cross-platform JPEG encoding
 
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using ACProxyCam.Models;
@@ -11,13 +13,16 @@ using SkiaSharp;
 namespace ACProxyCam.Services;
 
 /// <summary>
-/// HTTP server providing MJPEG streaming and snapshot endpoints.
+/// HTTP server providing MJPEG streaming, snapshot, and WebSocket H.264 endpoints.
+/// WebSocket H.264 (/h264) is for Mainsail/Fluidd jmuxer - zero CPU, no transcoding.
 /// </summary>
 public class MjpegServer : IDisposable
 {
     private readonly List<TcpListener> _listeners = new();
     private readonly List<ClientConnection> _clients = new();
+    private readonly List<H264WebSocketClient> _h264Clients = new();
     private readonly object _clientLock = new();
+    private readonly object _h264ClientLock = new();
     private CancellationTokenSource? _cts;
     private Thread? _acceptThread;
     private bool _disposed;
@@ -29,7 +34,24 @@ public class MjpegServer : IDisposable
     private DateTime _lastEncodeTime = DateTime.MinValue;
     private int _framesSkipped;
 
+    // H.264 state for WebSocket streaming
+    private byte[]? _spsNal;
+    private byte[]? _ppsNal;
+    private int _nalLengthSize = 4; // AVCC NAL unit length size (1-4 bytes, typically 4)
+    private byte[]? _lastKeyframe; // Cache last keyframe for new clients
+    private readonly object _keyframeLock = new();
+    private static readonly byte[] H264StartCode = { 0x00, 0x00, 0x00, 0x01 };
+
+    // HLS streaming service
+    private readonly HlsStreamingService _hlsService;
+
     public event EventHandler<string>? StatusChanged;
+
+    public MjpegServer()
+    {
+        _hlsService = new HlsStreamingService();
+        _hlsService.StatusChanged += (s, msg) => StatusChanged?.Invoke(this, msg);
+    }
     public event EventHandler<Exception>? ErrorOccurred;
     /// <summary>
     /// Raised when a snapshot is requested but no frame is available.
@@ -40,16 +62,34 @@ public class MjpegServer : IDisposable
     public int Port { get; private set; }
     public List<IPAddress> BindAddresses { get; private set; } = new();
     public bool IsRunning { get; private set; }
+    /// <summary>
+    /// Number of connected MJPEG streaming clients.
+    /// </summary>
     public int ConnectedClients
     {
         get
         {
             lock (_clientLock)
             {
-                return _clients.Count;
+                return _clients.Count(c => c.IsStreaming);
             }
         }
     }
+
+    /// <summary>
+    /// Number of connected H.264 WebSocket clients.
+    /// </summary>
+    public int H264WebSocketClients
+    {
+        get
+        {
+            lock (_h264ClientLock)
+            {
+                return _h264Clients.Count;
+            }
+        }
+    }
+
     public int JpegQuality { get; set; } = 80;
 
     /// <summary>
@@ -67,6 +107,46 @@ public class MjpegServer : IDisposable
     /// When true, frames are encoded at MaxFps even if no HTTP clients are connected.
     /// </summary>
     public bool HasExternalStreamingClient { get; set; } = false;
+
+    /// <summary>
+    /// Last time an HLS request was made (playlist, segment, or part).
+    /// Used to determine if HLS clients are active.
+    /// </summary>
+    private volatile bool _hlsActivityFlag = false;
+    private DateTime _hlsActivityExpiry = DateTime.MinValue;
+    private readonly object _hlsActivityLock = new();
+
+    /// <summary>
+    /// Whether there has been recent HLS activity (within last 5 seconds).
+    /// </summary>
+    public bool HasHlsActivity
+    {
+        get
+        {
+            if (!_hlsActivityFlag) return false;
+            lock (_hlsActivityLock)
+            {
+                if (DateTime.UtcNow > _hlsActivityExpiry)
+                {
+                    _hlsActivityFlag = false;
+                    return false;
+                }
+                return true;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Mark HLS activity to trigger full frame rate encoding.
+    /// </summary>
+    private void MarkHlsActivity()
+    {
+        lock (_hlsActivityLock)
+        {
+            _hlsActivityExpiry = DateTime.UtcNow.AddSeconds(5);
+            _hlsActivityFlag = true;
+        }
+    }
 
     /// <summary>
     /// Callback to get current LED status. Returns null if not available.
@@ -87,6 +167,270 @@ public class MjpegServer : IDisposable
         lock (_frameLock)
         {
             return _lastJpegFrame;
+        }
+    }
+
+    /// <summary>
+    /// Whether HLS streaming is ready (has segments available).
+    /// </summary>
+    public bool HlsReady => _hlsService.IsReady;
+
+    /// <summary>
+    /// Whether LL-HLS is enabled.
+    /// </summary>
+    public bool LlHlsEnabled => _hlsService.LlHlsEnabled;
+
+    /// <summary>
+    /// Configure LL-HLS settings.
+    /// </summary>
+    /// <param name="enabled">Enable LL-HLS partial segments</param>
+    /// <param name="partDurationMs">Part duration in milliseconds (100-500)</param>
+    public void ConfigureLlHls(bool enabled, int partDurationMs = 200)
+    {
+        _hlsService.ConfigureLlHls(enabled, partDurationMs);
+    }
+
+    /// <summary>
+    /// Set H.264 SPS/PPS NAL units (extracted from decoder extradata).
+    /// Must be called before H.264 streaming starts.
+    /// </summary>
+    /// <param name="sps">SPS NAL unit</param>
+    /// <param name="pps">PPS NAL unit</param>
+    /// <param name="nalLengthSize">AVCC NAL unit length size (1-4 bytes, from extradata byte 4 lower 2 bits + 1)</param>
+    public void SetH264Parameters(byte[]? sps, byte[]? pps, int nalLengthSize = 4)
+    {
+        _spsNal = sps;
+        _ppsNal = pps;
+        _nalLengthSize = nalLengthSize >= 1 && nalLengthSize <= 4 ? nalLengthSize : 4;
+        _hlsService.SetH264Parameters(sps, pps, nalLengthSize);
+    }
+
+    /// <summary>
+    /// Push an H.264 packet to all connected WebSocket and HLS clients.
+    /// Called by PrinterThread when raw H.264 packet is received from decoder.
+    /// Data is in AVCC format (length-prefixed NAL units).
+    /// </summary>
+    // H.264 diagnostic counters
+    private int _h264PacketCount;
+    private int _h264KeyframeCount;
+    private int _h264NonKeyframeCount;
+    private int _h264ParseFailCount;
+    private DateTime _lastH264DiagLog = DateTime.MinValue;
+
+    public void PushH264Packet(byte[] data, bool isKeyframe, long pts = 0)
+    {
+        // Push to HLS streaming service
+        try
+        {
+            _hlsService.PushH264Packet(data, isKeyframe, pts);
+        }
+        catch
+        {
+            // Ignore HLS errors
+        }
+
+        List<H264WebSocketClient> clients;
+        lock (_h264ClientLock)
+        {
+            if (_h264Clients.Count == 0) return;
+            clients = _h264Clients.ToList();
+        }
+
+        _h264PacketCount++;
+        if (isKeyframe) _h264KeyframeCount++;
+        else _h264NonKeyframeCount++;
+
+        // Parse NAL units from AVCC format
+        var nalUnits = ParseNalUnits(data, _nalLengthSize);
+        if (nalUnits.Count == 0)
+        {
+            _h264ParseFailCount++;
+            // Log first few bytes to diagnose format issues
+            if (_h264ParseFailCount <= 3)
+            {
+                var preview = data.Length >= 8
+                    ? $"{data[0]:X2} {data[1]:X2} {data[2]:X2} {data[3]:X2} {data[4]:X2} {data[5]:X2} {data[6]:X2} {data[7]:X2}"
+                    : BitConverter.ToString(data);
+                StatusChanged?.Invoke(this, $"H.264 parse failed: len={data.Length}, key={isKeyframe}, bytes=[{preview}]");
+            }
+            return;
+        }
+
+        // Track NAL types for diagnostics
+        var currentNalTypes = nalUnits.Select(n => n.Length > 0 ? (n[0] & 0x1F) : 0).ToList();
+
+        // Log diagnostics every 30 seconds
+        if ((DateTime.UtcNow - _lastH264DiagLog).TotalSeconds >= 30)
+        {
+            var nalTypeSummary = string.Join(",", currentNalTypes);
+            var frameSize = nalUnits.Sum(n => n.Length);
+            StatusChanged?.Invoke(this, $"H.264 stats: pkts={_h264PacketCount} key={_h264KeyframeCount} nonKey={_h264NonKeyframeCount} fail={_h264ParseFailCount}, nalSize={_nalLengthSize}, lastFrame=[{nalTypeSummary}] {frameSize}B");
+            _h264PacketCount = 0;
+            _h264KeyframeCount = 0;
+            _h264NonKeyframeCount = 0;
+            _h264ParseFailCount = 0;
+            _lastH264DiagLog = DateTime.UtcNow;
+        }
+
+        // Build complete frame with Annex B format (all NAL units with start codes)
+        // jmuxer expects complete access units in each message
+        using var ms = new System.IO.MemoryStream();
+
+        // Add SPS/PPS before keyframes
+        if (isKeyframe && _spsNal != null && _ppsNal != null)
+        {
+            ms.Write(H264StartCode, 0, H264StartCode.Length);
+            ms.Write(_spsNal, 0, _spsNal.Length);
+            ms.Write(H264StartCode, 0, H264StartCode.Length);
+            ms.Write(_ppsNal, 0, _ppsNal.Length);
+        }
+
+        // Add all NAL units from this frame
+        foreach (var nal in nalUnits)
+        {
+            ms.Write(H264StartCode, 0, H264StartCode.Length);
+            ms.Write(nal, 0, nal.Length);
+        }
+
+        var frameData = ms.ToArray();
+
+        // Cache keyframe for new clients (they need a keyframe to start decoding)
+        if (isKeyframe)
+        {
+            lock (_keyframeLock)
+            {
+                _lastKeyframe = frameData;
+            }
+        }
+
+        // Send complete frame to all clients
+        foreach (var client in clients)
+        {
+            try
+            {
+                client.SendBinaryFrame(frameData);
+            }
+            catch
+            {
+                RemoveH264Client(client);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Parse NAL units from AVCC format (length-prefixed).
+    /// FFmpeg outputs AVCC format for FLV/MP4 containers.
+    /// </summary>
+    /// <param name="data">Raw packet data</param>
+    /// <param name="nalLengthSize">AVCC NAL unit length prefix size (1-4 bytes)</param>
+    private static List<byte[]> ParseNalUnits(byte[] data, int nalLengthSize)
+    {
+        var nalUnits = new List<byte[]>();
+
+        if (data.Length < nalLengthSize)
+        {
+            return nalUnits;
+        }
+
+        // FFmpeg always outputs AVCC format for FLV streams, so use length-prefixed parsing
+        // Don't try to detect Annex B - it causes false positives when NAL length is 256-511
+        bool isAnnexB = false;
+
+        if (isAnnexB)
+        {
+            // Parse Annex B (start code separated)
+            int i = 0;
+            while (i < data.Length)
+            {
+                int startCodeLen = 0;
+                if (i + 2 < data.Length && data[i] == 0 && data[i + 1] == 0)
+                {
+                    if (data[i + 2] == 1) startCodeLen = 3;
+                    else if (i + 3 < data.Length && data[i + 2] == 0 && data[i + 3] == 1) startCodeLen = 4;
+                }
+
+                if (startCodeLen == 0) { i++; continue; }
+
+                int nalStart = i + startCodeLen;
+                i = nalStart;
+
+                int nalEnd = data.Length;
+                while (i < data.Length - 2)
+                {
+                    if (data[i] == 0 && data[i + 1] == 0 &&
+                        (data[i + 2] == 1 || (i + 3 < data.Length && data[i + 2] == 0 && data[i + 3] == 1)))
+                    {
+                        nalEnd = i;
+                        break;
+                    }
+                    i++;
+                }
+
+                if (nalEnd > nalStart)
+                {
+                    var nal = new byte[nalEnd - nalStart];
+                    Array.Copy(data, nalStart, nal, 0, nal.Length);
+                    nalUnits.Add(nal);
+                }
+            }
+        }
+        else
+        {
+            // Parse AVCC (variable-length big-endian length prefix)
+            int offset = 0;
+            while (offset + nalLengthSize <= data.Length)
+            {
+                // Read NAL length based on configured size
+                int nalLength = 0;
+                for (int i = 0; i < nalLengthSize; i++)
+                {
+                    nalLength = (nalLength << 8) | data[offset + i];
+                }
+                offset += nalLengthSize;
+
+                if (nalLength <= 0 || nalLength > data.Length - offset) break;
+
+                var nal = new byte[nalLength];
+                Array.Copy(data, offset, nal, 0, nalLength);
+                nalUnits.Add(nal);
+                offset += nalLength;
+            }
+        }
+
+        return nalUnits;
+    }
+
+    private void SendH264NalUnit(H264WebSocketClient client, byte[] nal)
+    {
+        try
+        {
+            // Send NAL unit with Annex B start code as binary WebSocket frame
+            var payload = new byte[H264StartCode.Length + nal.Length];
+            Array.Copy(H264StartCode, 0, payload, 0, H264StartCode.Length);
+            Array.Copy(nal, 0, payload, H264StartCode.Length, nal.Length);
+
+            client.SendBinaryFrame(payload);
+        }
+        catch
+        {
+            // Remove failed client
+            RemoveH264Client(client);
+        }
+    }
+
+    private void RemoveH264Client(H264WebSocketClient client)
+    {
+        bool removed;
+        int remaining;
+        lock (_h264ClientLock)
+        {
+            removed = _h264Clients.Remove(client);
+            remaining = _h264Clients.Count;
+        }
+        if (removed)
+        {
+            client.Dispose();
+            StatusChanged?.Invoke(this, $"H.264 WebSocket client disconnected (total: {remaining})");
         }
     }
 
@@ -166,6 +510,7 @@ public class MjpegServer : IDisposable
 
         IsRunning = false;
 
+        // Dispose MJPEG clients
         lock (_clientLock)
         {
             foreach (var client in _clients.ToList())
@@ -173,6 +518,16 @@ public class MjpegServer : IDisposable
                 client.Dispose();
             }
             _clients.Clear();
+        }
+
+        // Dispose H.264 WebSocket clients
+        lock (_h264ClientLock)
+        {
+            foreach (var client in _h264Clients.ToList())
+            {
+                client.Dispose();
+            }
+            _h264Clients.Clear();
         }
 
         _acceptThread?.Join(2000);
@@ -191,7 +546,7 @@ public class MjpegServer : IDisposable
         try
         {
             var now = DateTime.UtcNow;
-            var hasClients = ConnectedClients > 0 || HasExternalStreamingClient;
+            var hasClients = ConnectedClients > 0 || HasExternalStreamingClient || HasHlsActivity;
 
             // Determine target FPS based on whether clients are connected
             // (includes HTTP clients and external streaming clients like Obico/Janus)
@@ -423,7 +778,15 @@ public class MjpegServer : IDisposable
                 return;
             }
 
-            var (path, method, body) = ParseRequest(request);
+            var (path, method, body, queryParams) = ParseRequest(request);
+
+            // Check for WebSocket upgrade on /h264 endpoint
+            if (path.Equals("/h264", StringComparison.OrdinalIgnoreCase) &&
+                request.Contains("Upgrade: websocket", StringComparison.OrdinalIgnoreCase))
+            {
+                HandleH264WebSocketUpgrade(client, request);
+                return;
+            }
 
             switch (path.ToLowerInvariant())
             {
@@ -436,6 +799,11 @@ public class MjpegServer : IDisposable
                 case "/snap":
                 case "/image":
                     HandleSnapshotRequest(client);
+                    break;
+
+                case "/h264":
+                    // Non-WebSocket request to /h264 - return info
+                    HandleH264InfoRequest(client);
                     break;
 
                 case "/status":
@@ -454,7 +822,39 @@ public class MjpegServer : IDisposable
                     HandleLedOffRequest(client, method);
                     break;
 
+                case "/hls/playlist.m3u8":
+                    HandleHlsPlaylistRequestAsync(client, queryParams);
+                    break;
+
+                case "/hls/legacy.m3u8":
+                    HandleHlsLegacyPlaylistRequest(client);
+                    break;
+
                 default:
+                    // Handle HLS partial segment requests (LL-HLS)
+                    if (path.StartsWith("/hls/part", StringComparison.OrdinalIgnoreCase) &&
+                        path.EndsWith(".ts", StringComparison.OrdinalIgnoreCase))
+                    {
+                        HandleHlsPartRequest(client, path);
+                        break;
+                    }
+
+                    // Handle legacy HLS segment requests (with PTS adjustment for VLC)
+                    if (path.StartsWith("/hls/legacy-segment", StringComparison.OrdinalIgnoreCase) &&
+                        path.EndsWith(".ts", StringComparison.OrdinalIgnoreCase))
+                    {
+                        HandleHlsLegacySegmentRequest(client, path);
+                        break;
+                    }
+
+                    // Handle HLS full segment requests
+                    if (path.StartsWith("/hls/segment", StringComparison.OrdinalIgnoreCase) &&
+                        path.EndsWith(".ts", StringComparison.OrdinalIgnoreCase))
+                    {
+                        HandleHlsSegmentRequest(client, path);
+                        break;
+                    }
+
                     // Default to stream for root path
                     if (path == "/" || path == "")
                         HandleStreamRequest(client);
@@ -530,7 +930,9 @@ public class MjpegServer : IDisposable
         var header = "HTTP/1.1 200 OK\r\n" +
                      "Content-Type: image/jpeg\r\n" +
                      $"Content-Length: {frame.Length}\r\n" +
-                     "Cache-Control: no-cache\r\n" +
+                     "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                     "Pragma: no-cache\r\n" +
+                     "Expires: 0\r\n" +
                      "Access-Control-Allow-Origin: *\r\n" +
                      "Connection: close\r\n" +
                      "\r\n";
@@ -561,6 +963,10 @@ public class MjpegServer : IDisposable
         var header = "HTTP/1.1 200 OK\r\n" +
                      "Content-Type: application/json\r\n" +
                      $"Content-Length: {body.Length}\r\n" +
+                     "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                     "Pragma: no-cache\r\n" +
+                     "Expires: 0\r\n" +
+                     "Access-Control-Allow-Origin: *\r\n" +
                      "Connection: close\r\n" +
                      "\r\n";
 
@@ -589,6 +995,8 @@ public class MjpegServer : IDisposable
         var header = "HTTP/1.1 404 Not Found\r\n" +
                      "Content-Type: text/plain\r\n" +
                      $"Content-Length: {body.Length}\r\n" +
+                     "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                     "Access-Control-Allow-Origin: *\r\n" +
                      "Connection: close\r\n" +
                      "\r\n";
 
@@ -602,6 +1010,8 @@ public class MjpegServer : IDisposable
         var header = "HTTP/1.1 503 Service Unavailable\r\n" +
                      "Content-Type: text/plain\r\n" +
                      $"Content-Length: {body.Length}\r\n" +
+                     "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                     "Access-Control-Allow-Origin: *\r\n" +
                      "Connection: close\r\n" +
                      "\r\n";
 
@@ -794,6 +1204,9 @@ public class MjpegServer : IDisposable
         var header = "HTTP/1.1 200 OK\r\n" +
                      "Content-Type: application/json\r\n" +
                      $"Content-Length: {bodyBytes.Length}\r\n" +
+                     "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                     "Pragma: no-cache\r\n" +
+                     "Expires: 0\r\n" +
                      "Access-Control-Allow-Origin: *\r\n" +
                      "Connection: close\r\n" +
                      "\r\n";
@@ -835,6 +1248,9 @@ public class MjpegServer : IDisposable
         var header = $"HTTP/1.1 {statusCode} {statusText}\r\n" +
                      "Content-Type: application/json\r\n" +
                      $"Content-Length: {bodyBytes.Length}\r\n" +
+                     "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                     "Pragma: no-cache\r\n" +
+                     "Expires: 0\r\n" +
                      "Access-Control-Allow-Origin: *\r\n" +
                      "Connection: close\r\n" +
                      "\r\n";
@@ -846,24 +1262,47 @@ public class MjpegServer : IDisposable
 
     private static string ParseRequestPath(string request)
     {
-        var (path, _, _) = ParseRequest(request);
+        var (path, _, _, _) = ParseRequest(request);
         return path;
     }
 
-    private static (string Path, string Method, string? Body) ParseRequest(string request)
+    private static (string Path, string Method, string? Body, Dictionary<string, string> QueryParams) ParseRequest(string request)
     {
-        // Parse "GET /path HTTP/1.1"
+        // Parse "GET /path?query=params HTTP/1.1"
         var lines = request.Split('\n');
-        if (lines.Length == 0) return ("/", "GET", null);
+        if (lines.Length == 0) return ("/", "GET", null, new Dictionary<string, string>());
 
         var parts = lines[0].Split(' ');
-        if (parts.Length < 2) return ("/", "GET", null);
+        if (parts.Length < 2) return ("/", "GET", null, new Dictionary<string, string>());
 
         var method = parts[0].ToUpperInvariant();
-        var path = parts[1];
-        var queryIndex = path.IndexOf('?');
+        var fullPath = parts[1];
+        var path = fullPath;
+        var queryParams = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        // Extract query string
+        var queryIndex = fullPath.IndexOf('?');
         if (queryIndex >= 0)
-            path = path.Substring(0, queryIndex);
+        {
+            path = fullPath.Substring(0, queryIndex);
+            var queryString = fullPath.Substring(queryIndex + 1);
+
+            // Parse query parameters
+            foreach (var param in queryString.Split('&'))
+            {
+                var eqIndex = param.IndexOf('=');
+                if (eqIndex > 0)
+                {
+                    var key = Uri.UnescapeDataString(param.Substring(0, eqIndex));
+                    var value = Uri.UnescapeDataString(param.Substring(eqIndex + 1));
+                    queryParams[key] = value;
+                }
+                else if (param.Length > 0)
+                {
+                    queryParams[Uri.UnescapeDataString(param)] = "";
+                }
+            }
+        }
 
         // Extract body (after empty line)
         string? body = null;
@@ -881,8 +1320,405 @@ public class MjpegServer : IDisposable
             }
         }
 
-        return (path, method, body);
+        return (path, method, body, queryParams);
     }
+
+    /// <summary>
+    /// Handle WebSocket upgrade request for H.264 streaming.
+    /// Performs WebSocket handshake and adds client to H.264 client list.
+    /// </summary>
+    private void HandleH264WebSocketUpgrade(ClientConnection client, string request)
+    {
+        try
+        {
+            // Extract Sec-WebSocket-Key from request headers
+            string? webSocketKey = null;
+            var lines = request.Split('\n');
+            foreach (var line in lines)
+            {
+                if (line.StartsWith("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase))
+                {
+                    webSocketKey = line.Substring(18).Trim();
+                    break;
+                }
+            }
+
+            if (string.IsNullOrEmpty(webSocketKey))
+            {
+                SendBadRequest(client, "Missing Sec-WebSocket-Key header");
+                return;
+            }
+
+            // Compute accept key per RFC 6455
+            var acceptKey = ComputeWebSocketAcceptKey(webSocketKey);
+
+            // Send WebSocket handshake response
+            var response = "HTTP/1.1 101 Switching Protocols\r\n" +
+                          "Upgrade: websocket\r\n" +
+                          "Connection: Upgrade\r\n" +
+                          $"Sec-WebSocket-Accept: {acceptKey}\r\n" +
+                          "Access-Control-Allow-Origin: *\r\n" +
+                          "\r\n";
+
+            if (!client.TrySend(Encoding.ASCII.GetBytes(response)))
+            {
+                client.Dispose();
+                return;
+            }
+
+            // Create WebSocket client and add to list
+            var wsClient = new H264WebSocketClient(client);
+
+            lock (_h264ClientLock)
+            {
+                _h264Clients.Add(wsClient);
+            }
+
+            StatusChanged?.Invoke(this, $"H.264 WebSocket client connected (total: {H264WebSocketClients})");
+
+            // Send cached keyframe immediately (includes SPS/PPS) so client can start decoding right away
+            byte[]? cachedKeyframe;
+            lock (_keyframeLock)
+            {
+                cachedKeyframe = _lastKeyframe;
+            }
+
+            if (cachedKeyframe != null)
+            {
+                // Cached keyframe already has SPS/PPS prepended
+                try
+                {
+                    wsClient.SendBinaryFrame(cachedKeyframe);
+                }
+                catch
+                {
+                    // Client disconnected during initial send
+                    RemoveH264Client(wsClient);
+                    return;
+                }
+            }
+            else if (_spsNal != null && _ppsNal != null)
+            {
+                // No keyframe cached yet, just send SPS/PPS
+                SendH264NalUnit(wsClient, _spsNal);
+                SendH264NalUnit(wsClient, _ppsNal);
+            }
+
+            // Start ping/pong thread to keep connection alive and detect disconnects
+            ThreadPool.QueueUserWorkItem(_ => MonitorH264WebSocketClient(wsClient));
+        }
+        catch (Exception ex)
+        {
+            ErrorOccurred?.Invoke(this, new Exception($"WebSocket handshake failed: {ex.Message}", ex));
+            client.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Compute WebSocket accept key per RFC 6455.
+    /// </summary>
+    private static string ComputeWebSocketAcceptKey(string key)
+    {
+        const string guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        var combined = key + guid;
+        var hash = SHA1.HashData(Encoding.ASCII.GetBytes(combined));
+        return Convert.ToBase64String(hash);
+    }
+
+    /// <summary>
+    /// Monitor H.264 WebSocket client connection.
+    /// Reads from socket to detect close frames and disconnects.
+    /// </summary>
+    private void MonitorH264WebSocketClient(H264WebSocketClient client)
+    {
+        var ct = _cts?.Token ?? CancellationToken.None;
+
+        try
+        {
+            // Read loop to detect disconnects and handle control frames
+            while (!ct.IsCancellationRequested && client.IsConnected)
+            {
+                // Try to read WebSocket frames (will block until data or disconnect)
+                // This also handles ping/pong and close frames
+                if (!client.ProcessIncomingFrames())
+                {
+                    break; // Client disconnected or close frame received
+                }
+            }
+        }
+        catch
+        {
+            // Connection error
+        }
+        finally
+        {
+            RemoveH264Client(client);
+        }
+    }
+
+    /// <summary>
+    /// Handle non-WebSocket request to /h264 endpoint.
+    /// Returns info about the H.264 WebSocket endpoint.
+    /// </summary>
+    private void HandleH264InfoRequest(ClientConnection client)
+    {
+        var info = new
+        {
+            endpoint = "/h264",
+            protocol = "WebSocket",
+            description = "H.264 Annex B stream for Mainsail/Fluidd jmuxer",
+            usage = "Connect with WebSocket client to ws://<host>:<port>/h264",
+            format = "Binary frames containing H.264 NAL units with Annex B start codes",
+            connectedClients = H264WebSocketClients,
+            hasSps = _spsNal != null,
+            hasPps = _ppsNal != null
+        };
+
+        SendJsonResponse(client, info);
+    }
+
+    #region HLS Streaming
+
+    /// <summary>
+    /// Handle HLS playlist request with optional LL-HLS blocking support.
+    /// </summary>
+    private async void HandleHlsPlaylistRequestAsync(ClientConnection client, Dictionary<string, string> queryParams)
+    {
+        try
+        {
+            // Mark HLS activity for frame rate control
+            MarkHlsActivity();
+            // Check for LL-HLS blocking request parameters
+            int requestedMsn = -1;
+            int requestedPart = -1;
+
+            if (queryParams.TryGetValue("_HLS_msn", out var msnStr) && int.TryParse(msnStr, out var msn))
+            {
+                requestedMsn = msn;
+            }
+
+            if (queryParams.TryGetValue("_HLS_part", out var partStr) && int.TryParse(partStr, out var part))
+            {
+                requestedPart = part;
+            }
+
+            // If this is a blocking request, wait for the requested part
+            if (requestedMsn >= 0 && requestedPart >= 0 && _hlsService.LlHlsEnabled)
+            {
+                // Wait up to 30 seconds for the requested part
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                var available = await _hlsService.WaitForPartAsync(requestedMsn, requestedPart, cts.Token);
+
+                if (!available)
+                {
+                    // Timeout or cancelled - return current playlist anyway
+                    StatusChanged?.Invoke(this, $"LL-HLS: Blocking request timeout for MSN={requestedMsn}, Part={requestedPart}");
+                }
+            }
+
+            if (!_hlsService.IsReady)
+            {
+                SendServiceUnavailable(client, "HLS stream not ready - waiting for keyframe");
+                return;
+            }
+
+            var playlist = _hlsService.GetPlaylist(requestedMsn, requestedPart);
+            var body = Encoding.UTF8.GetBytes(playlist);
+
+            var header = "HTTP/1.1 200 OK\r\n" +
+                         "Content-Type: application/vnd.apple.mpegurl\r\n" +
+                         $"Content-Length: {body.Length}\r\n" +
+                         "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                         "Pragma: no-cache\r\n" +
+                         "Expires: 0\r\n" +
+                         "Access-Control-Allow-Origin: *\r\n" +
+                         "Connection: close\r\n" +
+                         "\r\n";
+
+            client.TrySend(Encoding.ASCII.GetBytes(header));
+            client.TrySend(body);
+        }
+        catch (Exception ex)
+        {
+            ErrorOccurred?.Invoke(this, new Exception($"HLS playlist error: {ex.Message}", ex));
+        }
+        finally
+        {
+            client.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Handle legacy HLS playlist request for VLC and other players that don't support LL-HLS.
+    /// </summary>
+    private void HandleHlsLegacyPlaylistRequest(ClientConnection client)
+    {
+        try
+        {
+            // Mark HLS activity for frame rate control
+            MarkHlsActivity();
+
+            var playlist = _hlsService.GetLegacyPlaylist();
+            var body = Encoding.UTF8.GetBytes(playlist);
+
+            var header = "HTTP/1.1 200 OK\r\n" +
+                         "Content-Type: application/vnd.apple.mpegurl\r\n" +
+                         $"Content-Length: {body.Length}\r\n" +
+                         "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                         "Pragma: no-cache\r\n" +
+                         "Expires: 0\r\n" +
+                         "Access-Control-Allow-Origin: *\r\n" +
+                         "Connection: close\r\n" +
+                         "\r\n";
+
+            client.TrySend(Encoding.ASCII.GetBytes(header));
+            client.TrySend(body);
+        }
+        catch (Exception ex)
+        {
+            ErrorOccurred?.Invoke(this, new Exception($"HLS legacy playlist error: {ex.Message}", ex));
+        }
+        finally
+        {
+            client.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Handle LL-HLS partial segment request.
+    /// </summary>
+    private void HandleHlsPartRequest(ClientConnection client, string path)
+    {
+        // Mark HLS activity for frame rate control
+        MarkHlsActivity();
+
+        // Parse segment number and part index from path: /hls/part-{sessionId}-{MSN}.{PartIndex}.ts
+        var match = System.Text.RegularExpressions.Regex.Match(path, @"/hls/part-\d+-(\d+)\.(\d+)\.ts", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!match.Success)
+        {
+            SendNotFound(client);
+            return;
+        }
+
+        if (!int.TryParse(match.Groups[1].Value, out var msn) ||
+            !int.TryParse(match.Groups[2].Value, out var partIndex))
+        {
+            SendNotFound(client);
+            return;
+        }
+
+        var part = _hlsService.GetPart(msn, partIndex);
+        if (part == null)
+        {
+            SendNotFound(client);
+            return;
+        }
+
+        var header = "HTTP/1.1 200 OK\r\n" +
+                     "Content-Type: video/mp2t\r\n" +
+                     $"Content-Length: {part.Data.Length}\r\n" +
+                     "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                     "Pragma: no-cache\r\n" +
+                     "Expires: 0\r\n" +
+                     "Access-Control-Allow-Origin: *\r\n" +
+                     "Connection: close\r\n" +
+                     "\r\n";
+
+        client.TrySend(Encoding.ASCII.GetBytes(header));
+        client.TrySend(part.Data);
+        client.Dispose();
+    }
+
+    /// <summary>
+    /// Handle HLS full segment request.
+    /// </summary>
+    private void HandleHlsSegmentRequest(ClientConnection client, string path)
+    {
+        // Mark HLS activity for frame rate control
+        MarkHlsActivity();
+
+        // Parse segment number from path: /hls/segment-{sessionId}-{N}.ts
+        var match = System.Text.RegularExpressions.Regex.Match(path, @"/hls/segment-\d+-(\d+)\.ts", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!match.Success)
+        {
+            SendNotFound(client);
+            return;
+        }
+
+        if (!int.TryParse(match.Groups[1].Value, out var segmentNumber))
+        {
+            SendNotFound(client);
+            return;
+        }
+
+        var segment = _hlsService.GetSegment(segmentNumber);
+        if (segment == null)
+        {
+            SendNotFound(client);
+            return;
+        }
+
+        var header = "HTTP/1.1 200 OK\r\n" +
+                     "Content-Type: video/mp2t\r\n" +
+                     $"Content-Length: {segment.Length}\r\n" +
+                     "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                     "Pragma: no-cache\r\n" +
+                     "Expires: 0\r\n" +
+                     "Access-Control-Allow-Origin: *\r\n" +
+                     "Connection: close\r\n" +
+                     "\r\n";
+
+        client.TrySend(Encoding.ASCII.GetBytes(header));
+        client.TrySend(segment);
+        client.Dispose();
+    }
+
+    /// <summary>
+    /// Handle legacy HLS segment request with PTS adjustment for VLC compatibility.
+    /// </summary>
+    private void HandleHlsLegacySegmentRequest(ClientConnection client, string path)
+    {
+        // Mark HLS activity for frame rate control
+        MarkHlsActivity();
+
+        // Parse segment number from path: /hls/legacy-segment-{sessionId}-{N}.ts
+        var match = System.Text.RegularExpressions.Regex.Match(path, @"/hls/legacy-segment-\d+-(\d+)\.ts", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!match.Success)
+        {
+            SendNotFound(client);
+            return;
+        }
+
+        if (!int.TryParse(match.Groups[1].Value, out var segmentNumber))
+        {
+            SendNotFound(client);
+            return;
+        }
+
+        // Get segment with adjusted PTS values for legacy players
+        var segment = _hlsService.GetLegacySegment(segmentNumber);
+        if (segment == null)
+        {
+            SendNotFound(client);
+            return;
+        }
+
+        var header = "HTTP/1.1 200 OK\r\n" +
+                     "Content-Type: video/mp2t\r\n" +
+                     $"Content-Length: {segment.Length}\r\n" +
+                     "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                     "Pragma: no-cache\r\n" +
+                     "Expires: 0\r\n" +
+                     "Access-Control-Allow-Origin: *\r\n" +
+                     "Connection: close\r\n" +
+                     "\r\n";
+
+        client.TrySend(Encoding.ASCII.GetBytes(header));
+        client.TrySend(segment);
+        client.Dispose();
+    }
+
+    #endregion
 
     public void Dispose()
     {
@@ -890,6 +1726,7 @@ public class MjpegServer : IDisposable
         _disposed = true;
 
         Stop();
+        _hlsService.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -909,6 +1746,7 @@ public class MjpegServer : IDisposable
         private bool _disposed;
 
         public bool IsStreaming { get; set; }
+        public NetworkStream Stream => _stream;
 
         public ClientConnection(TcpClient tcpClient)
         {
@@ -996,6 +1834,242 @@ public class MjpegServer : IDisposable
             {
                 // Ignore cleanup errors
             }
+        }
+    }
+
+    /// <summary>
+    /// Represents a connected H.264 WebSocket client.
+    /// Sends H.264 NAL units as binary WebSocket frames.
+    /// </summary>
+    private class H264WebSocketClient : IDisposable
+    {
+        private readonly ClientConnection _connection;
+        private readonly object _sendLock = new();
+        private bool _disposed;
+
+        public bool IsConnected => !_disposed;
+
+        public H264WebSocketClient(ClientConnection connection)
+        {
+            _connection = connection;
+        }
+
+        /// <summary>
+        /// Send binary data as a WebSocket frame.
+        /// </summary>
+        public void SendBinaryFrame(byte[] data)
+        {
+            if (_disposed) return;
+
+            lock (_sendLock)
+            {
+                try
+                {
+                    var frame = CreateWebSocketFrame(data, 0x02); // Binary frame opcode
+                    _connection.Stream.Write(frame, 0, frame.Length);
+                }
+                catch
+                {
+                    _disposed = true;
+                    throw;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Send a WebSocket ping frame to check connection.
+        /// </summary>
+        public bool SendPing()
+        {
+            if (_disposed) return false;
+
+            lock (_sendLock)
+            {
+                try
+                {
+                    var frame = CreateWebSocketFrame(Array.Empty<byte>(), 0x09); // Ping opcode
+                    _connection.Stream.Write(frame, 0, frame.Length);
+                    return true;
+                }
+                catch
+                {
+                    _disposed = true;
+                    return false;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Process incoming WebSocket frames (ping, pong, close).
+        /// Returns false if connection should be closed.
+        /// </summary>
+        public bool ProcessIncomingFrames()
+        {
+            if (_disposed) return false;
+
+            try
+            {
+                var stream = _connection.Stream;
+
+                // Try to read with timeout - this will detect disconnects
+                // The socket ReceiveTimeout is 5 seconds
+                var header = new byte[2];
+                int bytesRead;
+
+                try
+                {
+                    bytesRead = stream.Read(header, 0, 2);
+                }
+                catch (IOException)
+                {
+                    // Timeout or disconnect - send ping to check connection
+                    if (_disposed) return false;
+                    return SendPing();
+                }
+
+                if (bytesRead == 0)
+                {
+                    // Connection closed
+                    _disposed = true;
+                    return false;
+                }
+
+                if (bytesRead < 2)
+                {
+                    _disposed = true;
+                    return false;
+                }
+
+                var opcode = header[0] & 0x0F;
+                var masked = (header[1] & 0x80) != 0;
+                var payloadLen = header[1] & 0x7F;
+
+                // Read extended length if needed
+                if (payloadLen == 126)
+                {
+                    var extLen = new byte[2];
+                    stream.Read(extLen, 0, 2);
+                    payloadLen = (extLen[0] << 8) | extLen[1];
+                }
+                else if (payloadLen == 127)
+                {
+                    var extLen = new byte[8];
+                    stream.Read(extLen, 0, 8);
+                    payloadLen = 0; // Just skip large payloads for control frames
+                }
+
+                // Read masking key if present (client frames are masked)
+                if (masked)
+                {
+                    var maskKey = new byte[4];
+                    stream.Read(maskKey, 0, 4);
+                }
+
+                // Read and discard payload (we don't process client data)
+                if (payloadLen > 0 && payloadLen < 65536)
+                {
+                    var payload = new byte[payloadLen];
+                    var totalRead = 0;
+                    while (totalRead < payloadLen)
+                    {
+                        var read = stream.Read(payload, totalRead, payloadLen - totalRead);
+                        if (read == 0) break;
+                        totalRead += read;
+                    }
+                }
+
+                // Handle control frames
+                switch (opcode)
+                {
+                    case 0x08: // Close
+                        _disposed = true;
+                        return false;
+
+                    case 0x09: // Ping - send pong
+                        lock (_sendLock)
+                        {
+                            var pong = CreateWebSocketFrame(Array.Empty<byte>(), 0x0A);
+                            stream.Write(pong, 0, pong.Length);
+                        }
+                        break;
+
+                    case 0x0A: // Pong - ignore
+                        break;
+                }
+
+                return true;
+            }
+            catch
+            {
+                _disposed = true;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Create a WebSocket frame with the given payload and opcode.
+        /// </summary>
+        private static byte[] CreateWebSocketFrame(byte[] payload, byte opcode)
+        {
+            // WebSocket frame format:
+            // Byte 0: FIN (1) + RSV (000) + Opcode (4 bits)
+            // Byte 1: MASK (0 for server) + Payload length (7 bits or extended)
+            // Extended length if needed
+            // Payload data
+
+            int headerLength;
+            if (payload.Length < 126)
+            {
+                headerLength = 2;
+            }
+            else if (payload.Length <= 65535)
+            {
+                headerLength = 4;
+            }
+            else
+            {
+                headerLength = 10;
+            }
+
+            var frame = new byte[headerLength + payload.Length];
+
+            // FIN bit (1) + opcode
+            frame[0] = (byte)(0x80 | opcode);
+
+            // Payload length (server doesn't mask)
+            if (payload.Length < 126)
+            {
+                frame[1] = (byte)payload.Length;
+            }
+            else if (payload.Length <= 65535)
+            {
+                frame[1] = 126;
+                frame[2] = (byte)(payload.Length >> 8);
+                frame[3] = (byte)(payload.Length & 0xFF);
+            }
+            else
+            {
+                frame[1] = 127;
+                var len = (ulong)payload.Length;
+                for (int i = 0; i < 8; i++)
+                {
+                    frame[9 - i] = (byte)(len & 0xFF);
+                    len >>= 8;
+                }
+            }
+
+            // Copy payload
+            Array.Copy(payload, 0, frame, headerLength, payload.Length);
+
+            return frame;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            _connection.Dispose();
         }
     }
 }

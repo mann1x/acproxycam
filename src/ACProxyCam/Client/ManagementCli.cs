@@ -1406,7 +1406,9 @@ WantedBy=multi-user.target
         if (success)
         {
             _ui.WriteSuccess("Printer added successfully!");
-            _ui.WriteInfo($"MJPEG stream will be available at: http://<server>:{mjpegPort}/stream");
+            _ui.WriteInfo($"MJPEG stream: http://<server>:{mjpegPort}/stream");
+            _ui.WriteInfo($"H.264 WebSocket (Mainsail/Fluidd): ws://<server>:{mjpegPort}/h264");
+            _ui.WriteInfo($"HLS (Home Assistant/browser): http://<server>:{mjpegPort}/hls/playlist.m3u8");
         }
         else
         {
@@ -1734,7 +1736,16 @@ WantedBy=multi-user.target
             .AddColumn(new TableColumn($"[bold]{detailedStatus.Name}[/]{deviceTypeDisplay}{positionIndicator}").Centered());
 
         headerTable.AddRow($"[{statusColor}]{statusIcon} {detailedStatus.State}[/]");
-        headerTable.AddRow($"[grey]{detailedStatus.Ip}:{detailedStatus.MjpegPort}[/] │ [cyan]{detailedStatus.ConnectedClients}[/] clients │ [white]{resolution}[/]");
+        var clientsDisplay = $"[cyan]{detailedStatus.ConnectedClients}[/] MJPEG";
+        if (detailedStatus.H264WebSocketClients > 0)
+        {
+            clientsDisplay += $" [grey]│[/] [cyan]{detailedStatus.H264WebSocketClients}[/] H264";
+        }
+        if (detailedStatus.HlsReady)
+        {
+            clientsDisplay += " [grey]│[/] [green]HLS[/]";
+        }
+        headerTable.AddRow($"[grey]{detailedStatus.Ip}:{detailedStatus.MjpegPort}[/] │ {clientsDisplay} │ [white]{resolution}[/]");
 
         AnsiConsole.Write(headerTable);
 
@@ -1786,9 +1797,13 @@ WantedBy=multi-user.target
         var urlTable = new Table()
             .Border(TableBorder.Rounded)
             .BorderColor(Color.Grey)
-            .AddColumn(new TableColumn($"[bold]URLs[/]  [grey](http://<server>:{detailedStatus.MjpegPort}/)[/]").LeftAligned());
+            .AddColumn(new TableColumn("[bold]Endpoints[/]").LeftAligned());
 
+        urlTable.AddRow($"[bold]MJPEG/HTTP[/] [grey](http://<server>:{detailedStatus.MjpegPort}/)[/]");
         urlTable.AddRow("[cyan]/stream[/]  [grey]│[/]  [cyan]/snapshot[/]  [grey]│[/]  [cyan]/status[/]  [grey]│[/]  [cyan]/led[/]  [cyan]/led/on[/]  [cyan]/led/off[/]");
+        urlTable.AddRow("");
+        urlTable.AddRow($"[bold]H.264 WebSocket[/] [grey](Mainsail/Fluidd jmuxer)[/]: [cyan]ws://<server>:{detailedStatus.MjpegPort}/h264[/]");
+        urlTable.AddRow($"[bold]HLS[/] [grey](Home Assistant/browser)[/]: [cyan]http://<server>:{detailedStatus.MjpegPort}/hls/playlist.m3u8[/]");
 
         AnsiConsole.Write(urlTable);
 
@@ -3459,12 +3474,13 @@ WantedBy=multi-user.target
             var (success, printers, _) = await _ipcClient!.ListPrintersAsync();
             if (success && printers != null)
             {
-                var conflict = printers.FirstOrDefault(p => p.MjpegPort == value && p.Name != printerName);
-                if (conflict != null)
+                // Check MJPEG port conflict
+                var mjpegConflict = printers.FirstOrDefault(p => p.MjpegPort == value && p.Name != printerName);
+                if (mjpegConflict != null)
                 {
-                    _ui.WriteError($"Port {value} is already in use by printer '{conflict.Name}'");
+                    _ui.WriteError($"Port {value} is already in use by printer '{mjpegConflict.Name}'");
                     _ui.WriteWarning("Please choose a different port.");
-                    currentDefault = value + 1; // Suggest next port
+                    currentDefault = value + 1;
                     continue;
                 }
             }

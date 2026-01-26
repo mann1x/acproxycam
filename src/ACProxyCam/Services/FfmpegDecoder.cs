@@ -254,7 +254,8 @@ public unsafe class FfmpegDecoder : IDisposable
                 return;
             }
 
-            StatusChanged?.Invoke(this, $"Decoding {Width}x{Height}");
+            var stream = _formatContext->streams[_videoStreamIndex];
+            StatusChanged?.Invoke(this, $"Decoding {Width}x{Height}, time_base={stream->time_base.num}/{stream->time_base.den}");
             DecodingStarted?.Invoke(this, EventArgs.Empty);
 
             // Allocate frames
@@ -307,7 +308,23 @@ public unsafe class FfmpegDecoder : IDisposable
                             byte[] packetData = new byte[packet->size];
                             Marshal.Copy((IntPtr)packet->data, packetData, 0, packet->size);
                             bool isKeyframe = (packet->flags & ffmpeg.AV_PKT_FLAG_KEY) != 0;
-                            RawPacketReceived?.Invoke(this, new RawPacketEventArgs(packetData, isKeyframe, packet->pts, packet->dts));
+
+                            // Convert PTS from stream time_base to milliseconds
+                            // This is critical for HLS duration calculations to match MPEG-TS timing
+                            var videoStream = _formatContext->streams[_videoStreamIndex];
+                            long ptsMs = packet->pts;
+                            long dtsMs = packet->dts;
+                            if (packet->pts != ffmpeg.AV_NOPTS_VALUE && videoStream->time_base.den > 0)
+                            {
+                                // pts_ms = pts * (num/den) * 1000 = pts * num * 1000 / den
+                                ptsMs = packet->pts * videoStream->time_base.num * 1000 / videoStream->time_base.den;
+                            }
+                            if (packet->dts != ffmpeg.AV_NOPTS_VALUE && videoStream->time_base.den > 0)
+                            {
+                                dtsMs = packet->dts * videoStream->time_base.num * 1000 / videoStream->time_base.den;
+                            }
+
+                            RawPacketReceived?.Invoke(this, new RawPacketEventArgs(packetData, isKeyframe, ptsMs, dtsMs));
                         }
 
                         DecodePacket(packet);

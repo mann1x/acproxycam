@@ -13,6 +13,8 @@ public class PrinterStatus
     public string DeviceType { get; set; } = "";
     public PrinterState State { get; set; } = PrinterState.Stopped;
     public int ConnectedClients { get; set; }
+    public int H264WebSocketClients { get; set; }
+    public bool HlsReady { get; set; }
     public bool IsPaused { get; set; }
 
     // Performance settings

@@ -60,8 +60,10 @@ public class PrinterThread : IDisposable
     private const int StreamRecoveryDelayMs = 2000;      // 2 seconds between recovery attempts
     private const int QuickRecoveryPeriodMinutes = 5;    // First 5 minutes: quick retry
     private const int StreamStabilizationSeconds = 3;    // Wait 3 seconds before considering stream stable
+    private const int LanModeRetryThresholdSeconds = 30; // Try LAN mode after 30s of failed recovery
     private DateTime _streamFailedAt = DateTime.MinValue; // When the stream first failed
     private DateTime _streamStartedAt = DateTime.MinValue; // When the stream started (for stabilization)
+    private DateTime _lastLanModeAttempt = DateTime.MinValue; // When we last tried enabling LAN mode
     private volatile bool _streamStalled;                 // Flag for stream stall detection
 
     // Watchdog settings
@@ -197,6 +199,8 @@ public class PrinterThread : IDisposable
                 DeviceType = Config.DeviceType,
                 State = _state,
                 ConnectedClients = (_mjpegServer?.ConnectedClients ?? 0) + (_mjpegServer?.HasExternalStreamingClient == true ? 1 : 0),
+                H264WebSocketClients = _mjpegServer?.H264WebSocketClients ?? 0,
+                HlsReady = _mjpegServer?.HlsReady ?? false,
                 IsPaused = _isPaused,
                 CpuAffinity = _cpuAffinity,
                 CurrentFps = ((_mjpegServer?.ConnectedClients ?? 0) > 0 || _mjpegServer?.HasExternalStreamingClient == true) ? Config.MaxFps : Config.IdleFps,
@@ -744,6 +748,9 @@ public class PrinterThread : IDisposable
         _mjpegServer.IdleFps = Config.IdleFps;
         _mjpegServer.JpegQuality = Config.JpegQuality;
 
+        // Configure LL-HLS (Low-Latency HLS)
+        _mjpegServer.ConfigureLlHls(Config.LlHlsEnabled, Config.HlsPartDurationMs);
+
         // Determine bind addresses from config
         var bindAddresses = new List<IPAddress>();
         if (_listenInterfaces.Count > 0 && !_listenInterfaces.Contains("0.0.0.0"))
@@ -770,6 +777,8 @@ public class PrinterThread : IDisposable
         _mjpegServer.Start(Config.MjpegPort, bindAddresses);
         var addressList = string.Join(", ", bindAddresses.Select(a => $"{a}:{Config.MjpegPort}"));
         LogStatus($"MJPEG server listening on {addressList} (maxFps={Config.MaxFps}, idleFps={Config.IdleFps}, quality={Config.JpegQuality})");
+        LogStatus($"H.264 WebSocket endpoint: ws://<ip>:{Config.MjpegPort}/h264");
+        LogStatus($"HLS endpoint: http://<ip>:{Config.MjpegPort}/hls/playlist.m3u8");
     }
 
     /// <summary>
@@ -942,6 +951,20 @@ public class PrinterThread : IDisposable
             _streamStalled = false;
             LogStatus($"Stream running: {_decoder.Width}x{_decoder.Height}");
 
+            // Extract SPS/PPS and NAL length size from decoder extradata for H.264 streaming
+            if (_decoder.Extradata != null && _decoder.Extradata.Length > 0)
+            {
+                var (sps, pps, nalLengthSize) = ParseAvccExtradata(_decoder.Extradata);
+                _mjpegServer?.SetH264Parameters(sps, pps, nalLengthSize);
+                if (sps != null && pps != null)
+                {
+                    // Log SPS details for debugging (NAL type should be 0x67 or 0x27)
+                    var spsHex = sps.Length >= 4 ? $"[{sps[0]:X2} {sps[1]:X2} {sps[2]:X2} {sps[3]:X2}...]" : BitConverter.ToString(sps);
+                    var ppsHex = pps.Length >= 2 ? $"[{pps[0]:X2} {pps[1]:X2}...]" : BitConverter.ToString(pps);
+                    LogStatus($"H.264 parameters extracted (SPS: {sps.Length}B {spsHex}, PPS: {pps.Length}B {ppsHex}, NAL size: {nalLengthSize}B)");
+                }
+            }
+
             // Start Obico client now that the printer/stream is ready
             // This ensures LAN mode is properly enabled before Obico tries to connect to Moonraker
             if (_obicoClient == null && Config.Obico.Enabled)
@@ -972,6 +995,13 @@ public class PrinterThread : IDisposable
             LogStatus("Stream stalled (PTS not advancing)");
         };
 
+        // Subscribe to raw H.264 packets for WebSocket and HLS streaming
+        _decoder.RawPacketReceived += (s, args) =>
+        {
+            // Push to H.264 WebSocket clients (Mainsail/Fluidd jmuxer) and HLS
+            _mjpegServer?.PushH264Packet(args.Data, args.IsKeyframe, args.Pts);
+        };
+
         // Register callback for snapshot requests when no frame available
         if (_mjpegServer != null)
         {
@@ -988,6 +1018,9 @@ public class PrinterThread : IDisposable
         var lastLedAutoControlCheck = DateTime.MinValue;
         const int ledAutoControlIntervalSeconds = 30;
         var initialLedQueryDone = false;
+
+        // Camera keepalive: periodic startCapture to prevent frame rate throttling
+        var lastCameraKeepalive = DateTime.UtcNow; // Start from now since camera was just started
 
         // Initial connection grace period - give decoder time to connect before checking health
         const int InitialConnectionGraceSeconds = 5;
@@ -1032,11 +1065,13 @@ public class PrinterThread : IDisposable
                     {
                         ResetLogThrottling(); // Reset throttling on successful recovery
                         _streamFailedAt = DateTime.MinValue;
+                        _lastLanModeAttempt = DateTime.MinValue; // Reset LAN mode tracking
                         _state = PrinterState.Running; // Ensure state is Running after recovery
                         _obicoClient?.SetPrinterOffline(false); // Printer is back online
                     }
                     _lastSeenOnline = DateTime.UtcNow;
                     _streamFailedAt = DateTime.MinValue; // Reset failure tracking
+                    _lastLanModeAttempt = DateTime.MinValue; // Reset LAN mode tracking
                     _streamStalled = false;
 
                     // Query LED status once on startup
@@ -1058,6 +1093,27 @@ public class PrinterThread : IDisposable
                     {
                         lastLedAutoControlCheck = DateTime.UtcNow;
                         await ProcessLedAutoControlAsync(ct);
+                    }
+
+                    // Camera keepalive: resend startCapture to prevent frame rate throttling
+                    // Only when there are active consumers (MJPEG clients or HLS activity)
+                    if (Config.CameraKeepaliveSeconds > 0 &&
+                        (DateTime.UtcNow - lastCameraKeepalive).TotalSeconds >= Config.CameraKeepaliveSeconds)
+                    {
+                        lastCameraKeepalive = DateTime.UtcNow;
+                        var mjpegClients = _mjpegServer?.ConnectedClients ?? 0;
+                        var hasExternal = _mjpegServer?.HasExternalStreamingClient ?? false;
+                        var hasHls = _mjpegServer?.HasHlsActivity ?? false;
+                        var hasConsumers = mjpegClients > 0 || hasExternal || hasHls;
+
+                        if (hasConsumers)
+                        {
+                            await SendCameraKeepaliveAsync(ct);
+                        }
+                        else
+                        {
+                            LogStatusThrottled("camera_keepalive_skip", $"Keepalive skipped: no consumers (MJPEG={mjpegClients}, External={hasExternal}, HLS={hasHls})");
+                        }
                     }
 
                     await Task.Delay(1000, ct);
@@ -1138,6 +1194,31 @@ public class PrinterThread : IDisposable
     private async Task<bool> TryStreamRecoveryAsync(string streamUrl, CancellationToken ct)
     {
         _streamStalled = false;
+
+        // If stream has been failing for a while and AutoLanMode is enabled,
+        // try enabling LAN mode even if MQTT is connected (camera service may need it)
+        var failureDuration = _streamFailedAt != DateTime.MinValue
+            ? (DateTime.UtcNow - _streamFailedAt).TotalSeconds
+            : 0;
+        var timeSinceLastLanModeAttempt = _lastLanModeAttempt != DateTime.MinValue
+            ? (DateTime.UtcNow - _lastLanModeAttempt).TotalSeconds
+            : double.MaxValue;
+
+        if (Config.AutoLanMode &&
+            failureDuration >= LanModeRetryThresholdSeconds &&
+            timeSinceLastLanModeAttempt >= LanModeRetryThresholdSeconds)
+        {
+            LogStatus("Stream recovery: MQTT connected but stream not working - trying LAN mode...");
+            _lastLanModeAttempt = DateTime.UtcNow;
+            try
+            {
+                await TryEnableLanModeAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                LogStatusThrottled("lan_mode_recovery", $"LAN mode enable failed: {ex.Message}");
+            }
+        }
 
         // Try to restart camera via MQTT (includes SSH+LAN mode retry if enabled)
         if (!await TryQuickCameraRestartAsync(ct))
@@ -1429,6 +1510,32 @@ public class PrinterThread : IDisposable
         }
     }
 
+    /// <summary>
+    /// Send camera keepalive (startCapture) to maintain full frame rate.
+    /// Anycubic cameras throttle to ~4fps after 30-60s without activity.
+    /// </summary>
+    private async Task SendCameraKeepaliveAsync(CancellationToken ct)
+    {
+        if (_mqttController == null || !_mqttController.IsConnected ||
+            string.IsNullOrEmpty(Config.DeviceId) || string.IsNullOrEmpty(Config.ModelCode))
+        {
+            return;
+        }
+
+        try
+        {
+            var started = await _mqttController.TryStartCameraAsync(Config.DeviceId, Config.ModelCode, ct);
+            if (started)
+            {
+                LogStatusThrottled("camera_keepalive", "Camera keepalive sent");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogStatusThrottled("camera_keepalive_error", $"Camera keepalive failed: {ex.Message}");
+        }
+    }
+
     private async Task<bool> IsHostRespondingAsync()
     {
         try
@@ -1459,6 +1566,73 @@ public class PrinterThread : IDisposable
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// Parse SPS and PPS NAL units from AVCC extradata format.
+    /// Also extracts the NAL length size used in the stream.
+    /// </summary>
+    private static (byte[]? Sps, byte[]? Pps, int NalLengthSize) ParseAvccExtradata(byte[] extradata)
+    {
+        byte[]? spsNal = null;
+        byte[]? ppsNal = null;
+        int nalLengthSize = 4; // Default to 4 bytes
+
+        if (extradata == null || extradata.Length < 8)
+            return (null, null, nalLengthSize);
+
+        try
+        {
+            // Extract NAL length size from byte 4 (lower 2 bits + 1)
+            nalLengthSize = (extradata[4] & 0x03) + 1;
+
+            int offset = 5; // Skip config header (version, profile, compat, level, nal_length_size)
+
+            // Number of SPS (lower 5 bits)
+            int numSps = extradata[offset] & 0x1F;
+            offset++;
+
+            for (int i = 0; i < numSps && offset + 2 <= extradata.Length; i++)
+            {
+                // SPS length (big-endian 16-bit)
+                int spsLen = (extradata[offset] << 8) | extradata[offset + 1];
+                offset += 2;
+
+                if (offset + spsLen <= extradata.Length)
+                {
+                    spsNal = new byte[spsLen];
+                    Array.Copy(extradata, offset, spsNal, 0, spsLen);
+                    offset += spsLen;
+                }
+            }
+
+            // Number of PPS
+            if (offset < extradata.Length)
+            {
+                int numPps = extradata[offset];
+                offset++;
+
+                for (int i = 0; i < numPps && offset + 2 <= extradata.Length; i++)
+                {
+                    // PPS length (big-endian 16-bit)
+                    int ppsLen = (extradata[offset] << 8) | extradata[offset + 1];
+                    offset += 2;
+
+                    if (offset + ppsLen <= extradata.Length)
+                    {
+                        ppsNal = new byte[ppsLen];
+                        Array.Copy(extradata, offset, ppsNal, 0, ppsLen);
+                        offset += ppsLen;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Failed to parse extradata
+        }
+
+        return (spsNal, ppsNal, nalLengthSize);
     }
 
     private async Task CleanupServicesAsync()

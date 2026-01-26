@@ -13,6 +13,7 @@ Anycubic Camera Proxy for Linux - Converts FLV camera streams from Anycubic 3D p
 - **Configurable FPS** - MaxFps for streaming, IdleFps for snapshots when no clients connected
 - **CPU affinity** - distributes printer threads across CPU cores for better performance
 - **Camera LED control** - toggle camera LED via HTTP API or management interface, with optional auto-control
+- **HLS streaming** - Low-Latency HLS (LL-HLS) for modern players with ~1-2s latency, plus legacy HLS endpoint
 - **BedMesh Calibration** - run bed mesh calibration with visual heatmap display
 - **BedMesh Analysis** - run multiple calibrations with IQR-based statistical analysis and outlier detection
 - Systemd service with watchdog support
@@ -112,11 +113,23 @@ Once a printer is configured and running, access the streams at:
 | MJPEG Stream | `http://server-ip:8080/stream` | Live video stream |
 | Snapshot | `http://server-ip:8080/snapshot` | Current frame as JPEG |
 | Status | `http://server-ip:8080/status` | JSON status info |
+| HLS (LL-HLS) | `http://server-ip:8080/hls/playlist.m3u8` | Low-Latency HLS stream (~1-2s latency) |
+| HLS (Legacy) | `http://server-ip:8080/hls/legacy.m3u8` | Standard HLS for older players |
 | LED Status | `http://server-ip:8080/led` | GET: JSON `{"state":"on\|off","brightness":0-100}` |
 | LED On | `http://server-ip:8080/led/on` | POST: Turn LED on |
 | LED Off | `http://server-ip:8080/led/off` | POST: Turn LED off |
 
 Configure the stream URLs in Mainsail/Fluidd webcam settings.
+
+### HLS Streaming
+
+ACProxyCam provides HLS (HTTP Live Streaming) endpoints for players that don't support MJPEG:
+
+- **LL-HLS** (`/hls/playlist.m3u8`) - Low-Latency HLS with partial segments for reduced latency (~1-2 seconds). Works with modern players like hls.js, Safari, and Home Assistant.
+
+- **Legacy HLS** (`/hls/legacy.m3u8`) - Standard HLS v3 for older players. Compatible with MPC-HC (Media Player Classic).
+
+> **Note:** The legacy HLS endpoint has known compatibility issues with VLC and PotPlayer due to strict timing requirements in these players. Use MPC-HC or the LL-HLS endpoint with hls.js-based players instead.
 
 ## BedMesh Calibration & Analysis
 
