@@ -1,0 +1,138 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub Release'
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Extract version from csproj
+        id: version
+        run: |
+          VERSION=$(grep -oP '(?<=<Version>)[^<]+' src/ACProxyCam/ACProxyCam.csproj)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Determine if pre-release
+        id: prerelease
+        run: |
+          # Check if manual input specified pre-release
+          if [[ "${{ github.event.inputs.prerelease }}" == "true" ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "Pre-release: true (manual input)"
+          # Check if tag contains pre-release indicators (-alpha, -beta, -rc, -dev, -preview)
+          elif [[ "${{ github.ref_name }}" =~ -(alpha|beta|rc|dev|preview) ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "Pre-release: true (tag pattern)"
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+            echo "Pre-release: false"
+          fi
+
+      - name: Build linux-x64
+        run: |
+          dotnet publish src/ACProxyCam/ACProxyCam.csproj \
+            -c Release \
+            -r linux-x64 \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -o publish/linux-x64
+
+      - name: Build linux-arm64
+        run: |
+          dotnet publish src/ACProxyCam/ACProxyCam.csproj \
+            -c Release \
+            -r linux-arm64 \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -o publish/linux-arm64
+
+      - name: Create release archives
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          mkdir -p artifacts
+
+          # Create zip for linux-x64 (just the binary inside)
+          cd publish/linux-x64
+          zip ../../artifacts/acproxycam-linux-x64-v${VERSION}.zip acproxycam
+          cd ../..
+
+          # Create zip for linux-arm64 (just the binary inside)
+          cd publish/linux-arm64
+          zip ../../artifacts/acproxycam-linux-arm64-v${VERSION}.zip acproxycam
+          cd ../..
+
+      - name: Generate checksums
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          cd artifacts
+
+          sha256sum acproxycam-linux-x64-v${VERSION}.zip > acproxycam-linux-x64-v${VERSION}.zip.sha256
+          sha256sum acproxycam-linux-arm64-v${VERSION}.zip > acproxycam-linux-arm64-v${VERSION}.zip.sha256
+
+          echo "Checksums:"
+          cat *.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts/*
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          draft: true
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease == 'true' }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          PRERELEASE=${{ steps.prerelease.outputs.is_prerelease }}
+          echo "## Release Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${VERSION}" >> $GITHUB_STEP_SUMMARY
+          echo "**Pre-release:** ${PRERELEASE}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Artifacts:**" >> $GITHUB_STEP_SUMMARY
+          echo "- acproxycam-linux-x64-v${VERSION}.zip" >> $GITHUB_STEP_SUMMARY
+          echo "- acproxycam-linux-x64-v${VERSION}.zip.sha256" >> $GITHUB_STEP_SUMMARY
+          echo "- acproxycam-linux-arm64-v${VERSION}.zip" >> $GITHUB_STEP_SUMMARY
+          echo "- acproxycam-linux-arm64-v${VERSION}.zip.sha256" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Checksums:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cat artifacts/*.sha256 >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

@@ -341,7 +341,11 @@ ssh claude_test@192.168.178.12 "sudo docker stop acproxycam-test && sudo docker 
 
 ## Creating a Release
 
-### Step 1: Bump Version
+### Method 1: GitHub Actions (Preferred)
+
+The GitHub Actions workflow (`.github/workflows/release.yml`) automatically builds release artifacts when a version tag is pushed.
+
+#### Step 1: Bump Version
 
 Edit `src/ACProxyCam/ACProxyCam.csproj` and update the version numbers:
 
@@ -352,44 +356,60 @@ Edit `src/ACProxyCam/ACProxyCam.csproj` and update the version numbers:
 <InformationalVersion>1.X.0.$([System.DateTime]::UtcNow.ToString("yyyyMMddHHmm"))</InformationalVersion>
 ```
 
-### Step 2: Commit Changes
+#### Step 2: Commit and Tag
 
 ```bash
 git add -A
-git commit -m "Description of changes
+git commit -m "Release v1.X.0 - Description of changes
 
 Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
-git push origin main
+git tag v1.X.0
+git push origin main --tags
 ```
 
-### Step 3: Build Release Artifacts
+#### Pre-release Tags
 
-**IMPORTANT**: Always use `build.bat` to create release artifacts. Do NOT manually create zip files or checksums.
+Tags containing `-alpha`, `-beta`, `-rc`, `-dev`, or `-preview` are automatically marked as pre-releases:
 
-Run the build script from the repository root:
+```bash
+git tag v1.4.0-beta.1    # Creates pre-release
+git tag v1.4.0-rc.1      # Creates pre-release
+git tag v1.4.0           # Creates normal release
+```
+
+You can also manually trigger a pre-release from the Actions tab by checking the "Mark as pre-release" option.
+
+#### Step 3: GitHub Actions Builds Automatically
+
+The workflow will:
+1. Build for both `linux-x64` and `linux-arm64`
+2. Create zip files with the `acproxycam` binary
+3. Generate SHA256 checksums
+4. Create a **draft** GitHub release (or pre-release) with all artifacts attached
+
+#### Step 4: Publish the Release
+
+1. Go to GitHub → Releases → find the draft release
+2. Edit the release notes (auto-generated from commits)
+3. Click "Publish release"
+
+**Artifacts created:**
+- `acproxycam-linux-x64-v{VERSION}.zip`
+- `acproxycam-linux-x64-v{VERSION}.zip.sha256`
+- `acproxycam-linux-arm64-v{VERSION}.zip`
+- `acproxycam-linux-arm64-v{VERSION}.zip.sha256`
+
+### Method 2: Manual Build (Alternative)
+
+Use `build.bat` for local builds when GitHub Actions is not available.
 
 ```cmd
 build.bat
 ```
 
-This script:
-1. Reads version from `.csproj` file
-2. Publishes for both `linux-x64` and `linux-arm64`
-3. Creates zip files with the binary named `acproxycam` inside
-4. Generates SHA256 checksums
-5. Outputs to `D:\INSTALL\acproxycam\releases\`:
-   - `acproxycam-linux-x64-v{VERSION}.zip`
-   - `acproxycam-linux-x64-v{VERSION}.zip.sha256`
-   - `acproxycam-linux-arm64-v{VERSION}.zip`
-   - `acproxycam-linux-arm64-v{VERSION}.zip.sha256`
+This outputs to `D:\INSTALL\acproxycam\releases\`.
 
-**Requirements:**
-- 7-Zip installed at `c:\Program Files\7-Zip\7z.exe`
-- .NET 8.0 SDK
-
-### Step 4: Create GitHub Release
-
-Use the GitHub CLI to create the release:
+Then create the release manually:
 
 ```bash
 gh release create v1.X.0 \
@@ -400,6 +420,10 @@ gh release create v1.X.0 \
   --title "v1.X.0 - Release Title" \
   --notes "RELEASE_NOTES_HERE"
 ```
+
+**Requirements:**
+- 7-Zip installed at `c:\Program Files\7-Zip\7z.exe`
+- .NET 8.0 SDK
 
 ### Release Notes Template
 
@@ -430,10 +454,4 @@ sudo ./acproxycam
 CHECKSUM_X64  acproxycam-linux-x64-v1.X.0.zip
 CHECKSUM_ARM64  acproxycam-linux-arm64-v1.X.0.zip
 \```
-```
-
-Get checksums from the `.sha256` files:
-```bash
-cat "D:/INSTALL/acproxycam/releases/acproxycam-linux-x64-v1.X.0.zip.sha256"
-cat "D:/INSTALL/acproxycam/releases/acproxycam-linux-arm64-v1.X.0.zip.sha256"
 ```
