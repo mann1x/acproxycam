@@ -85,6 +85,12 @@ public class PrinterObicoConfig
     public string ObicoName { get; set; } = "";
 
     /// <summary>
+    /// Printer ID on the Obico server. Used for deletion.
+    /// </summary>
+    [JsonPropertyName("obicoPrinterId")]
+    public int ObicoPrinterId { get; set; } = 0;
+
+    /// <summary>
     /// Janus WebRTC server address for real-time streaming.
     /// If empty, defaults to the host from ServerUrl (for self-hosted Obico with Janus on same server).
     /// Set to "disabled" to disable Janus streaming entirely.

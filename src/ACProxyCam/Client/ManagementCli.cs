@@ -1053,6 +1053,7 @@ WantedBy=multi-user.target
                     PrinterState.Failed => ("red", "✗"),
                     PrinterState.Retrying => ("orange3", "↻"),
                     PrinterState.Connecting => ("blue", "◌"),
+                    PrinterState.Disabled => ("grey", "⊘"),
                     _ => ("grey", "○")
                 };
 
@@ -1515,6 +1516,33 @@ WantedBy=multi-user.target
 
         _ui.Clear();
         _ui.WriteRule($"Modify Printer: {selected}");
+        _ui.WriteLine();
+
+        // First ask if printer should be enabled - this is the primary question
+        var currentEnabledState = existingConfig.Enabled ? "Enabled" : "Disabled";
+        var enabled = _ui.Confirm($"Enable this printer [{currentEnabledState}]?", existingConfig.Enabled);
+
+        // If disabling, just update enabled flag and save
+        if (!enabled)
+        {
+            existingConfig.Enabled = false;
+            var (disableSuccess, disableError) = await _ipcClient.ModifyPrinterAsync(originalName, existingConfig);
+
+            if (disableSuccess)
+            {
+                _ui.WriteSuccess("Printer disabled. Configuration preserved.");
+            }
+            else
+            {
+                _ui.WriteError($"Error: {disableError ?? "Unknown error"}");
+            }
+
+            _ui.WaitForKey("Press any key to continue...");
+            return;
+        }
+
+        // Printer is enabled - continue with other settings
+        existingConfig.Enabled = true;
         _ui.WriteInfo("Press Enter to keep current value");
         _ui.WriteLine();
 
@@ -1611,7 +1639,16 @@ WantedBy=multi-user.target
             return;
         }
 
-        var choices = printers.Select(p => $"{p.Name} ({(p.IsPaused ? "Paused" : "Running")})").ToList();
+        // Filter out disabled printers - can only pause/resume enabled printers
+        var enabledPrinters = printers.Where(p => p.State != PrinterState.Disabled).ToList();
+        if (enabledPrinters.Count == 0)
+        {
+            _ui.WriteWarning("No enabled printers available.");
+            await Task.Delay(1500);
+            return;
+        }
+
+        var choices = enabledPrinters.Select(p => $"{p.Name} ({(p.IsPaused ? "Paused" : "Running")})").ToList();
 
         var selected = _ui.SelectOneWithEscape("Select printer to pause/resume:", choices);
 
@@ -1620,7 +1657,7 @@ WantedBy=multi-user.target
 
         // Extract printer name
         var printerName = selected.Split(' ')[0];
-        var printer = printers.First(p => p.Name == printerName);
+        var printer = enabledPrinters.First(p => p.Name == printerName);
 
         bool toggleSuccess;
         string? error;
@@ -1657,8 +1694,17 @@ WantedBy=multi-user.target
             return;
         }
 
+        // Filter out disabled printers
+        var enabledPrinters = printers.Where(p => p.State != PrinterState.Disabled).ToList();
+        if (enabledPrinters.Count == 0)
+        {
+            _ui.WriteWarning("No enabled printers available.");
+            await Task.Delay(1500);
+            return;
+        }
+
         // Build choices showing current LED status
-        var choices = printers.Select(p =>
+        var choices = enabledPrinters.Select(p =>
         {
             var ledStatus = p.CameraLed == null ? "?" : (p.CameraLed.IsOn ? "On" : "Off");
             return $"{p.Name} (LED: {ledStatus})";
@@ -1671,7 +1717,7 @@ WantedBy=multi-user.target
 
         // Extract printer name
         var printerName = selected.Split(' ')[0];
-        var printer = printers.First(p => p.Name == printerName);
+        var printer = enabledPrinters.First(p => p.Name == printerName);
 
         // Toggle LED: if currently on or unknown, turn off; if off, turn on
         var turnOn = printer.CameraLed == null || !printer.CameraLed.IsOn;
@@ -1701,7 +1747,8 @@ WantedBy=multi-user.target
             return;
         }
 
-        var choices = printers.Select(p => p.Name).ToList();
+        // Show disabled indicator in selection list
+        var choices = printers.Select(p => p.State == PrinterState.Disabled ? $"{p.Name} (Disabled)" : p.Name).ToList();
 
         var (selected, selectedIndex) = _ui.SelectOneWithEscapeAndIndex("Select printer to view:", choices, 0);
 
@@ -1760,6 +1807,7 @@ WantedBy=multi-user.target
             PrinterState.Failed => ("red", "✗"),
             PrinterState.Retrying => ("orange3", "↻"),
             PrinterState.Connecting => ("blue", "◌"),
+            PrinterState.Disabled => ("grey", "⊘"),
             _ => ("grey", "○")
         };
 
@@ -1933,6 +1981,9 @@ WantedBy=multi-user.target
         // Load config to check Obico settings
         var config = await ConfigManager.LoadAsync();
 
+        // Filter out disabled printers for operations that require connection
+        var enabledPrinters = printers.Where(p => p.State != PrinterState.Disabled).ToList();
+
         int lastSelectedIndex = 0;
         var menuChoices = new[] { "Link printer to Obico", "Unlink printer", "View Obico status", "Configure settings", "Detect firmware" };
 
@@ -1952,26 +2003,44 @@ WantedBy=multi-user.target
             switch (choice)
             {
                 case "Link printer to Obico":
-                    await LinkPrinterToObicoAsync(config, printers);
+                    if (enabledPrinters.Count == 0)
+                    {
+                        _ui.WriteWarning("No enabled printers available.");
+                        _ui.WaitForKey();
+                        break;
+                    }
+                    await LinkPrinterToObicoAsync(config, enabledPrinters);
                     config = await ConfigManager.LoadAsync(); // Reload after changes
                     break;
 
                 case "Unlink printer":
-                    await UnlinkPrinterFromObicoAsync(config, printers);
+                    if (enabledPrinters.Count == 0)
+                    {
+                        _ui.WriteWarning("No enabled printers available.");
+                        _ui.WaitForKey();
+                        break;
+                    }
+                    await UnlinkPrinterFromObicoAsync(config, enabledPrinters);
                     config = await ConfigManager.LoadAsync();
                     break;
 
                 case "View Obico status":
-                    await ShowObicoStatusAsync(config, printers);
+                    await ShowObicoStatusAsync(config, printers);  // Show all printers
                     break;
 
                 case "Configure settings":
-                    await ConfigureObicoSettingsAsync(config, printers);
+                    await ConfigureObicoSettingsAsync(config, printers);  // Allow config for all
                     config = await ConfigManager.LoadAsync();
                     break;
 
                 case "Detect firmware":
-                    await DetectFirmwareAsync(config, printers);
+                    if (enabledPrinters.Count == 0)
+                    {
+                        _ui.WriteWarning("No enabled printers available.");
+                        _ui.WaitForKey();
+                        break;
+                    }
+                    await DetectFirmwareAsync(config, enabledPrinters);
                     config = await ConfigManager.LoadAsync();
                     break;
             }
@@ -1984,29 +2053,42 @@ WantedBy=multi-user.target
         _ui.WriteRule("Link Printer to Obico");
         _ui.WriteLine();
 
-        // Select printer
-        var printerNames = config.Printers.Select(p => p.Name).ToArray();
+        // Select printer (only enabled printers can be linked)
+        var enabledPrinterConfigs = config.Printers.Where(p => p.Enabled).ToList();
+        var printerNames = enabledPrinterConfigs.Select(p => p.Name).ToArray();
         if (printerNames.Length == 0)
         {
-            _ui.WriteWarning("No printers configured.");
+            _ui.WriteWarning("No enabled printers available.");
             _ui.WaitForKey();
             return;
         }
 
-        var selectedName = _ui.SelectOne("Select printer to link:", printerNames);
+        var selectedName = _ui.SelectOneWithEscape("Select printer to link:", printerNames);
         if (selectedName == null)
             return;
 
-        var printerConfig = config.Printers.First(p => p.Name == selectedName);
+        var printerConfig = enabledPrinterConfigs.First(p => p.Name == selectedName);
 
         // Check if already linked
         if (printerConfig.Obico.IsLinked)
         {
             _ui.WriteWarning($"Printer '{selectedName}' is already linked to Obico.");
-            if (!_ui.Confirm("Unlink and re-link?", false))
+            _ui.WriteWarning("To link again, you must first unlink locally and delete the printer from the Obico server.");
+            _ui.WriteLine();
+            _ui.WriteInfo("Please delete the printer from the Obico web UI:");
+            _ui.WriteInfo($"  {printerConfig.Obico.ServerUrl}/printers/");
+            _ui.WriteLine();
+
+            if (!_ui.Confirm("Unlink locally and continue?", false))
                 return;
 
+            // Clear local config
             printerConfig.Obico.AuthToken = "";
+            printerConfig.Obico.DeviceSecret = "";
+            printerConfig.Obico.ObicoPrinterId = 0;
+            printerConfig.Obico.ObicoName = "";
+            await ConfigManager.SaveAsync(config);
+            _ui.WriteLine();
         }
 
         // Check if Rinkhals firmware is detected
@@ -2080,254 +2162,201 @@ WantedBy=multi-user.target
             printerConfig.Obico.ObicoDeviceId = Guid.NewGuid().ToString();
         }
 
-        // Try auto-discovery first
+        // Check if server uses HTTPS for self-signed cert option
+        var usesHttps = serverUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+        var allowSelfSignedCerts = false;
+
+        // Select linking method
         _ui.WriteLine();
-        _ui.WriteInfo("Starting auto-discovery...");
-        _ui.WriteInfo("Open Obico web interface and click 'Link Printer'");
-        _ui.WriteInfo("Obico should automatically find this printer.");
-        _ui.WriteLine();
-
-        var linkingService = new ObicoLinkingService();
-        string? authToken = null;
-        bool linkingCompleted = false;
-
-        // Subscribe to linking completed event
-        linkingService.LinkingCompleted += (s, e) =>
+        var linkingMethod = _ui.SelectOne("Select linking method:", new[]
         {
-            if (e.DeviceId == printerConfig.Obico.ObicoDeviceId)
-            {
-                authToken = e.AuthToken;
-                linkingCompleted = true;
-            }
-        };
+            "Direct login (enter Obico credentials) - Recommended",
+            "Manual linking (generates code to enter in Obico app)"
+        });
 
-        linkingService.StatusChanged += (s, msg) => _ui.WriteInfo($"  {msg}");
+        if (linkingMethod == null)
+            return;
 
-        try
+        // === Direct Login Method ===
+        if (linkingMethod.Contains("Direct login"))
         {
-            linkingService.Start();
-
-            // Start discovery announcement
-            var cts = new CancellationTokenSource();
-            var discoveryTask = linkingService.StartDiscoveryAsync(printerConfig, serverUrl, cts.Token);
-
             _ui.WriteLine();
-            _ui.WriteInfo("Waiting for Obico to discover the printer...");
-            _ui.WriteInfo("(Press Enter to switch to manual 6-digit code entry)");
+            _ui.WriteInfo("Direct login - enter your Obico account credentials.");
+            _ui.WriteInfo("(Credentials are used once and not stored)");
             _ui.WriteLine();
 
-            // Wait for discovery or user input
-            var waitTask = Task.Run(async () =>
-            {
-                var timeout = DateTime.UtcNow.AddMinutes(5);
-                while (!linkingCompleted && DateTime.UtcNow < timeout && !cts.Token.IsCancellationRequested)
-                {
-                    await Task.Delay(500, cts.Token);
-                }
-            });
+            var email = _ui.Ask("Enter email:");
+            if (string.IsNullOrWhiteSpace(email))
+                return;
 
-            // Check for user input to switch to manual mode
-            while (!linkingCompleted && !waitTask.IsCompleted)
+            var password = _ui.AskSecret("Enter password:");
+            if (string.IsNullOrWhiteSpace(password))
+                return;
+
+            // Ask about self-signed certs if using HTTPS
+            if (usesHttps && serverUrl != "https://app.obico.io")
             {
-                if (Console.KeyAvailable)
-                {
-                    var key = Console.ReadKey(true);
-                    if (key.Key == ConsoleKey.Enter)
-                    {
-                        _ui.WriteWarning("Switching to manual linking...");
-                        cts.Cancel();
-                        break;
-                    }
-                }
-                await Task.Delay(100);
+                allowSelfSignedCerts = _ui.Confirm("Allow self-signed SSL certificates?", false);
             }
 
-            // If auto-discovery succeeded
-            if (linkingCompleted && !string.IsNullOrEmpty(authToken))
+            _ui.WriteLine();
+
+            using var directLinkService = new ObicoLinkingService();
+            directLinkService.StatusChanged += (s, msg) => _ui.WriteInfo($"  {msg}");
+
+            var result = await directLinkService.LinkWithCredentialsAsync(
+                printerConfig,
+                serverUrl,
+                email,
+                password,
+                allowSelfSignedCerts);
+
+            if (result.Success)
             {
-                printerConfig.Obico.AuthToken = authToken;
+                printerConfig.Obico.AuthToken = result.AuthToken!;
+                printerConfig.Obico.IsPro = result.IsPro;
+                printerConfig.Obico.ObicoName = result.PrinterName ?? "My Printer";
+                printerConfig.Obico.ObicoPrinterId = result.PrinterId;
+                printerConfig.Obico.TargetFps = result.IsPro ? 25 : 5;
+
                 await ConfigManager.SaveAsync(config);
 
-                _ui.WriteSuccess($"Printer '{selectedName}' linked to Obico via auto-discovery!");
+                _ui.WriteLine();
+                _ui.WriteSuccess($"Printer '{selectedName}' linked to Obico!");
+                _ui.WriteInfo($"Obico name: {result.PrinterName}");
+                _ui.WriteInfo($"Account type: {(result.IsPro ? "Pro" : "Free")}");
 
-                // Reload config in daemon so it picks up the new Obico settings
+                // Reload config in daemon
                 await ReloadDaemonConfigAsync();
 
                 _ui.WaitForKey();
                 return;
             }
-        }
-        catch (Exception ex)
-        {
-            _ui.WriteWarning($"Auto-discovery failed: {ex.Message}");
-        }
-        finally
-        {
-            linkingService.Stop();
-            linkingService.Dispose();
+            else
+            {
+                _ui.WriteError($"Linking failed: {result.Error}");
+                _ui.WaitForKey();
+                return;
+            }
         }
 
-        // Fall back to manual linking with our passcode
-        // Generate fresh device ID to get a new passcode
+        // === Manual Linking Method ===
+        // ACProxyCam announces to Obico server and gets a passcode for user to enter in Obico app/website
         _ui.WriteLine();
-        _ui.WriteInfo("Manual linking - generating new one-time passcode...");
+        _ui.WriteInfo("Manual linking - ACProxyCam will generate a code for you.");
         _ui.WriteLine();
 
-        // Generate fresh credentials for manual linking
+        // Generate fresh device ID for manual linking
         printerConfig.Obico.ObicoDeviceId = Guid.NewGuid().ToString("N");
 
-        // Restart discovery service for manual linking
-        using var manualLinkingService = new Services.Obico.ObicoLinkingService();
+        using var manualLinkingService = new ObicoLinkingService();
         var manualCts = new CancellationTokenSource();
-        var manualLinkCompleted = false;
-        string? manualAuthToken = null;
-        string? currentPasscode = null;
 
+        // Status updates (but not passcode - that's handled by callback)
         manualLinkingService.StatusChanged += (s, msg) =>
         {
-            // Extract and display passcode
-            if (msg.Contains("One-time passcode:"))
+            if (!msg.Contains("passcode", StringComparison.OrdinalIgnoreCase))
             {
-                var parts = msg.Split("One-time passcode:");
-                if (parts.Length > 1)
-                {
-                    currentPasscode = parts[1].Trim();
-                    _ui.WriteLine();
-                    _ui.WriteMarkup($"[yellow]  >>> Enter this code in Obico app: [/][cyan]{currentPasscode}[/][yellow] <<<[/]");
-                    _ui.WriteLine();
-                    _ui.WriteLine();
-                    _ui.WriteLine("1. In the Obico app, click 'Link Printer'");
-                    _ui.WriteLine("2. Click 'Switch to Manual Linking'");
-                    _ui.WriteMarkup($"3. Enter the code: [cyan]{currentPasscode}[/]");
-                    _ui.WriteLine();
-                }
-            }
-            else if (!msg.Contains("passcode"))
-            {
-                _ui.WriteLine($" {msg}");
+                _ui.WriteInfo($"  {msg}");
             }
         };
 
-        manualLinkingService.LinkingCompleted += (s, e) =>
-        {
-            manualLinkCompleted = true;
-            manualAuthToken = e.AuthToken;
-        };
+        _ui.WriteInfo("Connecting to Obico server...");
+        _ui.WriteInfo("(Press Escape to cancel)");
+        _ui.WriteLine();
+
+        // Start manual linking with passcode callback
+        var linkingTask = manualLinkingService.StartManualLinkingAsync(
+            printerConfig,
+            serverUrl,
+            onPasscodeReceived: (passcode) =>
+            {
+                _ui.WriteLine();
+                _ui.WriteMarkup($"[yellow]  >>> Enter this code in Obico app: [/][cyan]{passcode}[/][yellow] <<<[/]");
+                _ui.WriteLine();
+                _ui.WriteLine();
+                _ui.WriteLine("1. In the Obico app/website, click 'Link Printer'");
+                _ui.WriteLine("2. Select 'Klipper' then click 'Next'");
+                _ui.WriteLine("3. Click 'Switch to Manual Setup'");
+                _ui.WriteMarkup($"4. Enter the code: [cyan]{passcode}[/]");
+                _ui.WriteLine();
+            },
+            ct: manualCts.Token);
 
         try
         {
-            manualLinkingService.Start();
-            var manualDiscoveryTask = manualLinkingService.StartDiscoveryAsync(printerConfig, serverUrl, manualCts.Token);
-
-            _ui.WriteInfo("Waiting for you to enter the passcode in Obico app...");
-            _ui.WriteInfo("(Press Escape to cancel)");
-            _ui.WriteLine();
-
-            // Wait for linking or user cancel
-            var manualTimeout = DateTime.UtcNow.AddMinutes(10);
-            while (!manualLinkCompleted && DateTime.UtcNow < manualTimeout && !manualCts.Token.IsCancellationRequested)
+            // Wait for linking or user cancel (with timeout)
+            var timeoutTask = Task.Delay(TimeSpan.FromMinutes(10), manualCts.Token);
+            var keyCheckTask = Task.Run(async () =>
             {
-                if (Console.KeyAvailable)
+                while (!manualCts.Token.IsCancellationRequested)
                 {
-                    var key = Console.ReadKey(true);
-                    if (key.Key == ConsoleKey.Escape)
+                    if (Console.KeyAvailable)
                     {
-                        _ui.WriteWarning("Cancelled.");
-                        manualCts.Cancel();
-                        break;
+                        var key = Console.ReadKey(true);
+                        if (key.Key == ConsoleKey.Escape)
+                        {
+                            manualCts.Cancel();
+                            break;
+                        }
                     }
+                    await Task.Delay(100);
                 }
-                await Task.Delay(100);
+            }, manualCts.Token);
+
+            var completedTask = await Task.WhenAny(linkingTask, timeoutTask);
+
+            if (completedTask == timeoutTask && !linkingTask.IsCompleted)
+            {
+                _ui.WriteError("Linking timeout. Please try again.");
+                manualCts.Cancel();
+                _ui.WaitForKey();
+                return;
             }
 
-            if (manualLinkCompleted && !string.IsNullOrEmpty(manualAuthToken))
+            var result = await linkingTask;
+
+            if (result.Success)
             {
-                printerConfig.Obico.AuthToken = manualAuthToken;
+                printerConfig.Obico.AuthToken = result.AuthToken!;
+                printerConfig.Obico.IsPro = result.IsPro;
+                printerConfig.Obico.ObicoName = result.PrinterName ?? "My Printer";
+                printerConfig.Obico.ObicoPrinterId = result.PrinterId;
+                printerConfig.Obico.TargetFps = result.IsPro ? 25 : 5;
+
                 await ConfigManager.SaveAsync(config);
 
+                _ui.WriteLine();
                 _ui.WriteSuccess($"Printer '{selectedName}' linked to Obico!");
+                _ui.WriteInfo($"Obico name: {result.PrinterName}");
+                _ui.WriteInfo($"Account type: {(result.IsPro ? "Pro" : "Free")}");
 
-                // Reload config in daemon so it picks up the new Obico settings
+                // Reload config in daemon
                 await ReloadDaemonConfigAsync();
 
                 _ui.WaitForKey();
                 return;
             }
-
-            if (!manualCts.Token.IsCancellationRequested)
+            else if (!manualCts.Token.IsCancellationRequested)
             {
-                _ui.WriteError("Linking timeout. Please try again.");
+                _ui.WriteError($"Linking failed: {result.Error}");
             }
-            _ui.WaitForKey();
-            return;
+            else
+            {
+                _ui.WriteWarning("Cancelled.");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _ui.WriteWarning("Cancelled.");
         }
         catch (Exception ex)
         {
             _ui.WriteError($"Manual linking failed: {ex.Message}");
-            _ui.WaitForKey();
-            return;
         }
         finally
         {
             manualCts.Cancel();
-            manualLinkingService.Stop();
-        }
-
-        // This code path is no longer used - keeping for reference
-        // The old flow asked for code FROM app, but correct flow is to give code TO app
-        #pragma warning disable CS0162
-        string? code = null;
-        if (false) // Dead code - old flow
-        {
-            code = _ui.Ask("Enter 6-digit code from Obico app:");
-        }
-        #pragma warning restore CS0162
-        if (string.IsNullOrWhiteSpace(code))
-            return;
-
-        // Verify code (legacy path - not used)
-        _ui.WriteInfo("Verifying code...");
-
-        try
-        {
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-            var response = await client.GetAsync(
-                $"{serverUrl.TrimEnd('/')}/api/v1/octo/verify/?code={code.Trim()}");
-
-            if (!response.IsSuccessStatusCode)
-            {
-                _ui.WriteError("Invalid or expired code. Please try again.");
-                _ui.WaitForKey();
-                return;
-            }
-
-            var json = await response.Content.ReadAsStringAsync();
-            var verifyResponse = System.Text.Json.JsonSerializer.Deserialize<Services.Obico.VerifyResponse>(json);
-
-            if (verifyResponse?.Printer?.AuthToken == null)
-            {
-                _ui.WriteError("Server did not return auth token.");
-                _ui.WaitForKey();
-                return;
-            }
-
-            // Save configuration (legacy path)
-            printerConfig.Obico.AuthToken = verifyResponse.Printer.AuthToken;
-            printerConfig.Obico.IsPro = verifyResponse.Printer.IsPro;
-            printerConfig.Obico.ObicoName = verifyResponse.Printer.Name;
-            printerConfig.Obico.TargetFps = verifyResponse.Printer.IsPro ? 25 : 5;
-
-            await ConfigManager.SaveAsync(config);
-
-            _ui.WriteSuccess($"Printer '{selectedName}' linked to Obico successfully!");
-            _ui.WriteInfo($"Obico name: {verifyResponse.Printer.Name}");
-            _ui.WriteInfo($"Account type: {(verifyResponse.Printer.IsPro ? "Pro" : "Free")}");
-            _ui.WriteLine();
-            _ui.WriteWarning("Restart the service for changes to take effect.");
-        }
-        catch (Exception ex)
-        {
-            _ui.WriteError($"Error linking printer: {ex.Message}");
         }
 
         _ui.WaitForKey();
@@ -2339,18 +2368,18 @@ WantedBy=multi-user.target
         _ui.WriteRule("Unlink Printer from Obico");
         _ui.WriteLine();
 
-        // Find linked printers
-        var linkedPrinters = config.Printers.Where(p => p.Obico.IsLinked).ToList();
+        // Find linked and enabled printers
+        var linkedPrinters = config.Printers.Where(p => p.Enabled && p.Obico.IsLinked).ToList();
 
         if (linkedPrinters.Count == 0)
         {
-            _ui.WriteWarning("No printers are linked to Obico.");
+            _ui.WriteWarning("No enabled printers are linked to Obico.");
             _ui.WaitForKey();
             return;
         }
 
         var printerNames = linkedPrinters.Select(p => p.Name).ToArray();
-        var selectedName = _ui.SelectOne("Select printer to unlink:", printerNames);
+        var selectedName = _ui.SelectOneWithEscape("Select printer to unlink:", printerNames);
         if (selectedName == null)
             return;
 
@@ -2358,15 +2387,26 @@ WantedBy=multi-user.target
             return;
 
         var printerConfig = config.Printers.First(p => p.Name == selectedName);
+        var serverUrl = printerConfig.Obico.ServerUrl;
+
+        // Clear local config
         printerConfig.Obico.AuthToken = "";
         printerConfig.Obico.DeviceSecret = "";
         printerConfig.Obico.IsPro = false;
         printerConfig.Obico.ObicoName = "";
+        printerConfig.Obico.ObicoPrinterId = 0;
 
         await ConfigManager.SaveAsync(config);
 
+        _ui.WriteLine();
         _ui.WriteSuccess($"Printer '{selectedName}' unlinked from Obico.");
-        _ui.WriteWarning("Restart the service for changes to take effect.");
+        _ui.WriteLine();
+        _ui.WriteWarning("Note: To fully remove the printer, delete it manually from the Obico web UI:");
+        _ui.WriteInfo($"  {serverUrl}/printers/");
+
+        // Reload config in daemon
+        await ReloadDaemonConfigAsync();
+
         _ui.WaitForKey();
     }
 
@@ -2412,7 +2452,7 @@ WantedBy=multi-user.target
 
         // Select printer
         var printerNames = config.Printers.Select(p => p.Name).ToArray();
-        var selectedName = _ui.SelectOne("Select printer to configure:", printerNames);
+        var selectedName = _ui.SelectOneWithEscape("Select printer to configure:", printerNames);
         if (selectedName == null)
             return;
 
@@ -2468,20 +2508,21 @@ WantedBy=multi-user.target
         _ui.WriteRule("Detect Firmware");
         _ui.WriteLine();
 
-        // Select printer
-        var printerNames = config.Printers.Select(p => p.Name).ToArray();
+        // Select printer (only enabled printers - need to connect to detect firmware)
+        var enabledPrinterConfigs = config.Printers.Where(p => p.Enabled).ToList();
+        var printerNames = enabledPrinterConfigs.Select(p => p.Name).ToArray();
         if (printerNames.Length == 0)
         {
-            _ui.WriteWarning("No printers configured.");
+            _ui.WriteWarning("No enabled printers available.");
             _ui.WaitForKey();
             return;
         }
 
-        var selectedName = _ui.SelectOne("Select printer:", printerNames);
+        var selectedName = _ui.SelectOneWithEscape("Select printer:", printerNames);
         if (selectedName == null)
             return;
 
-        var printerConfig = config.Printers.First(p => p.Name == selectedName);
+        var printerConfig = enabledPrinterConfigs.First(p => p.Name == selectedName);
 
         await DetectFirmwareForPrinterAsync(printerConfig);
 
@@ -2532,7 +2573,16 @@ WantedBy=multi-user.target
             return;
         }
 
-        await ShowBedMeshMenuAsync(printers);
+        // Filter out disabled printers
+        var enabledPrinters = printers.Where(p => p.State != PrinterState.Disabled).ToList();
+        if (enabledPrinters.Count == 0)
+        {
+            _ui.WriteWarning("No enabled printers available.");
+            await Task.Delay(1500);
+            return;
+        }
+
+        await ShowBedMeshMenuAsync(enabledPrinters);
     }
 
     private async Task ShowBedMeshMenuAsync(List<PrinterStatus> printers)
@@ -2579,7 +2629,12 @@ WantedBy=multi-user.target
         // Select printer
         var choices = printers.Select(p =>
         {
-            var status = p.State == PrinterState.Running ? "[green]●[/]" : "[grey]○[/]";
+            var status = p.State switch
+            {
+                PrinterState.Running => "[green]●[/]",
+                PrinterState.Disabled => "[grey]⊘[/]",
+                _ => "[grey]○[/]"
+            };
             return $"{status} {p.Name}";
         }).ToList();
 

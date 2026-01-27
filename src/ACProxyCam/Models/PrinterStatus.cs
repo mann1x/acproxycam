@@ -54,6 +54,7 @@ public class PrinterStatus
 public enum PrinterState
 {
     Stopped,
+    Disabled,
     Initializing,
     Connecting,
     Running,

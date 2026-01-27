@@ -2111,9 +2111,16 @@ public class ObicoClient : IDisposable
             // Capture previous values for change detection
             var wasProBefore = _printerConfig.Obico.IsPro;
             var previousName = _printerConfig.Obico.ObicoName ?? "";
+            var previousPrinterId = _printerConfig.Obico.ObicoPrinterId;
 
             // Update tier status
             _printerConfig.Obico.IsPro = printerInfo.IsPro;
+
+            // Update printer ID (for server-side deletion)
+            if (printerInfo.Id > 0)
+            {
+                _printerConfig.Obico.ObicoPrinterId = printerInfo.Id;
+            }
 
             // Update Obico name if changed
             if (!string.IsNullOrEmpty(printerInfo.Name))
@@ -2129,6 +2136,7 @@ public class ObicoClient : IDisposable
 
             var tierChanged = wasProBefore != printerInfo.IsPro;
             var nameChanged = previousName != (printerInfo.Name ?? "");
+            var printerIdChanged = previousPrinterId != printerInfo.Id && printerInfo.Id > 0;
 
             if (tierChanged)
             {
@@ -2141,8 +2149,13 @@ public class ObicoClient : IDisposable
                 Log($"Obico name updated: '{previousName}' -> '{printerInfo.Name}'");
             }
 
+            if (printerIdChanged)
+            {
+                Log($"Obico printer ID: {printerInfo.Id}");
+            }
+
             // Notify caller to persist config changes
-            if (tierChanged || nameChanged)
+            if (tierChanged || nameChanged || printerIdChanged)
             {
                 ConfigUpdated?.Invoke(this, EventArgs.Empty);
             }

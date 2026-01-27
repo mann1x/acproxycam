@@ -40,6 +40,14 @@ public class PrinterConfig
     [JsonPropertyName("name")]
     public string Name { get; set; } = "";
 
+    /// <summary>
+    /// Whether this printer is enabled. When false, the printer thread is not started.
+    /// Useful for long maintenance periods without removing the printer configuration.
+    /// Default: true.
+    /// </summary>
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; } = true;
+
     [JsonPropertyName("ip")]
     public string Ip { get; set; } = "";
 

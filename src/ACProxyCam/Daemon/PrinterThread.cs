@@ -833,13 +833,13 @@ public class PrinterThread : IDisposable
             _obicoClient.StateChanged += OnObicoStateChanged;
             _obicoClient.ConfigUpdated += OnObicoConfigUpdated;
 
-            // Wire up Janus streaming state to MJPEG server for full-rate encoding
+            // Wire up Janus H264 streaming state to MJPEG server for full-rate decoding
             if (_mjpegServer != null)
             {
                 _obicoClient.JanusStreamingChanged += (s, streaming) =>
                 {
                     _mjpegServer.HasExternalStreamingClient = streaming;
-                    LogStatus($"Janus streaming {(streaming ? "started" : "stopped")} - MJPEG encoding at {(streaming ? "full" : "idle")} rate");
+                    LogStatus($"Obico H264 streaming {(streaming ? "started" : "stopped")} - decoder at {(streaming ? "full" : "idle")} rate");
                 };
             }
 
@@ -924,6 +924,85 @@ public class PrinterThread : IDisposable
         _obicoStatus.IsPro = Config.Obico.IsPro;
         _obicoStatus.TargetFps = Config.Obico.TargetFps;
         ConfigChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// Update Obico configuration and restart the Obico client if needed.
+    /// Called by PrinterManager when config is reloaded from disk.
+    /// </summary>
+    public async Task UpdateObicoConfigAsync(PrinterObicoConfig newObicoConfig)
+    {
+        var oldAuthToken = Config.Obico.AuthToken;
+        var oldEnabled = Config.Obico.Enabled;
+        var wasLinked = !string.IsNullOrEmpty(oldAuthToken);
+
+        // Update config
+        Config.Obico.Enabled = newObicoConfig.Enabled;
+        Config.Obico.ServerUrl = newObicoConfig.ServerUrl;
+        Config.Obico.AuthToken = newObicoConfig.AuthToken;
+        Config.Obico.ObicoDeviceId = newObicoConfig.ObicoDeviceId;
+        Config.Obico.DeviceSecret = newObicoConfig.DeviceSecret;
+        Config.Obico.TargetFps = newObicoConfig.TargetFps;
+        Config.Obico.SnapshotsEnabled = newObicoConfig.SnapshotsEnabled;
+        Config.Obico.IsPro = newObicoConfig.IsPro;
+        Config.Obico.ObicoName = newObicoConfig.ObicoName;
+        Config.Obico.ObicoPrinterId = newObicoConfig.ObicoPrinterId;
+        Config.Obico.JanusServer = newObicoConfig.JanusServer;
+        Config.Obico.StreamMode = newObicoConfig.StreamMode;
+
+        // Update status
+        _obicoStatus.Enabled = newObicoConfig.Enabled;
+        _obicoStatus.IsLinked = newObicoConfig.IsLinked;
+        _obicoStatus.IsPro = newObicoConfig.IsPro;
+        _obicoStatus.TargetFps = newObicoConfig.TargetFps;
+
+        // Determine if we need to restart Obico client
+        var authTokenChanged = oldAuthToken != newObicoConfig.AuthToken;
+        var enabledChanged = oldEnabled != newObicoConfig.Enabled;
+        var becameLinked = !wasLinked && newObicoConfig.IsLinked;
+
+        LogStatus($"Obico config updated: enabled={newObicoConfig.Enabled}, linked={newObicoConfig.IsLinked}, authChanged={authTokenChanged}, enabledChanged={enabledChanged}, becameLinked={becameLinked}");
+
+        if (_obicoClient != null)
+        {
+            if (!newObicoConfig.Enabled)
+            {
+                // Obico was disabled - stop the client
+                LogStatus("Obico disabled - stopping client...");
+                await _obicoClient.StopAsync();
+                _obicoClient = null;
+                _obicoStatus.State = "Disabled";
+                _obicoStatus.ServerConnected = false;
+            }
+            else if (authTokenChanged)
+            {
+                // Auth token changed - restart with new credentials
+                LogStatus("Obico auth token changed - restarting client...");
+                await _obicoClient.StopAsync();
+                _obicoClient = null;
+
+                // Start new client with updated config
+                await StartObicoClientAsync(CancellationToken.None);
+
+                // Pass decoder to the new client (decoder is already running)
+                if (_decoder != null)
+                {
+                    _obicoClient?.SetDecoder(_decoder);
+                }
+            }
+        }
+        else if (newObicoConfig.Enabled && newObicoConfig.IsLinked && (enabledChanged || becameLinked || authTokenChanged))
+        {
+            // Obico was enabled or became linked - start the client
+            LogStatus("Obico enabled/linked - starting client...");
+            await StartObicoClientAsync(CancellationToken.None);
+
+            // Pass decoder to the new client (decoder is already running)
+            if (_decoder != null)
+            {
+                _obicoClient?.SetDecoder(_decoder);
+            }
+        }
     }
 
     private async Task RunStreamingLoopAsync(CancellationToken ct)
@@ -1045,14 +1124,14 @@ public class PrinterThread : IDisposable
                 var inInitialGracePeriod = timeSinceDecoderStart < InitialConnectionGraceSeconds;
 
                 // Check if stream is healthy (running, not stalled, and stabilized)
-                var streamRunning = _decoder.IsRunning && !_streamStalled;
+                var streamRunning = _decoder?.IsRunning == true && !_streamStalled;
                 var streamStabilized = _streamStartedAt != DateTime.MinValue &&
                                        (DateTime.UtcNow - _streamStartedAt).TotalSeconds >= StreamStabilizationSeconds;
                 var streamHealthy = streamRunning && streamStabilized;
 
                 // Check if decoder is stuck (no frames received for too long)
                 // This catches: 1) decoder stuck connecting, 2) decoder running but no frames
-                var noFramesTimeout = _decoder.TimeSinceLastFrame.TotalSeconds > 10;
+                var noFramesTimeout = (_decoder?.TimeSinceLastFrame.TotalSeconds ?? double.MaxValue) > 10;
                 if (noFramesTimeout && timeSinceDecoderStart > 10)
                 {
                     // Decoder has been running for >10s but no frames - it's stuck

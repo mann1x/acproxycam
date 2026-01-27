@@ -1,6 +1,7 @@
 // ObicoServerConnection.cs - WebSocket and REST client for Obico server
 
 using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.WebSockets;
 using System.Text;
@@ -494,6 +495,214 @@ public class ObicoServerConnection : IDisposable
     }
 
     /// <summary>
+    /// Login to Obico server with email and password.
+    /// Returns session cookies for authenticated requests.
+    /// </summary>
+    /// <param name="email">User's email address</param>
+    /// <param name="password">User's password</param>
+    /// <param name="allowSelfSignedCerts">Allow self-signed SSL certificates</param>
+    /// <param name="ct">Cancellation token</param>
+    public async Task<ObicoLoginResult> LoginAsync(
+        string email,
+        string password,
+        bool allowSelfSignedCerts = false,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            var cookieContainer = new CookieContainer();
+            var handler = new HttpClientHandler
+            {
+                CookieContainer = cookieContainer,
+                UseCookies = true,
+                AllowAutoRedirect = true
+            };
+
+            if (allowSelfSignedCerts)
+            {
+                handler.ServerCertificateCustomValidationCallback =
+                    HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+            }
+
+            using var client = new HttpClient(handler)
+            {
+                BaseAddress = new Uri(_serverUrl),
+                Timeout = TimeSpan.FromSeconds(30)
+            };
+
+            // Step 1: GET /accounts/login/ to obtain CSRF token from cookie
+            var getResponse = await client.GetAsync("/accounts/login/", ct);
+            getResponse.EnsureSuccessStatusCode();
+
+            // Extract CSRF token from cookies
+            var cookies = cookieContainer.GetCookies(new Uri(_serverUrl));
+            var csrfToken = cookies["csrftoken"]?.Value;
+
+            if (string.IsNullOrEmpty(csrfToken))
+            {
+                return new ObicoLoginResult
+                {
+                    Success = false,
+                    Error = "Failed to obtain CSRF token from server"
+                };
+            }
+
+            // Step 2: POST /accounts/login/ with credentials
+            var formContent = new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["login"] = email,
+                ["password"] = password,
+                ["csrfmiddlewaretoken"] = csrfToken
+            });
+
+            // Add Referer header (required by Django CSRF)
+            client.DefaultRequestHeaders.Add("Referer", $"{_serverUrl}/accounts/login/");
+
+            var postResponse = await client.PostAsync("/accounts/login/", formContent, ct);
+
+            // Check if login was successful
+            // Django redirects to next page on success, returns 200 with form on failure
+            if (postResponse.IsSuccessStatusCode)
+            {
+                // Check if we got redirected (successful login)
+                // Obico uses tsd_sessionid cookie instead of sessionid
+                var sessionCookies = cookieContainer.GetCookies(new Uri(_serverUrl));
+                var sessionCookie = sessionCookies["tsd_sessionid"] ?? sessionCookies["sessionid"];
+
+                if (sessionCookie != null)
+                {
+                    // Refresh CSRF token from response (it may have changed)
+                    var newCsrfToken = sessionCookies["csrftoken"]?.Value ?? csrfToken;
+
+                    return new ObicoLoginResult
+                    {
+                        Success = true,
+                        Cookies = cookieContainer,
+                        CsrfToken = newCsrfToken
+                    };
+                }
+
+                // Still on login page - credentials were wrong
+                return new ObicoLoginResult
+                {
+                    Success = false,
+                    Error = "Invalid email or password"
+                };
+            }
+
+            return new ObicoLoginResult
+            {
+                Success = false,
+                Error = $"Login failed: HTTP {(int)postResponse.StatusCode}"
+            };
+        }
+        catch (HttpRequestException ex) when (ex.InnerException is System.Security.Authentication.AuthenticationException)
+        {
+            return new ObicoLoginResult
+            {
+                Success = false,
+                Error = "SSL certificate error. Enable 'Allow self-signed certs' for self-hosted servers."
+            };
+        }
+        catch (Exception ex)
+        {
+            return new ObicoLoginResult
+            {
+                Success = false,
+                Error = $"Connection failed: {ex.Message}"
+            };
+        }
+    }
+
+    /// <summary>
+    /// Get a verification code for linking a new printer.
+    /// Requires authenticated session from LoginAsync.
+    /// </summary>
+    /// <param name="cookies">Session cookies from LoginAsync</param>
+    /// <param name="csrfToken">CSRF token from LoginAsync</param>
+    /// <param name="allowSelfSignedCerts">Allow self-signed SSL certificates</param>
+    /// <param name="ct">Cancellation token</param>
+    public async Task<VerificationCodeResult> GetVerificationCodeAsync(
+        CookieContainer cookies,
+        string csrfToken,
+        bool allowSelfSignedCerts = false,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            var handler = new HttpClientHandler
+            {
+                CookieContainer = cookies,
+                UseCookies = true
+            };
+
+            if (allowSelfSignedCerts)
+            {
+                handler.ServerCertificateCustomValidationCallback =
+                    HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+            }
+
+            using var client = new HttpClient(handler)
+            {
+                BaseAddress = new Uri(_serverUrl),
+                Timeout = TimeSpan.FromSeconds(15)
+            };
+
+            // Add CSRF token header for API requests
+            client.DefaultRequestHeaders.Add("X-CSRFToken", csrfToken);
+            client.DefaultRequestHeaders.Add("Referer", _serverUrl);
+
+            var response = await client.GetAsync("/api/v1/onetimeverificationcodes/", ct);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                if (response.StatusCode == HttpStatusCode.Unauthorized ||
+                    response.StatusCode == HttpStatusCode.Forbidden)
+                {
+                    return new VerificationCodeResult
+                    {
+                        Success = false,
+                        Error = "Session expired or unauthorized"
+                    };
+                }
+
+                return new VerificationCodeResult
+                {
+                    Success = false,
+                    Error = $"Failed to get verification code: HTTP {(int)response.StatusCode}"
+                };
+            }
+
+            var json = await response.Content.ReadAsStringAsync(ct);
+            var codeResponse = JsonSerializer.Deserialize<VerificationCodeResponse>(json);
+
+            if (codeResponse == null || string.IsNullOrEmpty(codeResponse.Code))
+            {
+                return new VerificationCodeResult
+                {
+                    Success = false,
+                    Error = "Server did not return a verification code"
+                };
+            }
+
+            return new VerificationCodeResult
+            {
+                Success = true,
+                Code = codeResponse.Code,
+                ExpiresAt = codeResponse.ExpiredAt
+            };
+        }
+        catch (Exception ex)
+        {
+            return new VerificationCodeResult
+            {
+                Success = false,
+                Error = $"Failed to get verification code: {ex.Message}"
+            };
+        }
+    }
+
+    /// <summary>
     /// Get linked printer information.
     /// </summary>
     public async Task<PrinterInfo?> GetPrinterInfoAsync(CancellationToken ct = default)
@@ -527,6 +736,87 @@ public class ObicoServerConnection : IDisposable
         catch (Exception ex)
         {
             throw new ObicoApiException($"Get printer info failed: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>
+    /// Delete a printer from the Obico server.
+    /// Note: This uses /api/v1/printers/ which requires user session authentication.
+    /// The printer auth_token cannot delete - this will return 403 Forbidden.
+    /// For now, deletion must be done manually via the Obico web UI.
+    /// </summary>
+    /// <param name="printerId">The printer ID on the Obico server</param>
+    /// <param name="ct">Cancellation token</param>
+    /// <returns>True if deleted successfully, false otherwise</returns>
+    public async Task<(bool Success, string? Error)> DeletePrinterAsync(int printerId, CancellationToken ct = default)
+    {
+        try
+        {
+            var response = await _httpClient.DeleteAsync($"/api/v1/printers/{printerId}/", ct);
+
+            if (response.IsSuccessStatusCode)
+            {
+                return (true, null);
+            }
+
+            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                return (false, "Printer not found on server (may have been deleted already)");
+            }
+
+            if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+            {
+                return (false, "Obico API requires web login to delete printers");
+            }
+
+            return (false, $"Server returned {(int)response.StatusCode}");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"Failed to delete printer: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Update printer name on the Obico server.
+    /// Uses /api/v1/octo/printer/ endpoint which accepts printer auth_token.
+    /// </summary>
+    /// <param name="printerId">The printer ID (unused, kept for API compatibility)</param>
+    /// <param name="name">The new printer name</param>
+    /// <param name="ct">Cancellation token</param>
+    /// <returns>True if updated successfully, false otherwise</returns>
+    public async Task<(bool Success, string? Error)> UpdatePrinterNameAsync(int printerId, string name, CancellationToken ct = default)
+    {
+        try
+        {
+            var content = new StringContent(
+                JsonSerializer.Serialize(new { name }),
+                Encoding.UTF8,
+                "application/json");
+
+            // Use /api/v1/octo/printer/ which accepts printer auth_token (not /api/v1/printers/ which requires user session)
+            var request = new HttpRequestMessage(HttpMethod.Patch, "/api/v1/octo/printer/")
+            {
+                Content = content
+            };
+
+            var response = await _httpClient.SendAsync(request, ct);
+
+            if (response.IsSuccessStatusCode)
+            {
+                return (true, null);
+            }
+
+            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                return (false, "Printer not found on server");
+            }
+
+            return (false, $"Server returned {(int)response.StatusCode}");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"Failed to update printer name: {ex.Message}");
         }
     }
 
@@ -1013,6 +1303,49 @@ public class ObicoApiException : Exception
 {
     public ObicoApiException(string message) : base(message) { }
     public ObicoApiException(string message, Exception inner) : base(message, inner) { }
+}
+
+/// <summary>
+/// Result of login attempt to Obico server.
+/// </summary>
+public class ObicoLoginResult
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+    public CookieContainer? Cookies { get; set; }
+    public string? CsrfToken { get; set; }
+}
+
+/// <summary>
+/// Result of verification code request.
+/// </summary>
+public class VerificationCodeResult
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+    public string? Code { get; set; }
+    public DateTime? ExpiresAt { get; set; }
+}
+
+/// <summary>
+/// Response from /api/v1/onetimeverificationcodes/ endpoint.
+/// </summary>
+public class VerificationCodeResponse
+{
+    [JsonPropertyName("id")]
+    public int Id { get; set; }
+
+    [JsonPropertyName("code")]
+    public string Code { get; set; } = "";
+
+    [JsonPropertyName("expired_at")]
+    public DateTime? ExpiredAt { get; set; }
+
+    [JsonPropertyName("verified_at")]
+    public DateTime? VerifiedAt { get; set; }
+
+    [JsonPropertyName("printer")]
+    public PrinterInfo? Printer { get; set; }
 }
 
 #endregion

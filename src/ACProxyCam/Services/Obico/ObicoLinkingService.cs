@@ -140,6 +140,15 @@ public class ObicoLinkingService : IDisposable
 
                                 if (verifyResponse?.Printer?.AuthToken != null)
                                 {
+                                    // Update printer name on server to match ACProxyCam config
+                                    _ = TryUpdatePrinterNameAsync(
+                                        serverUrl,
+                                        verifyResponse.Printer.AuthToken,
+                                        verifyResponse.Printer.Id,
+                                        printerConfig.Name,
+                                        verifyResponse.Printer.Name,
+                                        cts.Token);
+
                                     _discoveryServer.MarkLinked(deviceId, verifyResponse.Printer.AuthToken);
                                     return verifyResponse.Printer.AuthToken;
                                 }
@@ -207,6 +216,142 @@ public class ObicoLinkingService : IDisposable
     }
 
     /// <summary>
+    /// Start manual linking for a printer.
+    /// Announces to Obico server and waits for user to enter the code in Obico app.
+    /// Does NOT require the discovery server to be running.
+    /// </summary>
+    /// <param name="printerConfig">Printer configuration</param>
+    /// <param name="serverUrl">Obico server URL</param>
+    /// <param name="onPasscodeReceived">Callback when one-time passcode is received</param>
+    /// <param name="ct">Cancellation token</param>
+    /// <returns>LinkingResult with all fields populated</returns>
+    public async Task<LinkingResult> StartManualLinkingAsync(
+        PrinterConfig printerConfig,
+        string serverUrl,
+        Action<string>? onPasscodeReceived = null,
+        CancellationToken ct = default)
+    {
+        // Generate or use existing device ID
+        var deviceId = printerConfig.Obico.ObicoDeviceId;
+        if (string.IsNullOrEmpty(deviceId))
+        {
+            deviceId = Guid.NewGuid().ToString("N");
+            printerConfig.Obico.ObicoDeviceId = deviceId;
+        }
+
+        // Generate device secret locally (no discovery server needed)
+        var deviceSecret = GenerateDeviceSecret();
+        printerConfig.Obico.DeviceSecret = deviceSecret;
+
+        Log($"[{printerConfig.Name}] Starting manual linking...");
+
+        using var server = new ObicoServerConnection(serverUrl, "");
+        string? oneTimePasscode = null;
+        string? lastReportedPasscode = null;
+
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    var request = new UnlinkedRequest
+                    {
+                        DeviceId = deviceId,
+                        DeviceSecret = deviceSecret,
+                        Hostname = Environment.MachineName,
+                        Port = 0, // Not listening for discovery
+                        Os = "Linux",
+                        Arch = GetArchitecture(),
+                        HostOrIp = GetLocalIpAddress(),
+                        OneTimePasscode = oneTimePasscode,
+                        PluginVersion = GetVersion(),
+                        Agent = "moonraker_obico",
+                        PrinterProfile = "Unknown",
+                        MachineType = "Klipper",
+                        RpiModel = GetPlatformModel()
+                    };
+
+                    var response = await server.AnnounceUnlinkedAsync(request, ct);
+
+                    if (response != null)
+                    {
+                        // Got one-time passcode
+                        if (!string.IsNullOrEmpty(response.OneTimePasscode))
+                        {
+                            oneTimePasscode = response.OneTimePasscode;
+
+                            // Only report passcode once (or if it changed)
+                            if (oneTimePasscode != lastReportedPasscode)
+                            {
+                                lastReportedPasscode = oneTimePasscode;
+                                Log($"[{printerConfig.Name}] One-time passcode: {FormatPasscode(oneTimePasscode)}");
+                                onPasscodeReceived?.Invoke(oneTimePasscode);
+                            }
+                        }
+
+                        // Got verification code - linking succeeded!
+                        if (!string.IsNullOrEmpty(response.VerificationCode))
+                        {
+                            Log($"[{printerConfig.Name}] Received verification code, completing link...");
+
+                            var verifyResponse = await server.VerifyLinkCodeAsync(response.VerificationCode, ct);
+
+                            if (verifyResponse?.Printer?.AuthToken != null)
+                            {
+                                // Update printer name on server to match ACProxyCam config
+                                var updatedName = await TryUpdatePrinterNameAsync(
+                                    serverUrl,
+                                    verifyResponse.Printer.AuthToken,
+                                    verifyResponse.Printer.Id,
+                                    printerConfig.Name,
+                                    verifyResponse.Printer.Name,
+                                    ct);
+
+                                Log($"[{printerConfig.Name}] Linked successfully to Obico as '{updatedName}'");
+
+                                return new LinkingResult
+                                {
+                                    Success = true,
+                                    AuthToken = verifyResponse.Printer.AuthToken,
+                                    PrinterName = updatedName,
+                                    PrinterId = verifyResponse.Printer.Id,
+                                    IsPro = verifyResponse.Printer.IsPro
+                                };
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    Log($"[{printerConfig.Name}] Announcement failed: {ex.Message}");
+                }
+
+                // Wait before next announcement
+                await Task.Delay(TimeSpan.FromSeconds(2), ct);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal cancellation
+        }
+
+        return new LinkingResult
+        {
+            Success = false,
+            Error = ct.IsCancellationRequested ? "Cancelled" : "Timeout"
+        };
+    }
+
+    private static string GenerateDeviceSecret()
+    {
+        var bytes = new byte[32];
+        using var rng = System.Security.Cryptography.RandomNumberGenerator.Create();
+        rng.GetBytes(bytes);
+        return Convert.ToHexString(bytes).ToLowerInvariant();
+    }
+
+    /// <summary>
     /// Link printer using 6-digit code (manual linking).
     /// </summary>
     public async Task<LinkingResult> LinkWithCodeAsync(
@@ -268,13 +413,23 @@ public class ObicoLinkingService : IDisposable
                 printerConfig.Obico.ObicoDeviceId = Guid.NewGuid().ToString("N");
             }
 
-            Log($"[{printerConfig.Name}] Linked successfully to Obico");
+            // Update printer name on server to match ACProxyCam config
+            var updatedName = await TryUpdatePrinterNameAsync(
+                serverUrl,
+                response.Printer.AuthToken,
+                response.Printer.Id,
+                printerConfig.Name,
+                response.Printer.Name,
+                ct);
+
+            Log($"[{printerConfig.Name}] Linked successfully to Obico as '{updatedName}'");
 
             return new LinkingResult
             {
                 Success = true,
                 AuthToken = response.Printer.AuthToken,
-                PrinterName = response.Printer.Name,
+                PrinterName = updatedName,
+                PrinterId = response.Printer.Id,
                 IsPro = response.Printer.IsPro
             };
         }
@@ -319,6 +474,115 @@ public class ObicoLinkingService : IDisposable
     }
 
     /// <summary>
+    /// Link printer directly using Obico credentials.
+    /// Bypasses browser-based auto-discovery by logging in and creating a verification code directly.
+    /// </summary>
+    /// <param name="printerConfig">The printer configuration to link</param>
+    /// <param name="serverUrl">Obico server URL</param>
+    /// <param name="email">User's email address</param>
+    /// <param name="password">User's password</param>
+    /// <param name="allowSelfSignedCerts">Allow self-signed SSL certificates</param>
+    /// <param name="ct">Cancellation token</param>
+    public async Task<LinkingResult> LinkWithCredentialsAsync(
+        PrinterConfig printerConfig,
+        string serverUrl,
+        string email,
+        string password,
+        bool allowSelfSignedCerts = false,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            using var server = new ObicoServerConnection(serverUrl, "");
+
+            // Step 1: Login to Obico server
+            Log($"[{printerConfig.Name}] Logging in to Obico server...");
+            var loginResult = await server.LoginAsync(email, password, allowSelfSignedCerts, ct);
+
+            if (!loginResult.Success)
+            {
+                Log($"[{printerConfig.Name}] Login failed: {loginResult.Error}");
+                return new LinkingResult
+                {
+                    Success = false,
+                    Error = loginResult.Error ?? "Login failed"
+                };
+            }
+
+            Log($"[{printerConfig.Name}] Login successful");
+
+            // Step 2: Get verification code
+            Log($"[{printerConfig.Name}] Getting verification code...");
+            var codeResult = await server.GetVerificationCodeAsync(
+                loginResult.Cookies!,
+                loginResult.CsrfToken!,
+                allowSelfSignedCerts,
+                ct);
+
+            if (!codeResult.Success)
+            {
+                Log($"[{printerConfig.Name}] Failed to get verification code: {codeResult.Error}");
+                return new LinkingResult
+                {
+                    Success = false,
+                    Error = codeResult.Error ?? "Failed to get verification code"
+                };
+            }
+
+            Log($"[{printerConfig.Name}] Got verification code: {codeResult.Code}");
+
+            // Step 3: Verify code and get auth token
+            Log($"[{printerConfig.Name}] Verifying code and linking printer...");
+            var verifyResult = await server.VerifyLinkCodeAsync(codeResult.Code!, ct);
+
+            if (verifyResult?.Printer?.AuthToken == null)
+            {
+                Log($"[{printerConfig.Name}] Verification failed");
+                return new LinkingResult
+                {
+                    Success = false,
+                    Error = "Verification failed - no auth token received"
+                };
+            }
+
+            // Generate device ID if not set
+            if (string.IsNullOrEmpty(printerConfig.Obico.ObicoDeviceId))
+            {
+                printerConfig.Obico.ObicoDeviceId = Guid.NewGuid().ToString("N");
+            }
+
+            // Update printer name on server to match ACProxyCam config
+            var updatedName = await TryUpdatePrinterNameAsync(
+                serverUrl,
+                verifyResult.Printer.AuthToken,
+                verifyResult.Printer.Id,
+                printerConfig.Name,
+                verifyResult.Printer.Name,
+                ct);
+
+            Log($"[{printerConfig.Name}] Linked successfully to Obico as '{updatedName}'");
+
+            return new LinkingResult
+            {
+                Success = true,
+                AuthToken = verifyResult.Printer.AuthToken,
+                PrinterName = updatedName,
+                PrinterId = verifyResult.Printer.Id,
+                IsPro = verifyResult.Printer.IsPro
+            };
+        }
+        catch (Exception ex)
+        {
+            Log($"[{printerConfig.Name}] Linking failed: {ex.Message}");
+            return new LinkingResult
+            {
+                Success = false,
+                Error = ex.Message
+            };
+        }
+    }
+
+    /// <summary>
     /// Unlink a printer from Obico.
     /// </summary>
     public void Unlink(PrinterConfig printerConfig)
@@ -329,6 +593,46 @@ public class ObicoLinkingService : IDisposable
         printerConfig.Obico.ObicoName = "";
 
         Log($"[{printerConfig.Name}] Unlinked from Obico");
+    }
+
+    /// <summary>
+    /// Try to update the printer name on the Obico server after successful linking.
+    /// This is a best-effort operation - if it fails, linking still succeeded.
+    /// </summary>
+    private async Task<string> TryUpdatePrinterNameAsync(
+        string serverUrl,
+        string authToken,
+        int printerId,
+        string newName,
+        string currentName,
+        CancellationToken ct = default)
+    {
+        if (printerId <= 0 || string.IsNullOrEmpty(newName))
+        {
+            return currentName;
+        }
+
+        try
+        {
+            using var server = new ObicoServerConnection(serverUrl, authToken);
+            var (success, error) = await server.UpdatePrinterNameAsync(printerId, newName, ct);
+
+            if (success)
+            {
+                Log($"Printer name updated to '{newName}' on Obico server");
+                return newName;
+            }
+            else
+            {
+                Log($"Could not update printer name: {error}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Could not update printer name: {ex.Message}");
+        }
+
+        return currentName;
     }
 
     private void OnDiscoveryCompleted(object? sender, DiscoveryCompletedEventArgs e)
@@ -441,6 +745,7 @@ public class LinkingResult
     public bool Success { get; set; }
     public string? AuthToken { get; set; }
     public string? PrinterName { get; set; }
+    public int PrinterId { get; set; }
     public bool IsPro { get; set; }
     public string? Error { get; set; }
 }

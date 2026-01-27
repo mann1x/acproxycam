@@ -21,7 +21,33 @@ public class PrinterManager
 
     public void UpdateConfig(AppConfig config)
     {
+        var oldConfig = _config;
         _config = config;
+
+        // Update Obico config for each running printer thread
+        lock (_lock)
+        {
+            foreach (var newPrinterConfig in config.Printers)
+            {
+                if (_printers.TryGetValue(newPrinterConfig.Name, out var thread))
+                {
+                    // Find old config for comparison
+                    var oldPrinterConfig = oldConfig.Printers.FirstOrDefault(p => p.Name == newPrinterConfig.Name);
+
+                    // Check if Obico config changed
+                    var obicoChanged = oldPrinterConfig == null ||
+                                       oldPrinterConfig.Obico.AuthToken != newPrinterConfig.Obico.AuthToken ||
+                                       oldPrinterConfig.Obico.Enabled != newPrinterConfig.Obico.Enabled ||
+                                       oldPrinterConfig.Obico.ServerUrl != newPrinterConfig.Obico.ServerUrl;
+
+                    if (obicoChanged)
+                    {
+                        // Fire and forget - update Obico config asynchronously
+                        _ = thread.UpdateObicoConfigAsync(newPrinterConfig.Obico);
+                    }
+                }
+            }
+        }
     }
 
     public async Task StartAllAsync()
@@ -85,6 +111,13 @@ public class PrinterManager
 
     private async Task StartPrinterAsync(PrinterConfig config, int cpuAffinity = -1)
     {
+        // Don't start disabled printers
+        if (!config.Enabled)
+        {
+            Logger.Log($"Printer '{config.Name}' is disabled, skipping...");
+            return;
+        }
+
         lock (_lock)
         {
             if (_printers.ContainsKey(config.Name))
@@ -142,18 +175,73 @@ public class PrinterManager
 
     public List<PrinterStatus> GetAllStatus()
     {
+        var result = new List<PrinterStatus>();
+
         lock (_lock)
         {
-            return _printers.Values.Select(p => p.GetStatus()).ToList();
+            // Add status for running printers
+            foreach (var printer in _printers.Values)
+            {
+                result.Add(printer.GetStatus());
+            }
         }
+
+        // Add status for disabled printers (not running)
+        foreach (var config in _config.Printers)
+        {
+            if (!config.Enabled)
+            {
+                result.Add(CreateDisabledStatus(config));
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Create a PrinterStatus for a disabled printer (no running thread).
+    /// </summary>
+    private static PrinterStatus CreateDisabledStatus(PrinterConfig config)
+    {
+        return new PrinterStatus
+        {
+            Name = config.Name,
+            Ip = config.Ip,
+            MjpegPort = config.MjpegPort,
+            DeviceType = config.DeviceType,
+            State = PrinterState.Disabled,
+            JpegQuality = config.JpegQuality,
+            H264StreamerEnabled = config.H264StreamerEnabled,
+            HlsEnabled = config.HlsEnabled,
+            LlHlsEnabled = config.LlHlsEnabled,
+            MjpegStreamerEnabled = config.MjpegStreamerEnabled,
+            ObicoStatus = new ObicoStatus
+            {
+                Enabled = config.Obico.Enabled,
+                IsLinked = config.Obico.IsLinked,
+                State = "Disabled"
+            }
+        };
     }
 
     public PrinterStatus? GetStatus(string name)
     {
         lock (_lock)
         {
-            return _printers.TryGetValue(name, out var printer) ? printer.GetStatus() : null;
+            if (_printers.TryGetValue(name, out var printer))
+            {
+                return printer.GetStatus();
+            }
         }
+
+        // Check if it's a disabled printer
+        var config = _config.Printers.FirstOrDefault(p => p.Name == name);
+        if (config != null && !config.Enabled)
+        {
+            return CreateDisabledStatus(config);
+        }
+
+        return null;
     }
 
     public PrinterConfig? GetConfig(string name)
@@ -234,13 +322,17 @@ public class PrinterManager
         _config.Printers.Add(config);
         await ConfigManager.SaveAsync(_config);
 
-        // Calculate CPU affinity for the new printer
-        // New printers get assigned based on total count
-        var cpuAssignments = CpuAffinityService.CalculateCpuAssignments(_config.Printers.Count);
-        var cpuAffinity = cpuAssignments.Length > 0 ? cpuAssignments[_config.Printers.Count - 1] : -1;
+        // Only start if enabled
+        if (config.Enabled)
+        {
+            // Calculate CPU affinity for the new printer
+            // New printers get assigned based on total count
+            var cpuAssignments = CpuAffinityService.CalculateCpuAssignments(_config.Printers.Count);
+            var cpuAffinity = cpuAssignments.Length > 0 ? cpuAssignments[_config.Printers.Count - 1] : -1;
 
-        // Start the printer thread
-        await StartPrinterAsync(config, cpuAffinity);
+            // Start the printer thread
+            await StartPrinterAsync(config, cpuAffinity);
+        }
 
         return IpcResponse.Ok();
     }
@@ -341,7 +433,7 @@ public class PrinterManager
             }
         }
 
-        // Stop existing thread
+        // Stop existing thread if running
         if (existingThread != null)
         {
             existingThread.ConfigChanged -= OnPrinterConfigChanged;
@@ -359,15 +451,19 @@ public class PrinterManager
         _config.Printers.Add(newConfig);
         await ConfigManager.SaveAsync(_config);
 
-        // Calculate CPU affinity for the restarted printer
-        var printerIndex = _config.Printers.FindIndex(p => p.Name == newConfig.Name);
-        var cpuAssignments = CpuAffinityService.CalculateCpuAssignments(_config.Printers.Count);
-        var cpuAffinity = printerIndex >= 0 && printerIndex < cpuAssignments.Length
-            ? cpuAssignments[printerIndex]
-            : -1;
+        // Only start if enabled
+        if (newConfig.Enabled)
+        {
+            // Calculate CPU affinity for the restarted printer
+            var printerIndex = _config.Printers.FindIndex(p => p.Name == newConfig.Name);
+            var cpuAssignments = CpuAffinityService.CalculateCpuAssignments(_config.Printers.Count);
+            var cpuAffinity = printerIndex >= 0 && printerIndex < cpuAssignments.Length
+                ? cpuAssignments[printerIndex]
+                : -1;
 
-        // Start with new config
-        await StartPrinterAsync(newConfig, cpuAffinity);
+            // Start with new config
+            await StartPrinterAsync(newConfig, cpuAffinity);
+        }
 
         return IpcResponse.Ok();
     }

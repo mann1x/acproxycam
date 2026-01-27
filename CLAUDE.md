@@ -104,6 +104,11 @@ Key code in `MqttCameraController.cs`:
 ## Important Implementation Details
 
 - **Encryption**: AES-256-GCM with key derived from `/etc/machine-id` + PBKDF2. Encrypted fields prefixed with `encrypted:`.
+- **Config file permissions**: All files in `/etc/acproxycam/` must be owned by `acproxycam:acproxycam` with mode 600 (rw-------). When manually editing the config with sudo/root, ownership changes to root which breaks the daemon. Restore permissions before starting:
+  ```bash
+  sudo chown acproxycam:acproxycam /etc/acproxycam/config.json
+  sudo chmod 600 /etc/acproxycam/config.json
+  ```
 - **FFmpeg**: Uses system FFmpeg libraries (`libavcodec`, `libavformat`). Code in `FfmpegDecoder.cs` uses unsafe C#.
 - **Threading**: One thread per printer (`PrinterThread`). Thread-safe operations use explicit `lock()` on object monitors. State fields marked `volatile`.
 - **IPC**: Unix socket at `/run/acproxycam/acproxycam.sock` for daemon-CLI communication.

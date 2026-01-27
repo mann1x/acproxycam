@@ -65,67 +65,27 @@ public static class ConfigManager
 #pragma warning restore CA1416
         }
 
-        // Clone config and encrypt credentials
-        var saveConfig = new AppConfig
-        {
-            Version = config.Version,
-            ListenInterfaces = config.ListenInterfaces,
-            LogToFile = config.LogToFile,
-            LogLevel = config.LogLevel,
-            Obico = new GlobalObicoConfig
-            {
-                DiscoveryPort = config.Obico.DiscoveryPort,
-                DefaultServerUrl = config.Obico.DefaultServerUrl
-            },
-            Printers = config.Printers.Select(p => new PrinterConfig
-            {
-                Name = p.Name,
-                Ip = p.Ip,
-                MjpegPort = p.MjpegPort,
-                SshPort = p.SshPort,
-                SshUser = p.SshUser,
-                SshPassword = EncryptIfNeeded(p.SshPassword),
-                MqttPort = p.MqttPort,
-                MqttUsername = EncryptIfNeeded(p.MqttUsername),
-                MqttPassword = EncryptIfNeeded(p.MqttPassword),
-                DeviceId = p.DeviceId,
-                ModelCode = p.ModelCode,
-                DeviceType = p.DeviceType,
-                MaxFps = p.MaxFps,
-                IdleFps = p.IdleFps,
-                JpegQuality = p.JpegQuality,
-                SendStopCommand = p.SendStopCommand,
-                AutoLanMode = p.AutoLanMode,
-                LedAutoControl = p.LedAutoControl,
-                StandbyLedTimeoutMinutes = p.StandbyLedTimeoutMinutes,
-                CameraEnabled = p.CameraEnabled,
-                Obico = new PrinterObicoConfig
-                {
-                    Enabled = p.Obico.Enabled,
-                    ServerUrl = p.Obico.ServerUrl,
-                    AuthToken = EncryptIfNeeded(p.Obico.AuthToken),
-                    ObicoDeviceId = p.Obico.ObicoDeviceId,
-                    DeviceSecret = EncryptIfNeeded(p.Obico.DeviceSecret),
-                    TargetFps = p.Obico.TargetFps,
-                    SnapshotsEnabled = p.Obico.SnapshotsEnabled,
-                    IsPro = p.Obico.IsPro,
-                    ObicoName = p.Obico.ObicoName
-                },
-                Firmware = new FirmwareInfo
-                {
-                    Type = p.Firmware.Type,
-                    Version = p.Firmware.Version,
-                    MoonrakerAvailable = p.Firmware.MoonrakerAvailable,
-                    MoonrakerPort = p.Firmware.MoonrakerPort,
-                    ConfigPath = p.Firmware.ConfigPath,
-                    DetectedAt = p.Firmware.DetectedAt
-                }
-            }).ToList()
-        };
-
+        // Deep clone config via JSON serialization (preserves all properties automatically)
         var options = new JsonSerializerOptions { WriteIndented = true };
-        var json = JsonSerializer.Serialize(saveConfig, options);
+        var json = JsonSerializer.Serialize(config, options);
+        var saveConfig = JsonSerializer.Deserialize<AppConfig>(json)!;
 
+        // Encrypt sensitive fields in the clone
+        foreach (var printer in saveConfig.Printers)
+        {
+            printer.SshPassword = EncryptIfNeeded(printer.SshPassword);
+            printer.MqttUsername = EncryptIfNeeded(printer.MqttUsername);
+            printer.MqttPassword = EncryptIfNeeded(printer.MqttPassword);
+
+            if (printer.Obico != null)
+            {
+                printer.Obico.AuthToken = EncryptIfNeeded(printer.Obico.AuthToken);
+                printer.Obico.DeviceSecret = EncryptIfNeeded(printer.Obico.DeviceSecret);
+            }
+        }
+
+        // Serialize the encrypted clone and save
+        json = JsonSerializer.Serialize(saveConfig, options);
         await File.WriteAllTextAsync(ConfigFile, json);
 
         // Set file permissions (rw for owner only)
