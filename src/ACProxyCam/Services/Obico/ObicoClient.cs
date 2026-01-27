@@ -15,6 +15,7 @@ public class ObicoClient : IDisposable
     private readonly PrinterObicoConfig _obicoConfig;
     private readonly bool _isCloud;
     private readonly MoonrakerApiClient _moonraker;
+    private readonly bool _ownsMoonraker;  // If false, don't dispose (shared instance)
     private ObicoServerConnection? _obicoServer;
 
     private CancellationTokenSource? _cts;
@@ -179,13 +180,25 @@ public class ObicoClient : IDisposable
     /// </summary>
     /// <param name="printerConfig">The printer configuration.</param>
     /// <param name="configOverride">Optional config override for cloud vs local instance. If null, uses printerConfig.Obico.</param>
-    public ObicoClient(PrinterConfig printerConfig, PrinterObicoConfig? configOverride = null)
+    /// <param name="sharedMoonraker">Optional shared MoonrakerApiClient. If provided, this client won't own or dispose it.</param>
+    public ObicoClient(PrinterConfig printerConfig, PrinterObicoConfig? configOverride = null, MoonrakerApiClient? sharedMoonraker = null)
     {
         _printerConfig = printerConfig;
         _obicoConfig = configOverride ?? printerConfig.Obico;
         _isCloud = IsCloudServer(_obicoConfig.ServerUrl);
-        _moonraker = new MoonrakerApiClient(printerConfig.Ip, printerConfig.Firmware.MoonrakerPort);
         _verbose = Environment.GetEnvironmentVariable("ACPROXYCAM_VERBOSE") == "1";
+
+        // Use shared Moonraker client or create our own
+        if (sharedMoonraker != null)
+        {
+            _moonraker = sharedMoonraker;
+            _ownsMoonraker = false;
+        }
+        else
+        {
+            _moonraker = new MoonrakerApiClient(printerConfig.Ip, printerConfig.Firmware.MoonrakerPort);
+            _ownsMoonraker = true;
+        }
 
         // Wire up Moonraker events
         _moonraker.StatusUpdateReceived += OnMoonrakerStatusUpdate;
@@ -270,11 +283,18 @@ public class ObicoClient : IDisposable
         {
             SetState(ObicoClientState.Connecting);
 
-            // Connect to Moonraker first
-            Log("Connecting to Moonraker...");
-            await _moonraker.ConnectWebSocketAsync(_cts.Token);
-            await _moonraker.SubscribeToObicoObjectsAsync();
-            Log("Connected to Moonraker");
+            // Connect to Moonraker first (skip if already connected - shared client)
+            if (!_moonraker.IsConnected)
+            {
+                Log("Connecting to Moonraker...");
+                await _moonraker.ConnectWebSocketAsync(_cts.Token);
+                await _moonraker.SubscribeToObicoObjectsAsync();
+                Log("Connected to Moonraker");
+            }
+            else
+            {
+                Log("Using shared Moonraker connection");
+            }
 
             // Initialize status from current state
             await InitializeStatusAsync();
@@ -363,20 +383,12 @@ public class ObicoClient : IDisposable
     /// <summary>
     /// Start Janus WebRTC gateway for real-time streaming.
     /// For self-hosted Obico: connects to Janus on the Obico server.
-    /// For cloud Obico: Janus is not available (cloud handles streaming internally).
+    /// For cloud Obico: also requires Janus - video is relayed through Obico Cloud infrastructure.
     /// </summary>
     private async Task StartJanusAsync()
     {
         try
         {
-            // Cloud Obico (app.obico.io) handles WebRTC internally - no Janus needed
-            if (_isCloud)
-            {
-                Log("Cloud Obico - streaming handled by cloud infrastructure");
-                _janusEnabled = false;
-                return;
-            }
-
             // Check if Janus is explicitly disabled in config
             var janusServer = GetJanusServerAddress();
             if (string.IsNullOrEmpty(janusServer) || janusServer.Equals("disabled", StringComparison.OrdinalIgnoreCase))
@@ -448,7 +460,10 @@ public class ObicoClient : IDisposable
     }
 
     /// <summary>
-    /// Get Janus server address from config, or extract from Obico server URL.
+    /// Get Janus server address from config.
+    /// Default is localhost:8188 (standard Janus WebSocket port).
+    /// For Docker: Janus is included in the container, so localhost works.
+    /// For self-hosted setups: can point to external Janus server.
     /// </summary>
     private string? GetJanusServerAddress()
     {
@@ -459,19 +474,50 @@ public class ObicoClient : IDisposable
             return configuredServer;
         }
 
-        // Default: extract host from Obico server URL (assumes Janus is on same server)
-        try
+        // For cloud Obico, use the same Janus server as local Obico
+        // Cloud and local should both stream to the same Janus for WebRTC relay
+        if (_isCloud)
         {
-            var serverUrl = _obicoConfig.ServerUrl;
-            if (!string.IsNullOrEmpty(serverUrl))
+            // First check if local Obico has explicit Janus server configured
+            var localObicoJanus = _printerConfig.Obico?.JanusServer;
+            if (!string.IsNullOrEmpty(localObicoJanus))
             {
-                var uri = new Uri(serverUrl);
-                return uri.Host;
+                Log($"Using local Obico's Janus server for cloud streaming: {localObicoJanus}");
+                return localObicoJanus;
             }
-        }
-        catch { }
 
-        return null;
+            // Fall back to extracting host from local Obico's server URL
+            try
+            {
+                var localServerUrl = _printerConfig.Obico?.ServerUrl;
+                if (!string.IsNullOrEmpty(localServerUrl))
+                {
+                    var uri = new Uri(localServerUrl);
+                    Log($"Using local Obico's server host for cloud Janus: {uri.Host}");
+                    return uri.Host;
+                }
+            }
+            catch { }
+        }
+
+        // Default for self-hosted: extract host from Obico server URL (assumes Janus is on same server)
+        if (!_isCloud)
+        {
+            try
+            {
+                var serverUrl = _obicoConfig.ServerUrl;
+                if (!string.IsNullOrEmpty(serverUrl))
+                {
+                    var uri = new Uri(serverUrl);
+                    return uri.Host;
+                }
+            }
+            catch { }
+        }
+
+        // Default: localhost with standard Janus port
+        // This works for Docker (Janus included) and local installs
+        return "127.0.0.1";
     }
 
     /// <summary>
@@ -1560,11 +1606,22 @@ public class ObicoClient : IDisposable
                 await Task.Delay(TimeSpan.FromSeconds(ReconnectDelaySeconds), ct);
 
                 // Check if Moonraker connection needs reconnecting
+                // Only reconnect if we own the Moonraker connection (not shared)
                 if (!_moonraker.IsConnected)
                 {
-                    Log("Reconnecting to Moonraker...");
-                    await _moonraker.ConnectWebSocketAsync(ct);
-                    await _moonraker.SubscribeToObicoObjectsAsync();
+                    if (_ownsMoonraker)
+                    {
+                        Log("Reconnecting to Moonraker...");
+                        await _moonraker.ConnectWebSocketAsync(ct);
+                        await _moonraker.SubscribeToObicoObjectsAsync();
+                        Log("Reconnected to Moonraker");
+                    }
+                    else
+                    {
+                        // Shared Moonraker - wait for it to be reconnected by owner
+                        Log("Waiting for shared Moonraker connection...");
+                        continue; // Skip this attempt, wait for next cycle
+                    }
 
                     // Re-initialize status from current Moonraker state
                     // This clears stale "Offline" state and updates flags
@@ -1611,8 +1668,6 @@ public class ObicoClient : IDisposable
                             Log($"Error restarting Janus: {ex.Message}");
                         }
                     }
-
-                    Log("Reconnected to Moonraker");
                 }
 
                 // Check if Obico connection needs reconnecting
@@ -2419,7 +2474,12 @@ public class ObicoClient : IDisposable
         _janusStreamer?.Dispose();
         _janusClient?.Dispose();
         _obicoServer?.Dispose();
-        _moonraker.Dispose();
+
+        // Only dispose Moonraker if we own it (not shared)
+        if (_ownsMoonraker)
+        {
+            _moonraker.Dispose();
+        }
     }
 }
 

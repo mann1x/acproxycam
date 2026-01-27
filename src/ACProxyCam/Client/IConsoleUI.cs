@@ -54,6 +54,12 @@ public interface IConsoleUI
     string Ask(string prompt, string? defaultValue = null);
 
     /// <summary>
+    /// Ask for optional string input that allows empty input and Esc to cancel.
+    /// Returns null if user presses Escape, empty string if user presses Enter with no input.
+    /// </summary>
+    string? AskOptional(string prompt, string? currentValue = null);
+
+    /// <summary>
     /// Ask for an integer input.
     /// </summary>
     int AskInt(string prompt, int defaultValue);

@@ -39,6 +39,7 @@ public class PrinterThread : IDisposable
     private MqttCameraController? _mqttController;
     private FfmpegDecoder? _decoder;
     private MjpegServer? _mjpegServer;
+    private MoonrakerApiClient? _sharedMoonraker; // Shared Moonraker connection for all Obico clients
     private ObicoClient? _obicoClient;           // Local Obico server
     private ObicoClient? _obicoCloudClient;      // Obico Cloud (app.obico.io)
 
@@ -826,6 +827,43 @@ public class PrinterThread : IDisposable
             return;
         }
 
+        // Check if any Obico client needs to be started
+        var localNeeded = Config.Obico.Enabled && Config.Obico.IsLinked;
+        var cloudNeeded = Config.ObicoCloud.Enabled && Config.ObicoCloud.IsLinked;
+
+        if (!localNeeded && !cloudNeeded)
+        {
+            // No clients needed, skip Moonraker connection
+            return;
+        }
+
+        // Create shared Moonraker client for all Obico instances
+        _sharedMoonraker = new MoonrakerApiClient(Config.Ip, Config.Firmware.MoonrakerPort);
+
+        // Connect to Moonraker WebSocket and subscribe to objects ONCE
+        // Both clients will share this connection and receive events
+        try
+        {
+            LogStatus("Obico: Connecting to shared Moonraker...");
+
+            // Handle Moonraker reconnection at PrinterThread level
+            _sharedMoonraker.ConnectionStateChanged += OnSharedMoonrakerConnectionChanged;
+
+            await _sharedMoonraker.ConnectWebSocketAsync(ct);
+            await _sharedMoonraker.SubscribeToObicoObjectsAsync();
+            LogStatus("Obico: Shared Moonraker connection established");
+        }
+        catch (Exception ex)
+        {
+            LogStatus($"Obico: Failed to connect to Moonraker: {ex.Message}");
+            _obicoStatus.State = "Moonraker Error";
+            _obicoCloudStatus.State = "Moonraker Error";
+            _sharedMoonraker.ConnectionStateChanged -= OnSharedMoonrakerConnectionChanged;
+            _sharedMoonraker.Dispose();
+            _sharedMoonraker = null;
+            return;
+        }
+
         // Start local Obico client (if enabled and linked)
         _obicoClient = await StartObicoClientInstanceAsync(
             Config.Obico,
@@ -880,7 +918,8 @@ public class PrinterThread : IDisposable
             LogStatus($"{label}: Starting client...");
             status.State = "Starting";
 
-            client = new ObicoClient(Config, config);
+            // Pass shared Moonraker client to avoid multiple WebSocket connections
+            client = new ObicoClient(Config, config, _sharedMoonraker);
             client.StatusChanged += (s, msg) => LogStatus($"{label}: {msg}");
 
             if (isCloud)
@@ -940,6 +979,57 @@ public class PrinterThread : IDisposable
             // Don't throw - Obico failure shouldn't stop the camera
             return client;  // May be null or partially initialized
         }
+    }
+
+    /// <summary>
+    /// Handle shared Moonraker connection state changes.
+    /// Reconnects the WebSocket if disconnected.
+    /// </summary>
+    private void OnSharedMoonrakerConnectionChanged(object? sender, bool connected)
+    {
+        if (!connected && _sharedMoonraker != null && _state == PrinterState.Running)
+        {
+            LogStatus("Obico: Shared Moonraker connection lost, reconnecting...");
+            _ = ReconnectSharedMoonrakerAsync();
+        }
+    }
+
+    private async Task ReconnectSharedMoonrakerAsync()
+    {
+        if (_sharedMoonraker == null)
+            return;
+
+        const int maxAttempts = 10;
+        const int delaySeconds = 5;
+
+        for (int i = 0; i < maxAttempts; i++)
+        {
+            if (_state != PrinterState.Running)
+                return; // Stop reconnecting if printer is stopped
+
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
+
+                if (_sharedMoonraker.IsConnected)
+                {
+                    LogStatus("Obico: Shared Moonraker connection restored");
+                    return;
+                }
+
+                LogStatus($"Obico: Shared Moonraker reconnection attempt {i + 1}/{maxAttempts}...");
+                await _sharedMoonraker.ConnectWebSocketAsync(CancellationToken.None);
+                await _sharedMoonraker.SubscribeToObicoObjectsAsync();
+                LogStatus("Obico: Shared Moonraker reconnected");
+                return;
+            }
+            catch (Exception ex)
+            {
+                LogStatus($"Obico: Moonraker reconnection failed: {ex.Message}");
+            }
+        }
+
+        LogStatus("Obico: Shared Moonraker reconnection failed after max attempts");
     }
 
     private void OnObicoStateChanged(object? sender, ObicoClientState state)
@@ -1917,6 +2007,14 @@ public class PrinterThread : IDisposable
             _obicoCloudClient = null;
             _obicoCloudStatus.State = "Stopped";
             _obicoCloudStatus.ServerConnected = false;
+        }
+
+        // Dispose shared Moonraker client (after Obico clients are stopped)
+        if (_sharedMoonraker != null)
+        {
+            _sharedMoonraker.ConnectionStateChanged -= OnSharedMoonrakerConnectionChanged;
+            _sharedMoonraker.Dispose();
+            _sharedMoonraker = null;
         }
 
         // Stop decoder

@@ -87,6 +87,25 @@ public class SimpleConsoleUI : IConsoleUI
         return input ?? string.Empty;
     }
 
+    public string? AskOptional(string prompt, string? currentValue = null)
+    {
+        if (!string.IsNullOrEmpty(currentValue))
+        {
+            Console.Write($"{prompt} [{currentValue}]: ");
+        }
+        else
+        {
+            Console.Write($"{prompt}: ");
+        }
+        Console.Out.Flush();
+
+        var input = Console.ReadLine()?.Trim();
+
+        // Empty input returns empty string (keeps current)
+        // Note: SimpleConsoleUI doesn't support Esc key detection
+        return input ?? string.Empty;
+    }
+
     public int AskInt(string prompt, int defaultValue)
     {
         Console.Write($"{prompt} [{defaultValue}]: ");

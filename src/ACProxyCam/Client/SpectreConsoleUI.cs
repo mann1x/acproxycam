@@ -61,6 +61,22 @@ public class SpectreConsoleUI : IConsoleUI
         return AnsiConsole.Ask<string>(escapedPrompt);
     }
 
+    public string? AskOptional(string prompt, string? currentValue = null)
+    {
+        var escapedPrompt = Markup.Escape(prompt);
+        var textPrompt = new TextPrompt<string>(escapedPrompt)
+            .AllowEmpty();
+
+        if (!string.IsNullOrEmpty(currentValue))
+        {
+            textPrompt.DefaultValue(currentValue);
+        }
+
+        // Note: Spectre.Console doesn't natively support Esc to cancel in TextPrompt
+        // The user can press Enter with empty input to keep current value
+        return AnsiConsole.Prompt(textPrompt);
+    }
+
     public int AskInt(string prompt, int defaultValue)
     {
         var escapedPrompt = Markup.Escape(prompt);

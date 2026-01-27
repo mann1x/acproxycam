@@ -2563,17 +2563,30 @@ WantedBy=multi-user.target
             _ui.WriteLine();
 
             // Build menu with both local and cloud settings
+            // Note: Use (Local) and (Cloud) prefixes instead of [brackets] to avoid Spectre markup issues
+
+            // Calculate the effective Janus server (derived if not explicitly set)
+            var effectiveJanusServer = GetEffectiveJanusServer(printerConfig);
+            var janusDisplay = string.IsNullOrEmpty(printerConfig.Obico.JanusServer)
+                ? (printerConfig.Obico.JanusServer == "disabled" ? "Disabled" : $"{effectiveJanusServer} (auto)")
+                : printerConfig.Obico.JanusServer;
+            if (printerConfig.Obico.JanusServer == "disabled")
+                janusDisplay = "Disabled";
+
             var choices = new List<string>
             {
-                // Local settings header
-                $"[Local] Enable/Disable: {(printerConfig.Obico.Enabled ? "Enabled" : "Disabled")}",
-                $"[Local] Snapshots: {(printerConfig.Obico.SnapshotsEnabled ? "Enabled" : "Disabled")}",
-                $"[Local] Target FPS: {printerConfig.Obico.TargetFps}",
+                // Local settings
+                $"(Local) Enable/Disable: {(printerConfig.Obico.Enabled ? "Enabled" : "Disabled")}",
+                $"(Local) Snapshots: {(printerConfig.Obico.SnapshotsEnabled ? "Enabled" : "Disabled")}",
+                $"(Local) Target FPS: {printerConfig.Obico.TargetFps}",
 
-                // Cloud settings header
-                $"[Cloud] Enable/Disable: {(printerConfig.ObicoCloud.Enabled ? "Enabled" : "Disabled")}",
-                $"[Cloud] Snapshots: {(printerConfig.ObicoCloud.SnapshotsEnabled ? "Enabled" : "Disabled")}",
-                $"[Cloud] Target FPS: {printerConfig.ObicoCloud.TargetFps}",
+                // Cloud settings
+                $"(Cloud) Enable/Disable: {(printerConfig.ObicoCloud.Enabled ? "Enabled" : "Disabled")}",
+                $"(Cloud) Snapshots: {(printerConfig.ObicoCloud.SnapshotsEnabled ? "Enabled" : "Disabled")}",
+                $"(Cloud) Target FPS: {printerConfig.ObicoCloud.TargetFps}",
+
+                // Janus server configuration
+                $"Janus Server: {janusDisplay}",
 
                 // Other options
                 "Detect firmware",
@@ -2584,15 +2597,15 @@ WantedBy=multi-user.target
             if (choice == null || choice == "Back")
                 break;
 
-            if (choice.StartsWith("[Local] Enable"))
+            if (choice.StartsWith("(Local) Enable"))
             {
                 printerConfig.Obico.Enabled = !printerConfig.Obico.Enabled;
             }
-            else if (choice.StartsWith("[Local] Snapshots"))
+            else if (choice.StartsWith("(Local) Snapshots"))
             {
                 printerConfig.Obico.SnapshotsEnabled = !printerConfig.Obico.SnapshotsEnabled;
             }
-            else if (choice.StartsWith("[Local] Target"))
+            else if (choice.StartsWith("(Local) Target"))
             {
                 var fpsStr = _ui.Ask($"Enter target FPS (1-25, current: {printerConfig.Obico.TargetFps}):");
                 if (int.TryParse(fpsStr, out var fps) && fps >= 1 && fps <= 25)
@@ -2600,20 +2613,64 @@ WantedBy=multi-user.target
                     printerConfig.Obico.TargetFps = fps;
                 }
             }
-            else if (choice.StartsWith("[Cloud] Enable"))
+            else if (choice.StartsWith("(Cloud) Enable"))
             {
                 printerConfig.ObicoCloud.Enabled = !printerConfig.ObicoCloud.Enabled;
             }
-            else if (choice.StartsWith("[Cloud] Snapshots"))
+            else if (choice.StartsWith("(Cloud) Snapshots"))
             {
                 printerConfig.ObicoCloud.SnapshotsEnabled = !printerConfig.ObicoCloud.SnapshotsEnabled;
             }
-            else if (choice.StartsWith("[Cloud] Target"))
+            else if (choice.StartsWith("(Cloud) Target"))
             {
                 var fpsStr = _ui.Ask($"Enter target FPS (1-25, current: {printerConfig.ObicoCloud.TargetFps}):");
                 if (int.TryParse(fpsStr, out var fps) && fps >= 1 && fps <= 25)
                 {
                     printerConfig.ObicoCloud.TargetFps = fps;
+                }
+            }
+            else if (choice.StartsWith("Janus Server"))
+            {
+                // Check if Janus is currently enabled
+                var currentlyEnabled = printerConfig.Obico.JanusServer != "disabled";
+                var enableJanus = _ui.Confirm("Enable Janus WebRTC streaming?", currentlyEnabled);
+
+                if (!enableJanus)
+                {
+                    printerConfig.Obico.JanusServer = "disabled";
+                    printerConfig.ObicoCloud.JanusServer = "disabled";
+                    _ui.WriteInfo("Janus WebRTC streaming disabled.");
+                }
+                else
+                {
+                    var currentServer = printerConfig.Obico.JanusServer == "disabled" ? "" : printerConfig.Obico.JanusServer;
+                    var derivedServer = GetEffectiveJanusServer(printerConfig);
+
+                    _ui.WriteLine();
+                    _ui.WriteLine("Enter Janus server address (host:port or just host for default port 8188)");
+                    _ui.WriteInfo($"Leave empty to auto-detect from Obico server URL ({derivedServer})");
+
+                    var janusInput = _ui.AskOptional("Janus server", currentServer);
+
+                    if (janusInput == null)
+                    {
+                        // User cancelled (Esc) - keep current value
+                        _ui.WriteInfo("Cancelled - keeping current value.");
+                    }
+                    else if (string.IsNullOrWhiteSpace(janusInput))
+                    {
+                        // Empty input - use auto-detect (clear explicit setting)
+                        printerConfig.Obico.JanusServer = "";
+                        printerConfig.ObicoCloud.JanusServer = "";
+                        _ui.WriteSuccess($"Using auto-detected Janus server: {derivedServer}");
+                    }
+                    else
+                    {
+                        // User entered a value
+                        printerConfig.Obico.JanusServer = janusInput.Trim();
+                        printerConfig.ObicoCloud.JanusServer = janusInput.Trim();
+                        _ui.WriteSuccess($"Janus server set to: {janusInput.Trim()}");
+                    }
                 }
             }
             else if (choice == "Detect firmware")
@@ -2653,6 +2710,33 @@ WantedBy=multi-user.target
         await ConfigManager.SaveAsync(config);
         _ui.WriteSuccess("Firmware info saved to config.");
         _ui.WaitForKey();
+    }
+
+    /// <summary>
+    /// Get the effective Janus server address for a printer.
+    /// Derives from local Obico server URL if not explicitly configured.
+    /// </summary>
+    private string GetEffectiveJanusServer(PrinterConfig printerConfig)
+    {
+        // If explicitly configured, use that
+        var configured = printerConfig.Obico?.JanusServer;
+        if (!string.IsNullOrEmpty(configured) && configured != "disabled")
+            return configured;
+
+        // Try to extract host from local Obico server URL
+        try
+        {
+            var serverUrl = printerConfig.Obico?.ServerUrl;
+            if (!string.IsNullOrEmpty(serverUrl))
+            {
+                var uri = new Uri(serverUrl);
+                return uri.Host;
+            }
+        }
+        catch { }
+
+        // Default fallback
+        return "localhost:8188";
     }
 
     private async Task DetectFirmwareForPrinterAsync(PrinterConfig printerConfig)
