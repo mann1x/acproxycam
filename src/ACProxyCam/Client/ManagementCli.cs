@@ -477,10 +477,10 @@ public class ManagementCli
         var interfaces = GetNetworkInterfaces();
 
         // First, ask what to do with a single-select prompt
-        var actionChoices = new List<string> { "All interfaces (0.0.0.0)", "Select specific interfaces", "Back" };
+        var actionChoices = new List<string> { "All interfaces (0.0.0.0)", "Select specific interfaces" };
         var action = _ui.SelectOneWithEscape("Select listening interfaces for MJPEG streams:", actionChoices);
 
-        if (action == null || action == "Back")
+        if (action == null)
         {
             return null;
         }
@@ -2122,7 +2122,7 @@ WantedBy=multi-user.target
 
         // Select connection type
         _ui.WriteLine();
-        var connectionChoice = _ui.SelectOne("Select connection type:", new[]
+        var connectionChoice = _ui.SelectOneWithEscape("Select connection type:", new[]
         {
             "Link to Obico Cloud (app.obico.io)",
             "Link to local Obico server"
@@ -2212,7 +2212,7 @@ WantedBy=multi-user.target
 
         // Select linking method
         _ui.WriteLine();
-        var linkingMethod = _ui.SelectOne("Select linking method:", new[]
+        var linkingMethod = _ui.SelectOneWithEscape("Select linking method:", new[]
         {
             "Direct login (enter Obico credentials) - Recommended",
             "Manual linking (generates code to enter in Obico app)"
@@ -2589,12 +2589,11 @@ WantedBy=multi-user.target
                 $"Janus Server: {janusDisplay}",
 
                 // Other options
-                "Detect firmware",
-                "Back"
+                "Detect firmware"
             };
 
-            var choice = _ui.SelectOne("Select setting:", choices.ToArray());
-            if (choice == null || choice == "Back")
+            var choice = _ui.SelectOneWithEscape("Select setting:", choices.ToArray());
+            if (choice == null)
                 break;
 
             if (choice.StartsWith("(Local) Enable"))
