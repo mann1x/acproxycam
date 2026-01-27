@@ -785,6 +785,16 @@ WantedBy=multi-user.target
         Obico
     }
 
+    private enum ObicoMenuAction
+    {
+        None,
+        Back,
+        Link,
+        Unlink,
+        Configure,
+        DetectFirmware
+    }
+
     private async Task<int> ManagementLoopAsync()
     {
         while (true)
@@ -2009,16 +2019,156 @@ WantedBy=multi-user.target
         // Load config to check Obico settings
         var config = await ConfigManager.LoadAsync();
 
-        // Filter out disabled printers for operations that require connection
+        // Use simple menu for automation mode
+        if (_useSimpleUi)
+        {
+            await ShowObicoMenuSimpleAsync(config, printers);
+            return;
+        }
+
+        // Spectre.Console auto-refreshing dashboard
+        while (true)
+        {
+            var action = ObicoMenuAction.None;
+
+            // Clear and render Obico dashboard using Live display
+            AnsiConsole.Clear();
+
+            await AnsiConsole.Live(Text.Empty)
+                .AutoClear(false)
+                .StartAsync(async ctx =>
+                {
+                    var lastRefresh = DateTime.MinValue;
+
+                    while (action == ObicoMenuAction.None)
+                    {
+                        // Fetch fresh data
+                        var (_, freshPrinters, _) = await _ipcClient!.ListPrintersAsync();
+                        config = await ConfigManager.LoadAsync();
+
+                        // Build and render Obico dashboard
+                        var dashboard = BuildObicoDashboard(config, freshPrinters ?? printers);
+                        ctx.UpdateTarget(dashboard);
+                        lastRefresh = DateTime.UtcNow;
+
+                        // Wait for key input with timeout for auto-refresh
+                        while (action == ObicoMenuAction.None)
+                        {
+                            // Check for timeout - need to refresh
+                            if ((DateTime.UtcNow - lastRefresh).TotalMilliseconds >= RefreshIntervalMs)
+                                break;
+
+                            // Check for key input (non-blocking)
+                            if (Console.KeyAvailable)
+                            {
+                                var key = Console.ReadKey(true).Key;
+                                action = key switch
+                                {
+                                    ConsoleKey.Escape => ObicoMenuAction.Back,
+                                    ConsoleKey.L => ObicoMenuAction.Link,
+                                    ConsoleKey.U => ObicoMenuAction.Unlink,
+                                    ConsoleKey.C => ObicoMenuAction.Configure,
+                                    ConsoleKey.D => ObicoMenuAction.DetectFirmware,
+                                    _ => ObicoMenuAction.None
+                                };
+                                break;
+                            }
+
+                            await Task.Delay(50);
+                        }
+                    }
+                });
+
+            // Handle actions outside Live context
+            var enabledPrinters = printers.Where(p => p.State != PrinterState.Disabled).ToList();
+
+            switch (action)
+            {
+                case ObicoMenuAction.Back:
+                    return;
+
+                case ObicoMenuAction.Link:
+                    AnsiConsole.Clear();
+                    if (enabledPrinters.Count == 0)
+                    {
+                        _ui.WriteWarning("No enabled printers available.");
+                        await Task.Delay(1500);
+                    }
+                    else
+                    {
+                        await LinkPrinterToObicoAsync(config, enabledPrinters);
+                        config = await ConfigManager.LoadAsync();
+                    }
+                    break;
+
+                case ObicoMenuAction.Unlink:
+                    AnsiConsole.Clear();
+                    if (enabledPrinters.Count == 0)
+                    {
+                        _ui.WriteWarning("No enabled printers available.");
+                        await Task.Delay(1500);
+                    }
+                    else
+                    {
+                        await UnlinkPrinterFromObicoAsync(config, enabledPrinters);
+                        config = await ConfigManager.LoadAsync();
+                    }
+                    break;
+
+                case ObicoMenuAction.Configure:
+                    AnsiConsole.Clear();
+                    var (_, allPrinters, _) = await _ipcClient!.ListPrintersAsync();
+                    await ConfigureObicoSettingsAsync(config, allPrinters ?? printers);
+                    config = await ConfigManager.LoadAsync();
+                    break;
+
+                case ObicoMenuAction.DetectFirmware:
+                    AnsiConsole.Clear();
+                    if (enabledPrinters.Count == 0)
+                    {
+                        _ui.WriteWarning("No enabled printers available.");
+                        await Task.Delay(1500);
+                    }
+                    else
+                    {
+                        await DetectFirmwareAsync(config, enabledPrinters);
+                        config = await ConfigManager.LoadAsync();
+                    }
+                    break;
+            }
+
+            // Refresh printer list for next iteration
+            var (_, updatedPrinters, _) = await _ipcClient!.ListPrintersAsync();
+            if (updatedPrinters != null)
+                printers = updatedPrinters;
+        }
+    }
+
+    /// <summary>
+    /// Simple text-based Obico menu for automation and expect scripts.
+    /// </summary>
+    private async Task ShowObicoMenuSimpleAsync(AppConfig config, List<PrinterStatus> printers)
+    {
         var enabledPrinters = printers.Where(p => p.State != PrinterState.Disabled).ToList();
 
         int lastSelectedIndex = 0;
-        var menuChoices = new[] { "Link printer to Obico", "Unlink printer", "View Obico status", "Configure settings", "Detect firmware" };
+        var menuChoices = new[] { "Link printer to Obico", "Unlink printer", "Configure settings", "Detect firmware" };
 
         while (true)
         {
             _ui.Clear();
             _ui.WriteRule("Obico Integration");
+            _ui.WriteLine();
+
+            // Show simple status
+            foreach (var printerConfig in config.Printers)
+            {
+                var printerStatus = printers.FirstOrDefault(p => p.Name == printerConfig.Name);
+                var localStatus = printerConfig.Obico.IsLinked ? "[green]Linked[/]" : "[grey]Not linked[/]";
+                var cloudStatus = printerConfig.ObicoCloud.IsLinked ? "[green]Linked[/]" : "[grey]Not linked[/]";
+                _ui.WriteMarkup($"[white]{printerConfig.Name}[/]: Local={localStatus}, Cloud={cloudStatus}");
+                _ui.WriteLine();
+            }
             _ui.WriteLine();
 
             var (choice, selectedIndex) = _ui.SelectOneWithEscapeAndIndex("Select action:", menuChoices, lastSelectedIndex);
@@ -2038,7 +2188,7 @@ WantedBy=multi-user.target
                         break;
                     }
                     await LinkPrinterToObicoAsync(config, enabledPrinters);
-                    config = await ConfigManager.LoadAsync(); // Reload after changes
+                    config = await ConfigManager.LoadAsync();
                     break;
 
                 case "Unlink printer":
@@ -2052,12 +2202,8 @@ WantedBy=multi-user.target
                     config = await ConfigManager.LoadAsync();
                     break;
 
-                case "View Obico status":
-                    await ShowObicoStatusAsync(config, printers);  // Show all printers
-                    break;
-
                 case "Configure settings":
-                    await ConfigureObicoSettingsAsync(config, printers);  // Allow config for all
+                    await ConfigureObicoSettingsAsync(config, printers);
                     config = await ConfigManager.LoadAsync();
                     break;
 
@@ -2072,7 +2218,309 @@ WantedBy=multi-user.target
                     config = await ConfigManager.LoadAsync();
                     break;
             }
+
+            // Refresh data
+            var (_, updatedPrinters, _) = await _ipcClient!.ListPrintersAsync();
+            if (updatedPrinters != null)
+                printers = updatedPrinters;
+            enabledPrinters = printers.Where(p => p.State != PrinterState.Disabled).ToList();
         }
+    }
+
+    /// <summary>
+    /// Build the Obico dashboard with auto-refreshing table.
+    /// </summary>
+    private Rows BuildObicoDashboard(AppConfig config, List<PrinterStatus> printers)
+    {
+        var renderables = new List<Spectre.Console.Rendering.IRenderable>();
+
+        // === HEADER ===
+        var headerTable = new Table()
+            .Border(TableBorder.Rounded)
+            .BorderColor(Color.Purple)
+            .AddColumn(new TableColumn("[bold purple]Obico Integration[/]").Centered());
+
+        headerTable.AddRow($"[grey]v{Program.Version}[/]");
+        renderables.Add(headerTable);
+        renderables.Add(Text.Empty);
+
+        // === PRINTERS TABLE ===
+        if (config.Printers.Count == 0)
+        {
+            renderables.Add(new Panel("[grey]No printers configured.[/]")
+                .Border(BoxBorder.Rounded)
+                .BorderColor(Color.Grey));
+        }
+        else
+        {
+            var table = new Table()
+                .Border(TableBorder.Rounded)
+                .BorderColor(Color.Blue)
+                .AddColumn(new TableColumn("[bold]Printer[/]"))
+                .AddColumn(new TableColumn("[bold]Local Obico[/]"))
+                .AddColumn(new TableColumn("[bold]Obico Cloud[/]"))
+                .AddColumn(new TableColumn("[bold]Moonraker[/]").Centered());
+
+            foreach (var printerConfig in config.Printers)
+            {
+                var printerStatus = printers.FirstOrDefault(p => p.Name == printerConfig.Name);
+
+                // Build Local Obico column content (multi-line)
+                var localLines = BuildObicoColumnContent(
+                    printerConfig.Obico,
+                    printerStatus?.ObicoStatus,
+                    includeJanus: true,
+                    includeServer: true,
+                    isCloud: false);
+
+                // Build Obico Cloud column content (multi-line)
+                var cloudLines = BuildObicoColumnContent(
+                    printerConfig.ObicoCloud,
+                    printerStatus?.ObicoCloudStatus,
+                    includeJanus: false,  // Cloud uses same Janus as local
+                    includeServer: false,
+                    isCloud: true);
+
+                // Build Moonraker column
+                var moonrakerStatus = GetMoonrakerStatusDisplay(printerConfig, printerStatus);
+
+                // Create multi-line row using Rows for each cell
+                table.AddRow(
+                    new Markup($"[white bold]{Markup.Escape(printerConfig.Name)}[/]"),
+                    new Rows(localLines.Select(l => new Markup(l))),
+                    new Rows(cloudLines.Select(l => new Markup(l))),
+                    new Markup(moonrakerStatus)
+                );
+            }
+
+            renderables.Add(table);
+        }
+
+        // === COMMAND BAR ===
+        renderables.Add(Text.Empty);
+        renderables.Add(new Markup(
+            "[grey]Obico:[/] [white][[L]][/][grey]ink[/]  [white][[U]][/][grey]nlink[/]  [white][[C]][/][grey]onfigure[/]  [white][[D]][/][grey]etect firmware[/]  [white][[Esc]][/][grey] Back[/]"
+        ));
+
+        return new Rows(renderables);
+    }
+
+    /// <summary>
+    /// Build content lines for an Obico column (Local or Cloud).
+    /// </summary>
+    private List<string> BuildObicoColumnContent(
+        PrinterObicoConfig obicoConfig,
+        Models.ObicoStatus? status,
+        bool includeJanus,
+        bool includeServer,
+        bool isCloud = false)
+    {
+        var lines = new List<string>();
+
+        var isLinked = obicoConfig.IsLinked;
+
+        // Line 1: Status with colored dot
+        if (!isLinked)
+        {
+            lines.Add("[grey]○ Not linked[/]");
+            return lines;
+        }
+
+        // Determine status indicator based on runtime state
+        var (statusColor, statusIcon) = GetObicoStatusIndicator(status);
+
+        // Only show tier (Pro/Free) for Cloud - it's not relevant for local Obico
+        if (isCloud)
+        {
+            var tier = obicoConfig.IsPro ? "Pro" : "Free";
+            lines.Add($"[{statusColor}]{statusIcon}[/] Linked ({tier})");
+        }
+        else
+        {
+            lines.Add($"[{statusColor}]{statusIcon}[/] Linked");
+        }
+
+        // Line 2: Obico device name
+        if (!string.IsNullOrEmpty(obicoConfig.ObicoName))
+        {
+            lines.Add($"  [grey]\"{Markup.Escape(obicoConfig.ObicoName)}\"[/]");
+        }
+
+        // Line 3: Server URL (for local only)
+        if (includeServer && !string.IsNullOrEmpty(obicoConfig.ServerUrl))
+        {
+            lines.Add($"  [grey]{Markup.Escape(obicoConfig.ServerUrl)}[/]");
+        }
+
+        // Line 4: Janus status (for local only)
+        if (includeJanus)
+        {
+            var janusDisplay = GetJanusStatusDisplay(obicoConfig, status);
+            if (!string.IsNullOrEmpty(janusDisplay))
+            {
+                lines.Add($"  {janusDisplay}");
+            }
+        }
+
+        // Line 5: Snapshots
+        var snapshotDisplay = GetSnapshotDisplay(obicoConfig);
+        lines.Add($"  {snapshotDisplay}");
+
+        return lines;
+    }
+
+    /// <summary>
+    /// Get status indicator (color and icon) for Obico connection.
+    /// </summary>
+    private (string color, string icon) GetObicoStatusIndicator(Models.ObicoStatus? status)
+    {
+        if (status == null)
+            return ("grey", "○");
+
+        return status.State switch
+        {
+            "Running" => ("green", "●"),
+            "Connecting" => ("blue", "◌"),
+            "Failed" => ("red", "✗"),
+            "Stopped" => ("grey", "○"),
+            "No Moonraker" => ("orange3", "⚠"),
+            "Moonraker Error" => ("red", "✗"),
+            _ => ("yellow", "◐")
+        };
+    }
+
+    /// <summary>
+    /// Get Janus status display string.
+    /// </summary>
+    private string GetJanusStatusDisplay(PrinterObicoConfig obicoConfig, Models.ObicoStatus? status)
+    {
+        // Check if Janus is explicitly disabled
+        if (obicoConfig.JanusServer == "disabled")
+        {
+            return "[grey]Janus: Disabled[/]";
+        }
+
+        // Get effective Janus server address
+        string? effectiveJanus = status?.JanusServer;
+        if (string.IsNullOrEmpty(effectiveJanus))
+        {
+            // Fall back to config-derived value
+            if (!string.IsNullOrEmpty(obicoConfig.JanusServer))
+            {
+                effectiveJanus = obicoConfig.JanusServer;
+            }
+            else if (!string.IsNullOrEmpty(obicoConfig.ServerUrl))
+            {
+                try
+                {
+                    var uri = new Uri(obicoConfig.ServerUrl);
+                    effectiveJanus = uri.Host;
+                }
+                catch { }
+            }
+        }
+
+        if (string.IsNullOrEmpty(effectiveJanus))
+        {
+            return "[grey]Janus: Not configured[/]";
+        }
+
+        // Determine Janus connection and streaming status
+        var janusConnected = status?.JanusConnected ?? false;
+        var janusEnabled = status?.JanusEnabled ?? false;
+        var janusStreaming = status?.JanusStreaming ?? false;
+
+        if (!janusEnabled)
+        {
+            return $"[grey]Janus: ○ {Markup.Escape(effectiveJanus)}[/]";
+        }
+
+        // Show streaming status: green = streaming, blue = connected/ready, red = error
+        string color, icon, statusText;
+        if (janusStreaming)
+        {
+            color = "green";
+            icon = "●";
+            statusText = "Streaming";
+        }
+        else if (janusConnected)
+        {
+            color = "blue";
+            icon = "◌";
+            statusText = "Ready";
+        }
+        else
+        {
+            color = "red";
+            icon = "✗";
+            statusText = "Offline";
+        }
+
+        return $"[{color}]Janus: {icon} {statusText}[/] [grey]{Markup.Escape(effectiveJanus)}[/]";
+    }
+
+    /// <summary>
+    /// Get snapshot status display string.
+    /// </summary>
+    private string GetSnapshotDisplay(PrinterObicoConfig obicoConfig)
+    {
+        if (!obicoConfig.SnapshotsEnabled)
+        {
+            return "[grey]Snap: Off[/]";
+        }
+
+        var fpsValue = obicoConfig.TargetFps;
+        if (fpsValue <= 0)
+        {
+            return "[grey]Snap: Off[/]";
+        }
+
+        return $"[cyan]Snap: {fpsValue} fps[/]";
+    }
+
+    /// <summary>
+    /// Get Moonraker status display string.
+    /// </summary>
+    private string GetMoonrakerStatusDisplay(PrinterConfig printerConfig, PrinterStatus? printerStatus)
+    {
+        // Check firmware info from config
+        var firmware = printerConfig.Firmware;
+
+        if (firmware.Type == FirmwareType.Unknown)
+        {
+            return "[grey]? Unknown[/]";
+        }
+
+        if (!firmware.MoonrakerAvailable)
+        {
+            return "[grey]○ N/A[/]";
+        }
+
+        // Check for Moonraker error state from Obico clients
+        var localState = printerStatus?.ObicoStatus?.State;
+        var cloudState = printerStatus?.ObicoCloudStatus?.State;
+
+        if (localState == "Moonraker Error" || cloudState == "Moonraker Error")
+        {
+            return "[red]✗ Error[/]";
+        }
+
+        if (localState == "No Moonraker" || cloudState == "No Moonraker")
+        {
+            return "[grey]○ N/A[/]";
+        }
+
+        // Check runtime status for Moonraker connection (from either local or cloud Obico client)
+        var moonrakerConnected = (printerStatus?.ObicoStatus?.MoonrakerConnected ?? false) ||
+                                 (printerStatus?.ObicoCloudStatus?.MoonrakerConnected ?? false);
+        if (moonrakerConnected)
+        {
+            return "[green]● Connected[/]";
+        }
+
+        // Moonraker is available (detected by firmware check) but Obico isn't actively connected to it
+        // This is still a good state - just means no Obico client is using it right now
+        return "[green]● Available[/]";
     }
 
     private async Task LinkPrinterToObicoAsync(AppConfig config, List<PrinterStatus> printers)
@@ -2486,62 +2934,6 @@ WantedBy=multi-user.target
         _ui.WaitForKey();
     }
 
-    private async Task ShowObicoStatusAsync(AppConfig config, List<PrinterStatus> printers)
-    {
-        _ui.Clear();
-        _ui.WriteRule("Obico Status");
-        _ui.WriteLine();
-
-        foreach (var printer in config.Printers)
-        {
-            _ui.WriteMarkup($"[white bold]{printer.Name}[/]");
-            _ui.WriteLine();
-
-            // Local instance status
-            var localLinked = printer.Obico.IsLinked;
-            var localColor = localLinked ? "green" : "grey";
-            var localStatus = localLinked ? "Linked" : "Not linked";
-
-            _ui.WriteMarkup($"  [cyan]Local Instance:[/]");
-            _ui.WriteLine();
-            _ui.WriteMarkup($"    Status: [{localColor}]{localStatus}[/]");
-            _ui.WriteLine();
-
-            if (localLinked)
-            {
-                _ui.WriteLine($"    Server: {printer.Obico.ServerUrl}");
-                _ui.WriteLine($"    Obico name: {printer.Obico.ObicoName}");
-                _ui.WriteLine($"    Snapshots: {(printer.Obico.SnapshotsEnabled ? "Enabled" : "Disabled")} ({printer.Obico.TargetFps} FPS)");
-            }
-
-            // Cloud status
-            var cloudLinked = printer.ObicoCloud.IsLinked;
-            var cloudColor = cloudLinked ? "green" : "grey";
-            var cloudStatus = cloudLinked ? "Linked" : "Not linked";
-
-            _ui.WriteLine();
-            _ui.WriteMarkup($"  [cyan]Obico Cloud:[/]");
-            _ui.WriteLine();
-            _ui.WriteMarkup($"    Status: [{cloudColor}]{cloudStatus}[/]");
-            _ui.WriteLine();
-
-            if (cloudLinked)
-            {
-                _ui.WriteLine($"    Obico name: {printer.ObicoCloud.ObicoName}");
-                _ui.WriteLine($"    Account: {(printer.ObicoCloud.IsPro ? "Pro" : "Free")}");
-                _ui.WriteLine($"    Snapshots: {(printer.ObicoCloud.SnapshotsEnabled ? "Enabled" : "Disabled")} ({printer.ObicoCloud.TargetFps} FPS)");
-            }
-
-            _ui.WriteLine();
-            _ui.WriteLine($"  Firmware: {printer.Firmware.Type} {printer.Firmware.Version}");
-            _ui.WriteLine($"  Moonraker: {(printer.Firmware.MoonrakerAvailable ? "Available" : "Not available")}");
-            _ui.WriteLine();
-        }
-
-        _ui.WaitForKey();
-        await Task.CompletedTask;
-    }
-
     private async Task ConfigureObicoSettingsAsync(AppConfig config, List<PrinterStatus> printers)
     {
         _ui.Clear();
@@ -2586,10 +2978,7 @@ WantedBy=multi-user.target
                 $"(Cloud) Target FPS: {printerConfig.ObicoCloud.TargetFps}",
 
                 // Janus server configuration
-                $"Janus Server: {janusDisplay}",
-
-                // Other options
-                "Detect firmware"
+                $"Janus Server: {janusDisplay}"
             };
 
             var choice = _ui.SelectOneWithEscape("Select setting:", choices.ToArray());
@@ -2671,10 +3060,6 @@ WantedBy=multi-user.target
                         _ui.WriteSuccess($"Janus server set to: {janusInput.Trim()}");
                     }
                 }
-            }
-            else if (choice == "Detect firmware")
-            {
-                await DetectFirmwareForPrinterAsync(printerConfig);
             }
 
             await ConfigManager.SaveAsync(config);

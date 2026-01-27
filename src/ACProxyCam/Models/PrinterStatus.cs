@@ -178,4 +178,24 @@ public class ObicoStatus
     /// Last error message if any.
     /// </summary>
     public string? LastError { get; set; }
+
+    /// <summary>
+    /// Whether connected to Janus WebRTC server.
+    /// </summary>
+    public bool JanusConnected { get; set; }
+
+    /// <summary>
+    /// Janus server address (effective, resolved from config).
+    /// </summary>
+    public string? JanusServer { get; set; }
+
+    /// <summary>
+    /// Whether Janus is enabled (not disabled in config).
+    /// </summary>
+    public bool JanusEnabled { get; set; }
+
+    /// <summary>
+    /// Whether Janus is actively streaming (WebRTC viewer connected).
+    /// </summary>
+    public bool JanusStreaming { get; set; }
 }

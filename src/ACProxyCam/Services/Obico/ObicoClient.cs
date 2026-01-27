@@ -90,6 +90,12 @@ public class ObicoClient : IDisposable
     public bool IsCloud => _isCloud;
     public string PrinterName => _printerConfig.Name;
 
+    // Janus status properties
+    public bool JanusEnabled => _janusEnabled;
+    public bool JanusConnected => _janusClient?.IsConnected ?? false;
+    public string? JanusServer => _janusEnabled ? GetJanusServerAddress() : null;
+    public bool JanusStreaming { get; private set; }
+
     /// <summary>
     /// Sets the printer offline state. Called by PrinterThread when printer becomes unavailable.
     /// This suppresses Obico logging and status updates until the printer reconnects.
@@ -482,7 +488,6 @@ public class ObicoClient : IDisposable
             var localObicoJanus = _printerConfig.Obico?.JanusServer;
             if (!string.IsNullOrEmpty(localObicoJanus))
             {
-                Log($"Using local Obico's Janus server for cloud streaming: {localObicoJanus}");
                 return localObicoJanus;
             }
 
@@ -493,7 +498,6 @@ public class ObicoClient : IDisposable
                 if (!string.IsNullOrEmpty(localServerUrl))
                 {
                     var uri = new Uri(localServerUrl);
-                    Log($"Using local Obico's server host for cloud Janus: {uri.Host}");
                     return uri.Host;
                 }
             }
@@ -595,6 +599,9 @@ public class ObicoClient : IDisposable
     /// </summary>
     private void OnWebRtcStateChanged(object? sender, bool webRtcUp)
     {
+        // Track streaming state from events (more reliable than polling)
+        JanusStreaming = webRtcUp;
+
         // Notify that viewer connected/disconnected (for client tracking and keepalive logic)
         JanusStreamingChanged?.Invoke(this, webRtcUp);
 

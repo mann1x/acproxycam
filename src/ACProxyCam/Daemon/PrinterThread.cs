@@ -227,8 +227,8 @@ public class PrinterThread : IDisposable
                 StreamStatus = _streamStatus,
                 PrinterMqttState = _printerMqttState,
                 CameraLed = _cachedLedStatus,
-                ObicoStatus = _obicoStatus,
-                ObicoCloudStatus = _obicoCloudStatus
+                ObicoStatus = GetCurrentObicoStatus(_obicoStatus, _obicoClient),
+                ObicoCloudStatus = GetCurrentObicoStatus(_obicoCloudStatus, _obicoCloudClient)
             };
         }
     }
@@ -1032,10 +1032,52 @@ public class PrinterThread : IDisposable
         LogStatus("Obico: Shared Moonraker reconnection failed after max attempts");
     }
 
+    /// <summary>
+    /// Get current Obico status with live Janus information from the client.
+    /// </summary>
+    private Models.ObicoStatus GetCurrentObicoStatus(Models.ObicoStatus baseStatus, ObicoClient? client)
+    {
+        // Create a copy with updated Janus status from the live client
+        var status = new Models.ObicoStatus
+        {
+            Enabled = baseStatus.Enabled,
+            IsLinked = baseStatus.IsLinked,
+            State = baseStatus.State,
+            ServerConnected = baseStatus.ServerConnected,
+            MoonrakerConnected = baseStatus.MoonrakerConnected,
+            IsPro = baseStatus.IsPro,
+            TargetFps = baseStatus.TargetFps,
+            SnapshotsEnabled = baseStatus.SnapshotsEnabled,
+            ServerUrl = baseStatus.ServerUrl,
+            ObicoName = baseStatus.ObicoName,
+            LastError = baseStatus.LastError
+        };
+
+        // Update Janus status from live client
+        if (client != null)
+        {
+            status.JanusEnabled = client.JanusEnabled;
+            status.JanusConnected = client.JanusConnected;
+            status.JanusServer = client.JanusServer;
+            status.JanusStreaming = client.JanusStreaming;
+        }
+
+        return status;
+    }
+
     private void OnObicoStateChanged(object? sender, ObicoClientState state)
     {
         _obicoStatus.State = state.ToString();
         _obicoStatus.ServerConnected = state == ObicoClientState.Running;
+
+        // Update Janus status from ObicoClient
+        if (_obicoClient != null)
+        {
+            _obicoStatus.JanusEnabled = _obicoClient.JanusEnabled;
+            _obicoStatus.JanusConnected = _obicoClient.JanusConnected;
+            _obicoStatus.JanusServer = _obicoClient.JanusServer;
+            _obicoStatus.JanusStreaming = _obicoClient.JanusStreaming;
+        }
 
         // When ObicoClient fails (Moonraker not available), try to enable LAN mode
         // This handles the case where printer reboots and Moonraker doesn't start until LAN mode is enabled
@@ -1098,6 +1140,15 @@ public class PrinterThread : IDisposable
     {
         _obicoCloudStatus.State = state.ToString();
         _obicoCloudStatus.ServerConnected = state == ObicoClientState.Running;
+
+        // Update Janus status from ObicoCloudClient
+        if (_obicoCloudClient != null)
+        {
+            _obicoCloudStatus.JanusEnabled = _obicoCloudClient.JanusEnabled;
+            _obicoCloudStatus.JanusConnected = _obicoCloudClient.JanusConnected;
+            _obicoCloudStatus.JanusServer = _obicoCloudClient.JanusServer;
+            _obicoCloudStatus.JanusStreaming = _obicoCloudClient.JanusStreaming;
+        }
 
         // When ObicoClient fails (Moonraker not available), try to enable LAN mode
         // Only trigger once from the local client to avoid duplicate attempts
