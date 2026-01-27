@@ -3,6 +3,7 @@
 
 using System.Runtime.InteropServices;
 using FFmpeg.AutoGen;
+using ACProxyCam.Daemon;
 
 namespace ACProxyCam.Services;
 
@@ -133,7 +134,7 @@ public unsafe class FfmpegDecoder : IDisposable
                 var minor = (version >> 8) & 0xFF;
                 var micro = version & 0xFF;
 
-                Console.WriteLine($"FFmpeg initialized: avcodec {major}.{minor}.{micro}");
+                Logger.Log($"FFmpeg initialized: avcodec {major}.{minor}.{micro}");
 
                 // Set up log callback for throttled FFmpeg logging
                 SetupLogCallback();
@@ -183,7 +184,7 @@ public unsafe class FfmpegDecoder : IDisposable
             var throttledMessage = FfmpegLogThrottler.ThrottleMessage(message);
             if (throttledMessage != null)
             {
-                Console.WriteLine(throttledMessage);
+                Logger.Debug($"[FFmpeg] {throttledMessage}");
             }
         };
 

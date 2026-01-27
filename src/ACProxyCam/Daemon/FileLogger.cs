@@ -1,9 +1,20 @@
-// FileLogger.cs - File logging with rotation
+// FileLogger.cs - File logging with rotation and log levels
 
 namespace ACProxyCam.Daemon;
 
 /// <summary>
-/// Thread-safe file logger with automatic rotation.
+/// Log severity levels.
+/// </summary>
+public enum LogLevel
+{
+    Debug = 0,
+    Info = 1,
+    Warning = 2,
+    Error = 3
+}
+
+/// <summary>
+/// Thread-safe file logger with automatic rotation and log levels.
 /// </summary>
 public class FileLogger : IDisposable
 {
@@ -16,6 +27,11 @@ public class FileLogger : IDisposable
     private string _currentFilePath = string.Empty;
     private long _currentFileSize;
     private bool _disposed;
+
+    /// <summary>
+    /// Minimum log level to output. Messages below this level are ignored.
+    /// </summary>
+    public LogLevel MinLevel { get; set; } = LogLevel.Info;
 
     /// <summary>
     /// Create a new file logger.
@@ -36,12 +52,22 @@ public class FileLogger : IDisposable
     }
 
     /// <summary>
-    /// Log a message with timestamp.
+    /// Log a message at the specified level.
     /// </summary>
-    public void Log(string message)
+    public void Log(LogLevel level, string message)
     {
+        if (level < MinLevel) return;
+
         var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-        var line = $"[{timestamp}] {message}";
+        var levelStr = level switch
+        {
+            LogLevel.Debug => "DBG",
+            LogLevel.Info => "INF",
+            LogLevel.Warning => "WRN",
+            LogLevel.Error => "ERR",
+            _ => "???"
+        };
+        var line = $"[{timestamp}] [{levelStr}] {message}";
 
         lock (_lock)
         {
@@ -49,7 +75,7 @@ public class FileLogger : IDisposable
 
             try
             {
-                // Also write to console for journald
+                // Write to console (for journald)
                 Console.WriteLine(line);
 
                 // Write to file
@@ -72,44 +98,52 @@ public class FileLogger : IDisposable
     }
 
     /// <summary>
-    /// Log a message with a context prefix (e.g., printer name).
+    /// Log a message at the specified level with context.
     /// </summary>
-    public void Log(string context, string message)
+    public void Log(LogLevel level, string context, string message)
     {
-        Log($"[{context}] {message}");
+        Log(level, $"[{context}] {message}");
     }
+
+    /// <summary>
+    /// Log at Info level.
+    /// </summary>
+    public void Log(string message) => Log(LogLevel.Info, message);
+
+    /// <summary>
+    /// Log at Info level with context.
+    /// </summary>
+    public void Log(string context, string message) => Log(LogLevel.Info, context, message);
+
+    /// <summary>
+    /// Log at Debug level.
+    /// </summary>
+    public void LogDebug(string message) => Log(LogLevel.Debug, message);
+
+    /// <summary>
+    /// Log at Debug level with context.
+    /// </summary>
+    public void LogDebug(string context, string message) => Log(LogLevel.Debug, context, message);
 
     /// <summary>
     /// Log an error message.
     /// </summary>
-    public void LogError(string message)
-    {
-        Log($"ERROR: {message}");
-    }
+    public void LogError(string message) => Log(LogLevel.Error, message);
 
     /// <summary>
     /// Log an error with context.
     /// </summary>
-    public void LogError(string context, string message)
-    {
-        Log(context, $"Error: {message}");
-    }
+    public void LogError(string context, string message) => Log(LogLevel.Error, context, message);
 
     /// <summary>
     /// Log a warning message.
     /// </summary>
-    public void LogWarning(string message)
-    {
-        Log($"WARNING: {message}");
-    }
+    public void LogWarning(string message) => Log(LogLevel.Warning, message);
 
     /// <summary>
     /// Log a warning with context.
     /// </summary>
-    public void LogWarning(string context, string message)
-    {
-        Log(context, $"Warning: {message}");
-    }
+    public void LogWarning(string context, string message) => Log(LogLevel.Warning, context, message);
 
     private void EnsureDirectoryExists()
     {
@@ -191,7 +225,7 @@ public class FileLogger : IDisposable
                 AutoFlush = false
             };
 
-            Log("Log file rotated");
+            Log(LogLevel.Info, "Log file rotated");
         }
         catch (Exception ex)
         {
@@ -264,6 +298,11 @@ public static class Logger
     private static readonly object _lock = new();
 
     /// <summary>
+    /// Whether debug logging is enabled.
+    /// </summary>
+    public static bool DebugEnabled { get; set; }
+
+    /// <summary>
     /// Initialize the global logger.
     /// </summary>
     public static void Initialize(string logDirectory, string baseFileName = "acproxycam")
@@ -272,68 +311,83 @@ public static class Logger
         {
             _instance?.Dispose();
             _instance = new FileLogger(logDirectory, baseFileName);
+            if (DebugEnabled)
+            {
+                _instance.MinLevel = LogLevel.Debug;
+            }
         }
     }
 
     /// <summary>
-    /// Log a message.
+    /// Log at specified level.
     /// </summary>
-    public static void Log(string message)
+    public static void Log(LogLevel level, string message)
     {
         if (_instance != null)
         {
-            _instance.Log(message);
+            _instance.Log(level, message);
         }
-        else
+        else if (level >= (DebugEnabled ? LogLevel.Debug : LogLevel.Info))
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}");
+            var levelStr = level switch
+            {
+                LogLevel.Debug => "DBG",
+                LogLevel.Info => "INF",
+                LogLevel.Warning => "WRN",
+                LogLevel.Error => "ERR",
+                _ => "???"
+            };
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [{levelStr}] {message}");
         }
     }
 
     /// <summary>
-    /// Log a message with context.
+    /// Log at specified level with context.
     /// </summary>
-    public static void Log(string context, string message)
+    public static void Log(LogLevel level, string context, string message)
     {
-        if (_instance != null)
-        {
-            _instance.Log(context, message);
-        }
-        else
-        {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [{context}] {message}");
-        }
+        Log(level, $"[{context}] {message}");
     }
+
+    /// <summary>
+    /// Log at Info level.
+    /// </summary>
+    public static void Log(string message) => Log(LogLevel.Info, message);
+
+    /// <summary>
+    /// Log at Info level with context.
+    /// </summary>
+    public static void Log(string context, string message) => Log(LogLevel.Info, context, message);
+
+    /// <summary>
+    /// Log at Debug level.
+    /// </summary>
+    public static void Debug(string message) => Log(LogLevel.Debug, message);
+
+    /// <summary>
+    /// Log at Debug level with context.
+    /// </summary>
+    public static void Debug(string context, string message) => Log(LogLevel.Debug, context, message);
 
     /// <summary>
     /// Log an error.
     /// </summary>
-    public static void Error(string message)
-    {
-        if (_instance != null)
-        {
-            _instance.LogError(message);
-        }
-        else
-        {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ERROR: {message}");
-        }
-    }
+    public static void Error(string message) => Log(LogLevel.Error, message);
 
     /// <summary>
     /// Log an error with context.
     /// </summary>
-    public static void Error(string context, string message)
-    {
-        if (_instance != null)
-        {
-            _instance.LogError(context, message);
-        }
-        else
-        {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [{context}] Error: {message}");
-        }
-    }
+    public static void Error(string context, string message) => Log(LogLevel.Error, context, message);
+
+    /// <summary>
+    /// Log a warning.
+    /// </summary>
+    public static void Warning(string message) => Log(LogLevel.Warning, message);
+
+    /// <summary>
+    /// Log a warning with context.
+    /// </summary>
+    public static void Warning(string context, string message) => Log(LogLevel.Warning, context, message);
 
     /// <summary>
     /// Shutdown the logger.

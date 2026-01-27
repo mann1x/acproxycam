@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using ACProxyCam.Daemon;
 
 namespace ACProxyCam.Services.Obico;
 
@@ -152,10 +153,10 @@ public class MoonrakerApiClient : IDisposable
     public async Task<string> ExecuteGcodeAsync(string script, CancellationToken ct = default)
     {
         // Use POST body for multi-line scripts (more reliable than URL encoding)
-        Console.WriteLine($"[Moonraker] ExecuteGcodeAsync: {script.Replace("\n", "\\n")}");
+        Logger.Debug($"[Moonraker] ExecuteGcodeAsync: {script.Replace("\n", "\\n")}");
         var payload = new { script };
         var response = await PostAsync<JsonNode>("/printer/gcode/script", payload, ct);
-        Console.WriteLine($"[Moonraker] ExecuteGcodeAsync response: {response}");
+        Logger.Debug($"[Moonraker] ExecuteGcodeAsync response: {response}");
         return response?.ToString() ?? "";
     }
 

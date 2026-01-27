@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using ACProxyCam.Daemon;
 
 namespace ACProxyCam.Services.Obico;
 
@@ -222,7 +223,7 @@ public class ObicoServerConnection : IDisposable
         try
         {
             if (Verbose)
-                Console.WriteLine($"[Obico WS] Received: {message.Substring(0, Math.Min(500, message.Length))}...");
+                Logger.Debug($"[Obico WS] Received: {message.Substring(0, Math.Min(500, message.Length))}...");
 
             var json = JsonNode.Parse(message);
             if (json == null)
@@ -324,7 +325,7 @@ public class ObicoServerConnection : IDisposable
                     }
 
                     if (Verbose)
-                        Console.WriteLine($"[Obico WS] Command received: {cmd} (initiator: {obicoCmd.Initiator})");
+                        Logger.Debug($"[Obico WS] Command received: {cmd} (initiator: {obicoCmd.Initiator})");
                     CommandReceived?.Invoke(this, obicoCmd);
                 }
             }
@@ -343,13 +344,13 @@ public class ObicoServerConnection : IDisposable
         if (!_isConnected)
         {
             if (Verbose)
-                Console.WriteLine("[Obico WS] Cannot send - not connected");
+                Logger.Warning("[Obico WS] Cannot send - not connected");
             return;
         }
 
         var json = JsonSerializer.Serialize(message);
         if (Verbose)
-            Console.WriteLine($"[Obico WS] Sending: {json.Substring(0, Math.Min(500, json.Length))}...");
+            Logger.Debug($"[Obico WS] Sending: {json.Substring(0, Math.Min(500, json.Length))}...");
         _sendQueue.TryAdd(json);
     }
 
@@ -862,7 +863,7 @@ public class ObicoServerConnection : IDisposable
         catch (Exception ex)
         {
             if (Verbose)
-                Console.WriteLine($"[Obico] Snapshot upload failed: {ex.Message}");
+                Logger.Warning($"[Obico] Snapshot upload failed: {ex.Message}");
             throw new ObicoApiException($"Post snapshot failed: {ex.Message}", ex);
         }
     }

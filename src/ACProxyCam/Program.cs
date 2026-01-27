@@ -14,9 +14,16 @@ public class Program
 
     public static async Task<int> Main(string[] args)
     {
-        // Check for --simple-ui flag (hidden option for automation)
+        // Check for flags (hidden options)
         var useSimpleUi = args.Contains("--simple-ui");
-        var filteredArgs = args.Where(a => a != "--simple-ui").ToArray();
+        var debugMode = args.Contains("--debug");
+        var filteredArgs = args.Where(a => a != "--simple-ui" && a != "--debug").ToArray();
+
+        // Set debug mode globally
+        if (debugMode)
+        {
+            Daemon.Logger.DebugEnabled = true;
+        }
 
         // Parse command line arguments
         if (filteredArgs.Length > 0)

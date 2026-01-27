@@ -90,8 +90,7 @@ public class PrinterThread : IDisposable
         _listenInterfaces = listenInterfaces;
         _logThrottler = new LogThrottler(msg =>
         {
-            var timestamp = DateTime.Now.ToString("HH:mm:ss");
-            Console.WriteLine($"[{timestamp}] [{Config.Name}] {msg}");
+            Logger.Log(Config.Name, msg);
             StatusChanged?.Invoke(this, msg);
         });
     }
@@ -753,7 +752,21 @@ public class PrinterThread : IDisposable
         LogStatus($"Starting MJPEG server on port {Config.MjpegPort}...");
 
         _mjpegServer = new MjpegServer();
-        _mjpegServer.StatusChanged += (s, msg) => LogStatus($"MJPEG: {msg}");
+        _mjpegServer.StatusChanged += (s, msg) =>
+        {
+            // Verbose messages go to debug level
+            if (msg.StartsWith("LL-HLS part") ||
+                msg.StartsWith("HLS: Frame") ||
+                msg.StartsWith("H.264 stats") ||
+                msg.StartsWith("HLS stats"))
+            {
+                LogStatusDebug($"MJPEG: {msg}");
+            }
+            else
+            {
+                LogStatus($"MJPEG: {msg}");
+            }
+        };
         _mjpegServer.ErrorOccurred += (s, ex) => LogStatus($"MJPEG Error: {ex.Message}");
 
         // Apply per-printer encoding settings
@@ -1957,8 +1970,13 @@ public class PrinterThread : IDisposable
 
     private void LogStatus(string message)
     {
-        var timestamp = DateTime.Now.ToString("HH:mm:ss");
-        Console.WriteLine($"[{timestamp}] [{Config.Name}] {message}");
+        Logger.Log(Config.Name, message);
+        StatusChanged?.Invoke(this, message);
+    }
+
+    private void LogStatusDebug(string message)
+    {
+        Logger.Debug(Config.Name, message);
         StatusChanged?.Invoke(this, message);
     }
 

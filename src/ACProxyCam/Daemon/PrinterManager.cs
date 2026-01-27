@@ -71,8 +71,8 @@ public class PrinterManager
 
         if (cpuAssignments.Length > 0)
         {
-            Console.WriteLine($"[PrinterManager] Available CPUs: {string.Join(", ", availableCpus)}");
-            Console.WriteLine($"[PrinterManager] CPU assignments: {CpuAffinityService.FormatAssignments(cpuAssignments)}");
+            Logger.Debug($"[PrinterManager] Available CPUs: {string.Join(", ", availableCpus)}");
+            Logger.Debug($"[PrinterManager] CPU assignments: {CpuAffinityService.FormatAssignments(cpuAssignments)}");
         }
 
         for (int i = 0; i < _config.Printers.Count; i++)
@@ -175,11 +175,11 @@ public class PrinterManager
             try
             {
                 await ConfigManager.SaveAsync(_config);
-                Console.WriteLine($"[PrinterManager] Config saved (device type updated for {thread.Config.Name}: {thread.Config.DeviceType})");
+                Logger.Log($"[PrinterManager] Config saved (device type updated for {thread.Config.Name}: {thread.Config.DeviceType})");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[PrinterManager] Failed to save config: {ex.Message}");
+                Logger.Error($"[PrinterManager] Failed to save config: {ex.Message}");
             }
         }
     }
