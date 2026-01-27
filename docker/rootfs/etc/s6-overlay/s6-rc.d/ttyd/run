@@ -1,0 +1,32 @@
+#!/command/with-contenv sh
+# ttyd web terminal service
+# Provides web-based terminal access to acproxycam CLI
+
+# Build credential argument if authentication is configured
+CRED_ARG=""
+if [ -n "$TTYD_USER" ] && [ -n "$TTYD_PASS" ]; then
+    CRED_ARG="-c ${TTYD_USER}:${TTYD_PASS}"
+fi
+
+# Wait for IPC socket to be ready (daemon must be running)
+while [ ! -S /run/acproxycam/acproxycam.sock ]; do
+    echo "Waiting for acproxycam daemon..."
+    sleep 1
+done
+
+# Launch ttyd with acproxycam CLI
+# -i 0.0.0.0: Bind to all interfaces (not just localhost)
+# -d 1: Minimal debug output (suppress libwebsockets noise)
+# -t titleFixed: Set fixed browser tab title
+# -t theme: Black background to match SSH terminal appearance
+# -W: Allow write (required for interactive mode)
+# Full ANSI color support via xterm.js (xterm-256color)
+exec ttyd -p ${TTYD_PORT:-7681} \
+    -i 0.0.0.0 \
+    -d 1 \
+    -t titleFixed="ACProxyCam" \
+    -t fontSize=15 \
+    -t 'theme={"background":"#000000"}' \
+    -W \
+    ${CRED_ARG} \
+    /usr/local/bin/acproxycam 2>&1

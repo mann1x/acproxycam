@@ -1,0 +1,15 @@
+#!/command/with-contenv sh
+# Restart handler for acproxycam daemon
+# Exit code 0 = don't restart, non-zero = restart
+
+exit_code=$1
+
+if [ "$exit_code" -eq 0 ]; then
+    echo "acproxycam exited cleanly, not restarting"
+    exit 0
+else
+    echo "acproxycam crashed with exit code $exit_code, restarting..."
+    # Small delay before restart to avoid rapid restart loops
+    sleep 2
+    exit 1
+fi

@@ -778,8 +778,13 @@ public class PrinterThread : IDisposable
         _mjpegServer.ConfigureLlHls(Config.LlHlsEnabled, Config.HlsPartDurationMs);
 
         // Determine bind addresses from config
+        // In Docker, always bind to all interfaces (0.0.0.0) for external access
         var bindAddresses = new List<IPAddress>();
-        if (_listenInterfaces.Count > 0 && !_listenInterfaces.Contains("0.0.0.0"))
+        if (IsRunningInDocker())
+        {
+            bindAddresses.Add(IPAddress.Any);
+        }
+        else if (_listenInterfaces.Count > 0 && !_listenInterfaces.Contains("0.0.0.0"))
         {
             foreach (var iface in _listenInterfaces)
             {
@@ -2011,5 +2016,15 @@ public class PrinterThread : IDisposable
     ~PrinterThread()
     {
         Dispose();
+    }
+
+    /// <summary>
+    /// Check if running inside a Docker container.
+    /// In Docker, services should bind to 0.0.0.0 for external access.
+    /// </summary>
+    private static bool IsRunningInDocker()
+    {
+        return File.Exists("/.dockerenv") ||
+               Environment.GetEnvironmentVariable("ACPROXYCAM_DOCKER") == "true";
     }
 }

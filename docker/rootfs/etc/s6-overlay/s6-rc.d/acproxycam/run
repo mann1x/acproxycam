@@ -1,0 +1,5 @@
+#!/command/with-contenv sh
+# ACProxyCam daemon service
+# Runs with --no-file-log to send logs to stdout for Docker logging
+
+exec /usr/local/bin/acproxycam --daemon --no-file-log 2>&1

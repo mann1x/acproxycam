@@ -15,12 +15,14 @@ public class ManagementCli
 {
     private readonly IConsoleUI _ui;
     private readonly bool _useSimpleUi;
+    private readonly bool _isDocker;
     private IpcClient? _ipcClient;
 
     public ManagementCli(IConsoleUI ui)
     {
         _ui = ui;
         _useSimpleUi = ui is SimpleConsoleUI;
+        _isDocker = IsRunningInDocker();
     }
 
     public async Task<int> RunAsync()
@@ -370,6 +372,10 @@ public class ManagementCli
     {
         try
         {
+            // Skip root check in Docker containers (daemon runs as root, CLI connects via IPC)
+            if (IsRunningInDocker())
+                return true;
+
             return Environment.GetEnvironmentVariable("EUID") == "0" ||
                    Environment.GetEnvironmentVariable("USER") == "root" ||
                    (Environment.GetEnvironmentVariable("SUDO_USER") != null);
@@ -378,6 +384,13 @@ public class ManagementCli
         {
             return false;
         }
+    }
+
+    private bool IsRunningInDocker()
+    {
+        // Check for Docker container indicators
+        return File.Exists("/.dockerenv") ||
+               Environment.GetEnvironmentVariable("ACPROXYCAM_DOCKER") == "true";
     }
 
     private bool IsServiceInstalled()
@@ -463,11 +476,11 @@ public class ManagementCli
     {
         var interfaces = GetNetworkInterfaces();
 
-        // First, ask what to do with a single-select prompt (Escape to cancel)
-        var actionChoices = new List<string> { "All interfaces (0.0.0.0)", "Select specific interfaces" };
+        // First, ask what to do with a single-select prompt
+        var actionChoices = new List<string> { "All interfaces (0.0.0.0)", "Select specific interfaces", "Back" };
         var action = _ui.SelectOneWithEscape("Select listening interfaces for MJPEG streams:", actionChoices);
 
-        if (action == null)
+        if (action == null || action == "Back")
         {
             return null;
         }
@@ -814,12 +827,14 @@ WantedBy=multi-user.target
                                     var key = Console.ReadKey(true).Key;
                                     action = key switch
                                     {
-                                        ConsoleKey.Q => MenuAction.Quit,
-                                        ConsoleKey.Escape => MenuAction.Quit,
-                                        ConsoleKey.S => MenuAction.ToggleService,
-                                        ConsoleKey.R => MenuAction.RestartService,
-                                        ConsoleKey.U => MenuAction.Uninstall,
-                                        ConsoleKey.L => MenuAction.ChangeInterfaces,
+                                        // Q/Escape disabled in Docker (ttyd will just respawn CLI)
+                                        ConsoleKey.Q when !_isDocker => MenuAction.Quit,
+                                        ConsoleKey.Escape when !_isDocker => MenuAction.Quit,
+                                        // Service control keys disabled in Docker (S, R, U, L)
+                                        ConsoleKey.S when !_isDocker => MenuAction.ToggleService,
+                                        ConsoleKey.R when !_isDocker => MenuAction.RestartService,
+                                        ConsoleKey.U when !_isDocker => MenuAction.Uninstall,
+                                        ConsoleKey.L when !_isDocker => MenuAction.ChangeInterfaces,
                                         ConsoleKey.A => MenuAction.AddPrinter,
                                         ConsoleKey.D => MenuAction.DeletePrinter,
                                         ConsoleKey.M => MenuAction.ModifyPrinter,
@@ -947,15 +962,22 @@ WantedBy=multi-user.target
 
         // Menu options
         Console.WriteLine("Menu:");
-        Console.WriteLine("  s - Stop/Start service");
-        Console.WriteLine("  r - Restart service");
+        if (!_isDocker)
+        {
+            Console.WriteLine("  s - Stop/Start service");
+            Console.WriteLine("  r - Restart service");
+            Console.WriteLine("  l - Change listen interfaces");
+        }
         Console.WriteLine("  a - Add printer");
         Console.WriteLine("  d - Delete printer");
         Console.WriteLine("  m - Modify printer");
         Console.WriteLine("  t - Toggle LED");
         Console.WriteLine("  b - BedMesh menu");
         Console.WriteLine("  o - Obico menu");
-        Console.WriteLine("  q - Quit");
+        if (!_isDocker)
+        {
+            Console.WriteLine("  q - Quit");
+        }
         Console.WriteLine();
         Console.Write("Select option: ");
 
@@ -965,11 +987,13 @@ WantedBy=multi-user.target
 
         return keyInfo.Key switch
         {
-            ConsoleKey.Q => MenuAction.Quit,
-            ConsoleKey.S => MenuAction.ToggleService,
-            ConsoleKey.R => MenuAction.RestartService,
-            ConsoleKey.U => MenuAction.Uninstall,
-            ConsoleKey.L => MenuAction.ChangeInterfaces,
+            // Q disabled in Docker (ttyd will just respawn CLI)
+            ConsoleKey.Q when !_isDocker => MenuAction.Quit,
+            // Service control keys disabled in Docker (S, R, U, L)
+            ConsoleKey.S when !_isDocker => MenuAction.ToggleService,
+            ConsoleKey.R when !_isDocker => MenuAction.RestartService,
+            ConsoleKey.U when !_isDocker => MenuAction.Uninstall,
+            ConsoleKey.L when !_isDocker => MenuAction.ChangeInterfaces,
             ConsoleKey.A => MenuAction.AddPrinter,
             ConsoleKey.D => MenuAction.DeletePrinter,
             ConsoleKey.M => MenuAction.ModifyPrinter,
@@ -1014,9 +1038,13 @@ WantedBy=multi-user.target
         renderables.Add(headerTable);
 
         // === SERVICE CONTROLS ===
-        renderables.Add(new Markup(
-            "[grey]Service:[/] [white][[S]][/][grey]top/Start[/]  [white][[R]][/][grey]estart[/]  [white][[U]][/][grey]ninstall[/]  [white][[L]][/][grey]isten[/]  [white][[Q]][/][grey]uit[/]"
-        ));
+        // In Docker mode, hide service management options - Docker/s6 handles service lifecycle
+        if (!_isDocker)
+        {
+            renderables.Add(new Markup(
+                "[grey]Service:[/] [white][[S]][/][grey]top/Start[/]  [white][[R]][/][grey]estart[/]  [white][[U]][/][grey]ninstall[/]  [white][[L]][/][grey]isten[/]  [white][[Q]][/][grey]uit[/]"
+            ));
+        }
         renderables.Add(Text.Empty);
 
         // === PRINTERS TABLE ===

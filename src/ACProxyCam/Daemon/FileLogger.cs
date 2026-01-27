@@ -296,11 +296,21 @@ public static class Logger
 {
     private static FileLogger? _instance;
     private static readonly object _lock = new();
+    private static bool _consoleOnly;
 
     /// <summary>
     /// Whether debug logging is enabled.
     /// </summary>
     public static bool DebugEnabled { get; set; }
+
+    /// <summary>
+    /// Whether to log only to console (no file logging). Used for Docker.
+    /// </summary>
+    public static bool ConsoleOnly
+    {
+        get => _consoleOnly;
+        set => _consoleOnly = value;
+    }
 
     /// <summary>
     /// Initialize the global logger.
@@ -310,6 +320,14 @@ public static class Logger
         lock (_lock)
         {
             _instance?.Dispose();
+
+            // Skip file logging if console-only mode
+            if (_consoleOnly)
+            {
+                _instance = null;
+                return;
+            }
+
             _instance = new FileLogger(logDirectory, baseFileName);
             if (DebugEnabled)
             {

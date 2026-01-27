@@ -17,12 +17,19 @@ public class Program
         // Check for flags (hidden options)
         var useSimpleUi = args.Contains("--simple-ui");
         var debugMode = args.Contains("--debug");
-        var filteredArgs = args.Where(a => a != "--simple-ui" && a != "--debug").ToArray();
+        var noFileLog = args.Contains("--no-file-log");
+        var filteredArgs = args.Where(a => a != "--simple-ui" && a != "--debug" && a != "--no-file-log").ToArray();
 
         // Set debug mode globally
         if (debugMode)
         {
             Daemon.Logger.DebugEnabled = true;
+        }
+
+        // Set console-only logging (for Docker)
+        if (noFileLog)
+        {
+            Daemon.Logger.ConsoleOnly = true;
         }
 
         // Parse command line arguments
@@ -75,6 +82,7 @@ public class Program
         Console.WriteLine("  -v, --version    Show version information");
         Console.WriteLine("  -h, --help       Show this help message");
         Console.WriteLine("  --daemon         Run as daemon (used by systemd)");
+        Console.WriteLine("  --no-file-log    Disable file logging (logs to stdout only, for Docker)");
         Console.WriteLine("  --install        Install service");
         Console.WriteLine("  --uninstall      Uninstall service");
         Console.WriteLine("    --keep-config  Keep config files when uninstalling");

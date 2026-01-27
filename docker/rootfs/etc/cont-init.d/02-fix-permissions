@@ -1,0 +1,14 @@
+#!/command/with-contenv sh
+# Fix permissions for IPC socket directory
+# The daemon creates the socket with restricted permissions,
+# but in Docker all processes run as root so we need world access
+
+echo "Setting permissions for IPC socket directory..."
+mkdir -p /run/acproxycam
+chmod 777 /run/acproxycam
+
+# Also ensure config directory is writable
+mkdir -p /etc/acproxycam
+chmod 755 /etc/acproxycam
+
+echo "Permissions configured"

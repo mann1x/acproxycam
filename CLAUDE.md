@@ -313,6 +313,32 @@ expect /tmp/test_calibration.exp
 
 **Important**: Always use direct SSH for testing - do not use Python paramiko wrappers as they have issues with terminal handling and expect scripts.
 
+### Building Docker Image via SSH
+
+Docker images can be built remotely on the test server since the local Windows machine doesn't have Docker installed.
+
+```bash
+# 1. Sync the entire repo to the test server
+scp -r . claude_test@192.168.178.12:/tmp/acproxycam-build/
+
+# 2. Build for single architecture (for local testing)
+ssh claude_test@192.168.178.12 "cd /tmp/acproxycam-build && sudo docker buildx build --platform linux/arm64 -t acproxycam:test --load -f docker/Dockerfile ."
+
+# 3. Build for both architectures (without pushing)
+ssh claude_test@192.168.178.12 "cd /tmp/acproxycam-build && sudo docker buildx build --platform linux/amd64,linux/arm64 -t acproxycam:latest -f docker/Dockerfile ."
+
+# 4. Run the container for testing
+ssh claude_test@192.168.178.12 "sudo docker run -d --name acproxycam-test --network host -v acproxycam-config:/etc/acproxycam -v /etc/machine-id:/etc/machine-id:ro acproxycam:test"
+
+# 5. View logs
+ssh claude_test@192.168.178.12 "sudo docker logs -f acproxycam-test"
+
+# 6. Stop and remove test container
+ssh claude_test@192.168.178.12 "sudo docker stop acproxycam-test && sudo docker rm acproxycam-test"
+```
+
+**Note**: For production builds and publishing to GitHub Container Registry, use the GitHub Actions workflow (`.github/workflows/docker.yml`) which automatically builds and pushes on version tags.
+
 ## Creating a Release
 
 ### Step 1: Bump Version

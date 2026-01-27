@@ -1,0 +1,24 @@
+#!/command/with-contenv sh
+# Setup machine-id for encryption key consistency
+# ACProxyCam uses /etc/machine-id to derive the encryption key for config
+
+echo "Checking machine-id configuration..."
+
+if [ -f /etc/machine-id ] && [ -s /etc/machine-id ]; then
+    echo "Using host machine-id (bind mounted)"
+else
+    # Generate a persistent machine-id in the config volume
+    PERSISTENT_ID=/etc/acproxycam/.machine-id
+
+    if [ -f "$PERSISTENT_ID" ] && [ -s "$PERSISTENT_ID" ]; then
+        echo "Using persistent machine-id from config volume"
+        cp "$PERSISTENT_ID" /etc/machine-id
+    else
+        echo "Generating new machine-id (will be persisted in config volume)"
+        # Generate a random machine-id (32 hex chars)
+        cat /proc/sys/kernel/random/uuid | tr -d '-' > /etc/machine-id
+        cp /etc/machine-id "$PERSISTENT_ID"
+    fi
+fi
+
+echo "Machine-id configured: $(cat /etc/machine-id | head -c 8)..."

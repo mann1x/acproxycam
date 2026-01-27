@@ -1,0 +1,12 @@
+#!/command/with-contenv sh
+# Janus WebRTC gateway service
+# Only runs if JANUS_ENABLED is true
+
+if [ "$JANUS_ENABLED" != "true" ]; then
+    echo "Janus WebRTC gateway disabled, sleeping..."
+    # Sleep forever to keep s6 from restarting
+    exec sleep infinity
+fi
+
+echo "Starting Janus WebRTC gateway..."
+exec janus 2>&1

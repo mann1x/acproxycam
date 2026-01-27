@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  acproxycam:
+    image: ghcr.io/mann1x/acproxycam:latest
+    container_name: acproxycam
+    restart: unless-stopped
+
+    # Host network mode for direct printer access
+    # Required for discovering printers on the local network
+    network_mode: host
+
+    environment:
+      # Web terminal port (default: 7681)
+      - TTYD_PORT=${TTYD_PORT:-7681}
+
+      # Web terminal authentication (leave empty for no auth)
+      - TTYD_USER=${TTYD_USER:-}
+      - TTYD_PASS=${TTYD_PASS:-}
+
+      # Enable/disable Janus WebRTC gateway
+      - JANUS_ENABLED=${JANUS_ENABLED:-true}
+
+    volumes:
+      # Persistent configuration
+      - acproxycam-config:/etc/acproxycam
+
+      # Machine ID for encryption key consistency
+      # Mount as read-only from host
+      - /etc/machine-id:/etc/machine-id:ro
+
+    # Logs are available via: docker logs acproxycam
+    # No file logging inside container (uses --no-file-log)
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7681/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  acproxycam-config:
+    name: acproxycam-config
