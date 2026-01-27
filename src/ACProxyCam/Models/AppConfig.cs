@@ -193,10 +193,26 @@ public class PrinterConfig
     public int CameraKeepaliveSeconds { get; set; } = 0;
 
     /// <summary>
-    /// Per-printer Obico integration settings.
+    /// Per-printer Obico integration settings (local self-hosted server).
     /// </summary>
     [JsonPropertyName("obico")]
     public PrinterObicoConfig Obico { get; set; } = new();
+
+    /// <summary>
+    /// Obico Cloud integration settings (app.obico.io).
+    /// Runs independently and in parallel with local Obico instance.
+    /// </summary>
+    [JsonPropertyName("obicoCloud")]
+    public PrinterObicoConfig ObicoCloud { get; set; } = new()
+    {
+        ServerUrl = ObicoCloudUrl,
+        Enabled = false
+    };
+
+    /// <summary>
+    /// Static URL for Obico Cloud - cannot be changed.
+    /// </summary>
+    public const string ObicoCloudUrl = "https://app.obico.io";
 
     /// <summary>
     /// Detected firmware information (auto-populated via SSH).

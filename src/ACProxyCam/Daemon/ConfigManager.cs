@@ -39,11 +39,18 @@ public static class ConfigManager
             printer.MqttUsername = DecryptIfNeeded(printer.MqttUsername);
             printer.MqttPassword = DecryptIfNeeded(printer.MqttPassword);
 
-            // Decrypt Obico auth token
+            // Decrypt Obico auth token (local)
             if (printer.Obico != null)
             {
                 printer.Obico.AuthToken = DecryptIfNeeded(printer.Obico.AuthToken);
                 printer.Obico.DeviceSecret = DecryptIfNeeded(printer.Obico.DeviceSecret);
+            }
+
+            // Decrypt Obico Cloud auth token
+            if (printer.ObicoCloud != null)
+            {
+                printer.ObicoCloud.AuthToken = DecryptIfNeeded(printer.ObicoCloud.AuthToken);
+                printer.ObicoCloud.DeviceSecret = DecryptIfNeeded(printer.ObicoCloud.DeviceSecret);
             }
         }
 
@@ -81,6 +88,12 @@ public static class ConfigManager
             {
                 printer.Obico.AuthToken = EncryptIfNeeded(printer.Obico.AuthToken);
                 printer.Obico.DeviceSecret = EncryptIfNeeded(printer.Obico.DeviceSecret);
+            }
+
+            if (printer.ObicoCloud != null)
+            {
+                printer.ObicoCloud.AuthToken = EncryptIfNeeded(printer.ObicoCloud.AuthToken);
+                printer.ObicoCloud.DeviceSecret = EncryptIfNeeded(printer.ObicoCloud.DeviceSecret);
             }
         }
 

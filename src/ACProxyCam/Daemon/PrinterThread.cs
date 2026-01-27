@@ -39,13 +39,15 @@ public class PrinterThread : IDisposable
     private MqttCameraController? _mqttController;
     private FfmpegDecoder? _decoder;
     private MjpegServer? _mjpegServer;
-    private ObicoClient? _obicoClient;
+    private ObicoClient? _obicoClient;           // Local Obico server
+    private ObicoClient? _obicoCloudClient;      // Obico Cloud (app.obico.io)
 
     // Status details
     private readonly SshStatus _sshStatus = new();
     private readonly MqttStatus _mqttStatus = new();
     private readonly StreamStatus _streamStatus = new();
-    private readonly Models.ObicoStatus _obicoStatus = new();
+    private readonly Models.ObicoStatus _obicoStatus = new();       // Local status
+    private readonly Models.ObicoStatus _obicoCloudStatus = new();  // Cloud status
 
     // LED auto-control state
     private string? _printerMqttState;
@@ -225,7 +227,8 @@ public class PrinterThread : IDisposable
                 StreamStatus = _streamStatus,
                 PrinterMqttState = _printerMqttState,
                 CameraLed = _cachedLedStatus,
-                ObicoStatus = _obicoStatus
+                ObicoStatus = _obicoStatus,
+                ObicoCloudStatus = _obicoCloudStatus
             };
         }
     }
@@ -792,85 +795,132 @@ public class PrinterThread : IDisposable
     }
 
     /// <summary>
-    /// Start the Obico client if enabled and firmware supports it.
+    /// Start both local and cloud Obico clients if enabled and firmware supports it.
     /// </summary>
     private async Task StartObicoClientAsync(CancellationToken ct)
     {
-        // Update basic status
-        _obicoStatus.Enabled = Config.Obico.Enabled;
-        _obicoStatus.IsLinked = Config.Obico.IsLinked;
-        _obicoStatus.IsPro = Config.Obico.IsPro;
-        _obicoStatus.TargetFps = Config.Obico.TargetFps;
-
-        if (!Config.Obico.Enabled)
-        {
-            _obicoStatus.State = "Disabled";
-            LogStatus("Obico: Not enabled (use CLI to configure)");
-            return;
-        }
-
+        // Check Moonraker availability (required for both)
         if (!Config.Firmware.MoonrakerAvailable)
         {
             _obicoStatus.State = "No Moonraker";
+            _obicoCloudStatus.State = "No Moonraker";
             LogStatus("Obico: Skipping - Moonraker not available (requires Rinkhals firmware)");
             return;
         }
 
-        if (!Config.Obico.IsLinked)
+        // Start local Obico client (if enabled and linked)
+        _obicoClient = await StartObicoClientInstanceAsync(
+            Config.Obico,
+            _obicoStatus,
+            isCloud: false,
+            ct);
+
+        // Start cloud Obico client (if enabled and linked)
+        _obicoCloudClient = await StartObicoClientInstanceAsync(
+            Config.ObicoCloud,
+            _obicoCloudStatus,
+            isCloud: true,
+            ct);
+    }
+
+    /// <summary>
+    /// Start a single Obico client instance (local or cloud).
+    /// Returns the created client (caller must assign to appropriate field).
+    /// </summary>
+    private async Task<ObicoClient?> StartObicoClientInstanceAsync(
+        PrinterObicoConfig config,
+        Models.ObicoStatus status,
+        bool isCloud,
+        CancellationToken ct)
+    {
+        var label = isCloud ? "Obico Cloud" : "Obico";
+
+        // Update basic status
+        status.Enabled = config.Enabled;
+        status.IsLinked = config.IsLinked;
+        status.IsPro = config.IsPro;
+        status.TargetFps = config.TargetFps;
+        status.SnapshotsEnabled = config.SnapshotsEnabled;
+        status.ServerUrl = isCloud ? null : config.ServerUrl; // Don't show URL for cloud
+        status.ObicoName = config.ObicoName;
+
+        if (!config.Enabled)
         {
-            _obicoStatus.State = "Not Linked";
-            LogStatus("Obico: Skipping - printer not linked to Obico server");
-            return;
+            status.State = "Disabled";
+            return null;
         }
 
+        if (!config.IsLinked)
+        {
+            status.State = "Not Linked";
+            return null;
+        }
+
+        ObicoClient? client = null;
         try
         {
-            LogStatus("Starting Obico client...");
-            _obicoStatus.State = "Starting";
+            LogStatus($"{label}: Starting client...");
+            status.State = "Starting";
 
-            _obicoClient = new ObicoClient(Config);
-            _obicoClient.StatusChanged += (s, msg) => LogStatus($"Obico: {msg}");
-            _obicoClient.StateChanged += OnObicoStateChanged;
-            _obicoClient.ConfigUpdated += OnObicoConfigUpdated;
+            client = new ObicoClient(Config, config);
+            client.StatusChanged += (s, msg) => LogStatus($"{label}: {msg}");
+
+            if (isCloud)
+            {
+                client.StateChanged += OnObicoCloudStateChanged;
+                client.ConfigUpdated += OnObicoCloudConfigUpdated;
+            }
+            else
+            {
+                client.StateChanged += OnObicoStateChanged;
+                client.ConfigUpdated += OnObicoConfigUpdated;
+            }
 
             // Wire up Janus H264 streaming state to MJPEG server for full-rate decoding
-            if (_mjpegServer != null)
+            // Only one client needs to do this (use local if available, otherwise cloud)
+            if (_mjpegServer != null && (_obicoClient == null || !isCloud))
             {
-                _obicoClient.JanusStreamingChanged += (s, streaming) =>
+                client.JanusStreamingChanged += (s, streaming) =>
                 {
                     _mjpegServer.HasExternalStreamingClient = streaming;
-                    LogStatus($"Obico H264 streaming {(streaming ? "started" : "stopped")} - decoder at {(streaming ? "full" : "idle")} rate");
+                    LogStatus($"{label} H264 streaming {(streaming ? "started" : "stopped")} - decoder at {(streaming ? "full" : "idle")} rate");
                 };
             }
 
             // Wire up native firmware sync for print cancellation from Obico
-            _obicoClient.NativePrintStopRequested += async (s, e) =>
+            // Only one client needs to do this (use local if available, otherwise cloud)
+            if (_obicoClient == null || !isCloud)
             {
-                if (_mqttController != null && !string.IsNullOrEmpty(Config.DeviceId))
+                client.NativePrintStopRequested += async (s, e) =>
                 {
-                    LogStatus("Syncing native Anycubic firmware: sending print stop via MQTT");
-                    await _mqttController.SendPrintStopAsync(Config.DeviceId, Config.ModelCode);
-                }
-            };
+                    if (_mqttController != null && !string.IsNullOrEmpty(Config.DeviceId))
+                    {
+                        LogStatus($"{label}: Syncing native Anycubic firmware: sending print stop via MQTT");
+                        await _mqttController.SendPrintStopAsync(Config.DeviceId, Config.ModelCode);
+                    }
+                };
+            }
 
             // Set snapshot callback if camera is enabled
             if (Config.CameraEnabled && _mjpegServer != null)
             {
-                _obicoClient.SetSnapshotCallback(() => _mjpegServer.GetLastJpegFrame());
+                client.SetSnapshotCallback(() => _mjpegServer.GetLastJpegFrame());
             }
 
-            await _obicoClient.StartAsync(ct);
+            await client.StartAsync(ct);
 
-            _obicoStatus.State = _obicoClient.State.ToString();
-            _obicoStatus.ServerConnected = _obicoClient.State == ObicoClientState.Running;
-            LogStatus($"Obico client started (state: {_obicoClient.State})");
+            status.State = client.State.ToString();
+            status.ServerConnected = client.State == ObicoClientState.Running;
+            LogStatus($"{label}: Client started (state: {client.State})");
+            return client;
         }
         catch (Exception ex)
         {
-            _obicoStatus.State = "Failed";
-            _obicoStatus.LastError = ex.Message;
-            LogStatus($"Obico client failed to start: {ex.Message}");
+            status.State = "Failed";
+            status.LastError = ex.Message;
+            LogStatus($"{label}: Client failed to start: {ex.Message}");
             // Don't throw - Obico failure shouldn't stop the camera
+            return client;  // May be null or partially initialized
         }
     }
 
@@ -889,7 +939,7 @@ public class PrinterThread : IDisposable
     }
 
     /// <summary>
-    /// Try to enable LAN mode and restart Obico client.
+    /// Try to enable LAN mode and restart Obico clients.
     /// Called when Obico client fails due to Moonraker not being available.
     /// </summary>
     private async Task TryEnableLanModeAndRestartObicoAsync()
@@ -903,13 +953,22 @@ public class PrinterThread : IDisposable
             LogStatus("LAN mode enabled, waiting for Moonraker to start...");
             await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
 
-            // Restart Obico client
+            // Restart local Obico client
             if (_obicoClient != null)
             {
                 LogStatus("Restarting Obico client...");
                 await _obicoClient.StopAsync();
                 await _obicoClient.StartAsync(cts.Token);
                 LogStatus($"Obico client restarted (state: {_obicoClient.State})");
+            }
+
+            // Restart cloud Obico client
+            if (_obicoCloudClient != null)
+            {
+                LogStatus("Restarting Obico Cloud client...");
+                await _obicoCloudClient.StopAsync();
+                await _obicoCloudClient.StartAsync(cts.Token);
+                LogStatus($"Obico Cloud client restarted (state: {_obicoCloudClient.State})");
             }
         }
         catch (Exception ex)
@@ -923,86 +982,158 @@ public class PrinterThread : IDisposable
         // Forward to ConfigChanged to persist changes (e.g., tier update)
         _obicoStatus.IsPro = Config.Obico.IsPro;
         _obicoStatus.TargetFps = Config.Obico.TargetFps;
+        _obicoStatus.ObicoName = Config.Obico.ObicoName;
+        ConfigChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void OnObicoCloudStateChanged(object? sender, ObicoClientState state)
+    {
+        _obicoCloudStatus.State = state.ToString();
+        _obicoCloudStatus.ServerConnected = state == ObicoClientState.Running;
+
+        // When ObicoClient fails (Moonraker not available), try to enable LAN mode
+        // Only trigger once from the local client to avoid duplicate attempts
+        if (state == ObicoClientState.Failed && Config.AutoLanMode && _obicoClient == null)
+        {
+            LogStatus("Obico Cloud client failed - attempting to enable LAN mode...");
+            _ = TryEnableLanModeAndRestartObicoAsync();
+        }
+    }
+
+    private void OnObicoCloudConfigUpdated(object? sender, EventArgs e)
+    {
+        // Forward to ConfigChanged to persist changes (e.g., tier update)
+        _obicoCloudStatus.IsPro = Config.ObicoCloud.IsPro;
+        _obicoCloudStatus.TargetFps = Config.ObicoCloud.TargetFps;
+        _obicoCloudStatus.ObicoName = Config.ObicoCloud.ObicoName;
         ConfigChanged?.Invoke(this, EventArgs.Empty);
     }
 
     /// <summary>
-    /// Update Obico configuration and restart the Obico client if needed.
+    /// Update local Obico configuration and restart the client if needed.
     /// Called by PrinterManager when config is reloaded from disk.
     /// </summary>
     public async Task UpdateObicoConfigAsync(PrinterObicoConfig newObicoConfig)
     {
-        var oldAuthToken = Config.Obico.AuthToken;
-        var oldEnabled = Config.Obico.Enabled;
+        _obicoClient = await UpdateObicoConfigInstanceAsync(
+            newObicoConfig,
+            Config.Obico,
+            _obicoClient,
+            _obicoStatus,
+            isCloud: false);
+    }
+
+    /// <summary>
+    /// Update Obico Cloud configuration and restart the client if needed.
+    /// Called by PrinterManager when config is reloaded from disk.
+    /// </summary>
+    public async Task UpdateObicoCloudConfigAsync(PrinterObicoConfig newObicoConfig)
+    {
+        _obicoCloudClient = await UpdateObicoConfigInstanceAsync(
+            newObicoConfig,
+            Config.ObicoCloud,
+            _obicoCloudClient,
+            _obicoCloudStatus,
+            isCloud: true);
+    }
+
+    /// <summary>
+    /// Update Obico configuration for a specific instance (local or cloud).
+    /// Returns the (potentially new) client.
+    /// </summary>
+    private async Task<ObicoClient?> UpdateObicoConfigInstanceAsync(
+        PrinterObicoConfig newConfig,
+        PrinterObicoConfig targetConfig,
+        ObicoClient? client,
+        Models.ObicoStatus status,
+        bool isCloud)
+    {
+        var label = isCloud ? "Obico Cloud" : "Obico";
+        var oldAuthToken = targetConfig.AuthToken;
+        var oldEnabled = targetConfig.Enabled;
         var wasLinked = !string.IsNullOrEmpty(oldAuthToken);
 
         // Update config
-        Config.Obico.Enabled = newObicoConfig.Enabled;
-        Config.Obico.ServerUrl = newObicoConfig.ServerUrl;
-        Config.Obico.AuthToken = newObicoConfig.AuthToken;
-        Config.Obico.ObicoDeviceId = newObicoConfig.ObicoDeviceId;
-        Config.Obico.DeviceSecret = newObicoConfig.DeviceSecret;
-        Config.Obico.TargetFps = newObicoConfig.TargetFps;
-        Config.Obico.SnapshotsEnabled = newObicoConfig.SnapshotsEnabled;
-        Config.Obico.IsPro = newObicoConfig.IsPro;
-        Config.Obico.ObicoName = newObicoConfig.ObicoName;
-        Config.Obico.ObicoPrinterId = newObicoConfig.ObicoPrinterId;
-        Config.Obico.JanusServer = newObicoConfig.JanusServer;
-        Config.Obico.StreamMode = newObicoConfig.StreamMode;
+        targetConfig.Enabled = newConfig.Enabled;
+        targetConfig.ServerUrl = newConfig.ServerUrl;
+        targetConfig.AuthToken = newConfig.AuthToken;
+        targetConfig.ObicoDeviceId = newConfig.ObicoDeviceId;
+        targetConfig.DeviceSecret = newConfig.DeviceSecret;
+        targetConfig.TargetFps = newConfig.TargetFps;
+        targetConfig.SnapshotsEnabled = newConfig.SnapshotsEnabled;
+        targetConfig.IsPro = newConfig.IsPro;
+        targetConfig.ObicoName = newConfig.ObicoName;
+        targetConfig.ObicoPrinterId = newConfig.ObicoPrinterId;
+        targetConfig.JanusServer = newConfig.JanusServer;
+        targetConfig.StreamMode = newConfig.StreamMode;
 
         // Update status
-        _obicoStatus.Enabled = newObicoConfig.Enabled;
-        _obicoStatus.IsLinked = newObicoConfig.IsLinked;
-        _obicoStatus.IsPro = newObicoConfig.IsPro;
-        _obicoStatus.TargetFps = newObicoConfig.TargetFps;
+        status.Enabled = newConfig.Enabled;
+        status.IsLinked = newConfig.IsLinked;
+        status.IsPro = newConfig.IsPro;
+        status.TargetFps = newConfig.TargetFps;
+        status.SnapshotsEnabled = newConfig.SnapshotsEnabled;
+        status.ServerUrl = isCloud ? null : newConfig.ServerUrl;
+        status.ObicoName = newConfig.ObicoName;
 
-        // Determine if we need to restart Obico client
-        var authTokenChanged = oldAuthToken != newObicoConfig.AuthToken;
-        var enabledChanged = oldEnabled != newObicoConfig.Enabled;
-        var becameLinked = !wasLinked && newObicoConfig.IsLinked;
+        // Determine if we need to restart client
+        var authTokenChanged = oldAuthToken != newConfig.AuthToken;
+        var enabledChanged = oldEnabled != newConfig.Enabled;
+        var becameLinked = !wasLinked && newConfig.IsLinked;
 
-        LogStatus($"Obico config updated: enabled={newObicoConfig.Enabled}, linked={newObicoConfig.IsLinked}, authChanged={authTokenChanged}, enabledChanged={enabledChanged}, becameLinked={becameLinked}");
+        LogStatus($"{label} config updated: enabled={newConfig.Enabled}, linked={newConfig.IsLinked}, authChanged={authTokenChanged}, enabledChanged={enabledChanged}, becameLinked={becameLinked}");
 
-        if (_obicoClient != null)
+        if (client != null)
         {
-            if (!newObicoConfig.Enabled)
+            if (!newConfig.Enabled)
             {
-                // Obico was disabled - stop the client
-                LogStatus("Obico disabled - stopping client...");
-                await _obicoClient.StopAsync();
-                _obicoClient = null;
-                _obicoStatus.State = "Disabled";
-                _obicoStatus.ServerConnected = false;
+                // Disabled - stop the client
+                LogStatus($"{label} disabled - stopping client...");
+                await client.StopAsync();
+                status.State = "Disabled";
+                status.ServerConnected = false;
+                return null;
             }
             else if (authTokenChanged)
             {
                 // Auth token changed - restart with new credentials
-                LogStatus("Obico auth token changed - restarting client...");
-                await _obicoClient.StopAsync();
-                _obicoClient = null;
+                LogStatus($"{label} auth token changed - restarting client...");
+                await client.StopAsync();
 
                 // Start new client with updated config
-                await StartObicoClientAsync(CancellationToken.None);
+                var newClient = await StartObicoClientInstanceAsync(
+                    targetConfig,
+                    status,
+                    isCloud,
+                    CancellationToken.None);
 
                 // Pass decoder to the new client (decoder is already running)
                 if (_decoder != null)
                 {
-                    _obicoClient?.SetDecoder(_decoder);
+                    newClient?.SetDecoder(_decoder);
                 }
+                return newClient;
             }
+            return client;  // No change needed
         }
-        else if (newObicoConfig.Enabled && newObicoConfig.IsLinked && (enabledChanged || becameLinked || authTokenChanged))
+        else if (newConfig.Enabled && newConfig.IsLinked && (enabledChanged || becameLinked || authTokenChanged))
         {
-            // Obico was enabled or became linked - start the client
-            LogStatus("Obico enabled/linked - starting client...");
-            await StartObicoClientAsync(CancellationToken.None);
+            // Enabled or became linked - start the client
+            LogStatus($"{label} enabled/linked - starting client...");
+            var newClient = await StartObicoClientInstanceAsync(
+                targetConfig,
+                status,
+                isCloud,
+                CancellationToken.None);
 
             // Pass decoder to the new client (decoder is already running)
             if (_decoder != null)
             {
-                _obicoClient?.SetDecoder(_decoder);
+                newClient?.SetDecoder(_decoder);
             }
+            return newClient;
         }
+        return client;  // No change needed
     }
 
     private async Task RunStreamingLoopAsync(CancellationToken ct)
@@ -1068,9 +1199,10 @@ public class PrinterThread : IDisposable
                 }
             }
 
-            // Pass decoder to Obico client for H.264 RTP streaming (shares source stream)
+            // Pass decoder to Obico clients for H.264 RTP streaming (shares source stream)
             // Must be called after ObicoClient is started so Janus is ready
             _obicoClient?.SetDecoder(_decoder);
+            _obicoCloudClient?.SetDecoder(_decoder);
         };
         _decoder.DecodingStopped += (s, e) =>
         {
@@ -1157,6 +1289,7 @@ public class PrinterThread : IDisposable
                         _lastLanModeAttempt = DateTime.MinValue; // Reset LAN mode tracking
                         _state = PrinterState.Running; // Ensure state is Running after recovery
                         _obicoClient?.SetPrinterOffline(false); // Printer is back online
+                        _obicoCloudClient?.SetPrinterOffline(false);
                     }
                     _lastSeenOnline = DateTime.UtcNow;
                     _streamFailedAt = DateTime.MinValue; // Reset failure tracking
@@ -1226,6 +1359,7 @@ public class PrinterThread : IDisposable
 
                         // Mark printer offline to suppress Obico/Janus logging during recovery
                         _obicoClient?.SetPrinterOffline(true);
+                        _obicoCloudClient?.SetPrinterOffline(true);
                     }
 
                     var failureDuration = DateTime.UtcNow - _streamFailedAt;
@@ -1263,8 +1397,9 @@ public class PrinterThread : IDisposable
                         }
                         else
                         {
-                            // Printer not available - notify Obico client and trigger full restart
+                            // Printer not available - notify Obico clients and trigger full restart
                             _obicoClient?.SetPrinterOffline(true);
+                            _obicoCloudClient?.SetPrinterOffline(true);
                             throw new Exception($"Stream failed and printer not available after {failureDuration.TotalMinutes:F1} minutes");
                         }
                     }
@@ -1735,7 +1870,7 @@ public class PrinterThread : IDisposable
 
     private async Task CleanupServicesAsync()
     {
-        // Stop Obico client first (it may depend on other services)
+        // Stop Obico clients first (they may depend on other services)
         if (_obicoClient != null)
         {
             try
@@ -1749,6 +1884,21 @@ public class PrinterThread : IDisposable
             _obicoClient = null;
             _obicoStatus.State = "Stopped";
             _obicoStatus.ServerConnected = false;
+        }
+
+        if (_obicoCloudClient != null)
+        {
+            try
+            {
+                _obicoCloudClient.StateChanged -= OnObicoCloudStateChanged;
+                _obicoCloudClient.ConfigUpdated -= OnObicoCloudConfigUpdated;
+                await _obicoCloudClient.StopAsync();
+            }
+            catch { }
+            _obicoCloudClient.Dispose();
+            _obicoCloudClient = null;
+            _obicoCloudStatus.State = "Stopped";
+            _obicoCloudStatus.ServerConnected = false;
         }
 
         // Stop decoder

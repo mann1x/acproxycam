@@ -12,6 +12,8 @@ namespace ACProxyCam.Services.Obico;
 public class ObicoClient : IDisposable
 {
     private readonly PrinterConfig _printerConfig;
+    private readonly PrinterObicoConfig _obicoConfig;
+    private readonly bool _isCloud;
     private readonly MoonrakerApiClient _moonraker;
     private ObicoServerConnection? _obicoServer;
 
@@ -83,7 +85,8 @@ public class ObicoClient : IDisposable
     public event EventHandler? NativePrintStopRequested;
 
     public ObicoClientState State { get; private set; } = ObicoClientState.Stopped;
-    public bool IsLinked => _printerConfig.Obico.IsLinked;
+    public bool IsLinked => _obicoConfig.IsLinked;
+    public bool IsCloud => _isCloud;
     public string PrinterName => _printerConfig.Name;
 
     /// <summary>
@@ -149,7 +152,7 @@ public class ObicoClient : IDisposable
             SendStatusUpdate(force: true);
 
             // Restart Janus streaming when printer comes back online
-            if (_printerConfig.CameraEnabled && _printerConfig.Obico.Enabled && _janusEnabled)
+            if (_printerConfig.CameraEnabled && _obicoConfig.Enabled && _janusEnabled)
             {
                 _ = Task.Run(async () =>
                 {
@@ -171,9 +174,16 @@ public class ObicoClient : IDisposable
         }
     }
 
-    public ObicoClient(PrinterConfig printerConfig)
+    /// <summary>
+    /// Creates an Obico client for a printer.
+    /// </summary>
+    /// <param name="printerConfig">The printer configuration.</param>
+    /// <param name="configOverride">Optional config override for cloud vs local instance. If null, uses printerConfig.Obico.</param>
+    public ObicoClient(PrinterConfig printerConfig, PrinterObicoConfig? configOverride = null)
     {
         _printerConfig = printerConfig;
+        _obicoConfig = configOverride ?? printerConfig.Obico;
+        _isCloud = IsCloudServer(_obicoConfig.ServerUrl);
         _moonraker = new MoonrakerApiClient(printerConfig.Ip, printerConfig.Firmware.MoonrakerPort);
         _verbose = Environment.GetEnvironmentVariable("ACPROXYCAM_VERBOSE") == "1";
 
@@ -182,6 +192,15 @@ public class ObicoClient : IDisposable
         _moonraker.KlippyStateChanged += OnKlippyStateChanged;
         _moonraker.PrintStateChanged += OnPrintStateChanged;
         _moonraker.ConnectionStateChanged += OnMoonrakerConnectionChanged;
+    }
+
+    /// <summary>
+    /// Check if a server URL is for Obico cloud (app.obico.io) vs self-hosted server.
+    /// </summary>
+    private static bool IsCloudServer(string? serverUrl)
+    {
+        var url = serverUrl?.ToLowerInvariant() ?? "";
+        return url.Contains("obico.io");
     }
 
     /// <summary>
@@ -202,7 +221,7 @@ public class ObicoClient : IDisposable
 
         // If Janus is enabled but H.264 streamer not started (waiting for decoder), start it now
         if (_janusEnabled && _janusClient != null && _h264Streamer == null &&
-            _printerConfig.Obico.StreamMode == ObicoStreamMode.H264)
+            _obicoConfig.StreamMode == ObicoStreamMode.H264)
         {
             try
             {
@@ -231,7 +250,7 @@ public class ObicoClient : IDisposable
         if (_isRunning)
             return;
 
-        if (!_printerConfig.Obico.Enabled)
+        if (!_obicoConfig.Enabled)
         {
             Log("Obico not enabled for this printer");
             return;
@@ -291,8 +310,8 @@ public class ObicoClient : IDisposable
 
         _obicoServer?.Dispose();
         _obicoServer = new ObicoServerConnection(
-            _printerConfig.Obico.ServerUrl,
-            _printerConfig.Obico.AuthToken);
+            _obicoConfig.ServerUrl,
+            _obicoConfig.AuthToken);
 
         // Enable verbose logging via environment variable (e.g., for systemd troubleshooting)
         _obicoServer.Verbose = Environment.GetEnvironmentVariable("ACPROXYCAM_VERBOSE") == "1";
@@ -325,7 +344,7 @@ public class ObicoClient : IDisposable
             // Start background tasks
             _statusUpdateTask = Task.Run(() => StatusUpdateLoopAsync(_cts!.Token), _cts!.Token);
 
-            if (_printerConfig.Obico.SnapshotsEnabled && _printerConfig.CameraEnabled)
+            if (_obicoConfig.SnapshotsEnabled && _printerConfig.CameraEnabled)
             {
                 _snapshotTask = Task.Run(() => SnapshotUploadLoopAsync(_cts!.Token), _cts!.Token);
             }
@@ -351,7 +370,7 @@ public class ObicoClient : IDisposable
         try
         {
             // Cloud Obico (app.obico.io) handles WebRTC internally - no Janus needed
-            if (IsCloudServer())
+            if (_isCloud)
             {
                 Log("Cloud Obico - streaming handled by cloud infrastructure");
                 _janusEnabled = false;
@@ -367,7 +386,7 @@ public class ObicoClient : IDisposable
                 return;
             }
 
-            var streamMode = _printerConfig.Obico.StreamMode;
+            var streamMode = _obicoConfig.StreamMode;
             Log($"Starting Janus {streamMode} streaming to {janusServer}...");
 
             // Create Janus client with appropriate streaming mode
@@ -434,7 +453,7 @@ public class ObicoClient : IDisposable
     private string? GetJanusServerAddress()
     {
         // Use configured Janus server if set
-        var configuredServer = _printerConfig.Obico.JanusServer;
+        var configuredServer = _obicoConfig.JanusServer;
         if (!string.IsNullOrEmpty(configuredServer))
         {
             return configuredServer;
@@ -443,7 +462,7 @@ public class ObicoClient : IDisposable
         // Default: extract host from Obico server URL (assumes Janus is on same server)
         try
         {
-            var serverUrl = _printerConfig.Obico.ServerUrl;
+            var serverUrl = _obicoConfig.ServerUrl;
             if (!string.IsNullOrEmpty(serverUrl))
             {
                 var uri = new Uri(serverUrl);
@@ -1440,7 +1459,7 @@ public class ObicoClient : IDisposable
 
         if (wasViewing != status.Viewing)
         {
-            var isCloud = IsCloudServer();
+            var isCloud = _isCloud;
             if (status.Viewing)
             {
                 Log($"User started viewing - boosting snapshot rate{(isCloud ? " (cloud rate limits apply)" : "")}");
@@ -1575,7 +1594,7 @@ public class ObicoClient : IDisposable
                     }
 
                     // Restart Janus streaming
-                    if (_printerConfig.CameraEnabled && _printerConfig.Obico.Enabled)
+                    if (_printerConfig.CameraEnabled && _obicoConfig.Enabled)
                     {
                         Log("Restarting Janus after Moonraker reconnection...");
                         try
@@ -1870,10 +1889,10 @@ public class ObicoClient : IDisposable
             httpClient.Timeout = TimeSpan.FromMinutes(5);
 
             // Add auth token to request
-            if (!string.IsNullOrEmpty(_printerConfig.Obico.AuthToken))
+            if (!string.IsNullOrEmpty(_obicoConfig.AuthToken))
             {
                 httpClient.DefaultRequestHeaders.Authorization =
-                    new System.Net.Http.Headers.AuthenticationHeaderValue("Token", _printerConfig.Obico.AuthToken);
+                    new System.Net.Http.Headers.AuthenticationHeaderValue("Token", _obicoConfig.AuthToken);
             }
 
             var gcodeData = await httpClient.GetByteArrayAsync(url);
@@ -2005,8 +2024,8 @@ public class ObicoClient : IDisposable
     {
         // Determine if this is a cloud or local/self-hosted server
         // Cloud servers (obico.io) have rate limits, local servers do not
-        var isCloud = IsCloudServer();
-        var isPro = _printerConfig.Obico.IsPro;
+        var isCloud = _isCloud;
+        var isPro = _obicoConfig.IsPro;
 
         Log($"Snapshot upload loop started (isCloud={isCloud}, isPro={isPro}, viewing={_isUserViewing})");
 
@@ -2047,15 +2066,6 @@ public class ObicoClient : IDisposable
                 }
             }
         }
-    }
-
-    /// <summary>
-    /// Check if connected to Obico cloud (app.obico.io) vs self-hosted server.
-    /// </summary>
-    private bool IsCloudServer()
-    {
-        var serverUrl = _printerConfig.Obico.ServerUrl?.ToLowerInvariant() ?? "";
-        return serverUrl.Contains("obico.io");
     }
 
     /// <summary>
@@ -2109,30 +2119,30 @@ public class ObicoClient : IDisposable
             Log($"Obico printer info: id={printerInfo.Id}, name='{printerInfo.Name}', isPro={printerInfo.IsPro}");
 
             // Capture previous values for change detection
-            var wasProBefore = _printerConfig.Obico.IsPro;
-            var previousName = _printerConfig.Obico.ObicoName ?? "";
-            var previousPrinterId = _printerConfig.Obico.ObicoPrinterId;
+            var wasProBefore = _obicoConfig.IsPro;
+            var previousName = _obicoConfig.ObicoName ?? "";
+            var previousPrinterId = _obicoConfig.ObicoPrinterId;
 
             // Update tier status
-            _printerConfig.Obico.IsPro = printerInfo.IsPro;
+            _obicoConfig.IsPro = printerInfo.IsPro;
 
             // Update printer ID (for server-side deletion)
             if (printerInfo.Id > 0)
             {
-                _printerConfig.Obico.ObicoPrinterId = printerInfo.Id;
+                _obicoConfig.ObicoPrinterId = printerInfo.Id;
             }
 
             // Update Obico name if changed
             if (!string.IsNullOrEmpty(printerInfo.Name))
             {
-                _printerConfig.Obico.ObicoName = printerInfo.Name;
+                _obicoConfig.ObicoName = printerInfo.Name;
             }
 
             // Note: TargetFps in config is informational only for display purposes
             // Actual snapshot upload rate is determined by account tier in SnapshotUploadLoopAsync:
             // Free: 0.1 FPS (1 frame every 10 seconds)
             // Pro: 0.5 FPS (1 frame every 2 seconds)
-            _printerConfig.Obico.TargetFps = printerInfo.IsPro ? 1 : 1; // Display "1 FPS" but actual rate is lower
+            _obicoConfig.TargetFps = printerInfo.IsPro ? 1 : 1; // Display "1 FPS" but actual rate is lower
 
             var tierChanged = wasProBefore != printerInfo.IsPro;
             var nameChanged = previousName != (printerInfo.Name ?? "");

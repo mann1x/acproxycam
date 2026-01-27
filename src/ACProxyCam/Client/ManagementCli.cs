@@ -2069,29 +2069,7 @@ WantedBy=multi-user.target
 
         var printerConfig = enabledPrinterConfigs.First(p => p.Name == selectedName);
 
-        // Check if already linked
-        if (printerConfig.Obico.IsLinked)
-        {
-            _ui.WriteWarning($"Printer '{selectedName}' is already linked to Obico.");
-            _ui.WriteWarning("To link again, you must first unlink locally and delete the printer from the Obico server.");
-            _ui.WriteLine();
-            _ui.WriteInfo("Please delete the printer from the Obico web UI:");
-            _ui.WriteInfo($"  {printerConfig.Obico.ServerUrl}/printers/");
-            _ui.WriteLine();
-
-            if (!_ui.Confirm("Unlink locally and continue?", false))
-                return;
-
-            // Clear local config
-            printerConfig.Obico.AuthToken = "";
-            printerConfig.Obico.DeviceSecret = "";
-            printerConfig.Obico.ObicoPrinterId = 0;
-            printerConfig.Obico.ObicoName = "";
-            await ConfigManager.SaveAsync(config);
-            _ui.WriteLine();
-        }
-
-        // Check if Rinkhals firmware is detected
+        // Check if Rinkhals firmware is detected (before asking about server)
         if (printerConfig.Firmware.Type != Models.FirmwareType.Rinkhals)
         {
             _ui.WriteWarning("Obico integration requires Rinkhals firmware with Moonraker.");
@@ -2114,16 +2092,49 @@ WantedBy=multi-user.target
             }
         }
 
-        // Select Obico server
+        // Select connection type
         _ui.WriteLine();
-        var serverChoice = _ui.SelectOne("Select Obico server:", new[]
+        var connectionChoice = _ui.SelectOne("Select connection type:", new[]
         {
-            "Obico Cloud (app.obico.io) - Recommended",
-            "Self-hosted server"
+            "Link to Obico Cloud (app.obico.io)",
+            "Link to local Obico server"
         });
 
+        if (connectionChoice == null)
+            return;
+
+        bool isCloud = connectionChoice.Contains("Cloud");
+        var targetConfig = isCloud ? printerConfig.ObicoCloud : printerConfig.Obico;
         string serverUrl;
-        if (serverChoice?.Contains("Self-hosted") == true)
+        var label = isCloud ? "Obico Cloud" : "local Obico";
+
+        // Check if already linked to this connection type
+        if (targetConfig.IsLinked)
+        {
+            _ui.WriteWarning($"Printer '{selectedName}' is already linked to {label}.");
+            _ui.WriteWarning("To link again, you must first unlink locally and delete the printer from the server.");
+            _ui.WriteLine();
+            _ui.WriteInfo("Please delete the printer from the Obico web UI:");
+            _ui.WriteInfo($"  {targetConfig.ServerUrl}/printers/");
+            _ui.WriteLine();
+
+            if (!_ui.Confirm("Unlink locally and continue?", false))
+                return;
+
+            // Clear local config
+            targetConfig.AuthToken = "";
+            targetConfig.DeviceSecret = "";
+            targetConfig.ObicoPrinterId = 0;
+            targetConfig.ObicoName = "";
+            await ConfigManager.SaveAsync(config);
+            _ui.WriteLine();
+        }
+
+        if (isCloud)
+        {
+            serverUrl = PrinterConfig.ObicoCloudUrl;
+        }
+        else
         {
             serverUrl = _ui.Ask("Enter server URL (e.g., http://192.168.1.100:3334):");
             if (string.IsNullOrWhiteSpace(serverUrl))
@@ -2132,6 +2143,15 @@ WantedBy=multi-user.target
             // Normalize URL
             if (!serverUrl.StartsWith("http://") && !serverUrl.StartsWith("https://"))
                 serverUrl = "http://" + serverUrl;
+
+            // Block cloud URL for local instance
+            if (serverUrl.ToLowerInvariant().Contains("obico.io"))
+            {
+                _ui.WriteError("Cannot use Obico Cloud URL for local instance.");
+                _ui.WriteWarning("Use 'Link to Obico Cloud' instead.");
+                _ui.WaitForKey();
+                return;
+            }
 
             // Test connection
             _ui.WriteInfo("Testing connection...");
@@ -2148,18 +2168,14 @@ WantedBy=multi-user.target
                 return;
             }
         }
-        else
-        {
-            serverUrl = "https://app.obico.io";
-        }
 
-        printerConfig.Obico.ServerUrl = serverUrl;
-        printerConfig.Obico.Enabled = true;
+        targetConfig.ServerUrl = serverUrl;
+        targetConfig.Enabled = true;
 
         // Generate device ID if not set
-        if (string.IsNullOrEmpty(printerConfig.Obico.ObicoDeviceId))
+        if (string.IsNullOrEmpty(targetConfig.ObicoDeviceId))
         {
-            printerConfig.Obico.ObicoDeviceId = Guid.NewGuid().ToString();
+            targetConfig.ObicoDeviceId = Guid.NewGuid().ToString();
         }
 
         // Check if server uses HTTPS for self-signed cert option
@@ -2193,8 +2209,8 @@ WantedBy=multi-user.target
             if (string.IsNullOrWhiteSpace(password))
                 return;
 
-            // Ask about self-signed certs if using HTTPS
-            if (usesHttps && serverUrl != "https://app.obico.io")
+            // Ask about self-signed certs if using HTTPS and not cloud
+            if (usesHttps && !isCloud)
             {
                 allowSelfSignedCerts = _ui.Confirm("Allow self-signed SSL certificates?", false);
             }
@@ -2209,20 +2225,21 @@ WantedBy=multi-user.target
                 serverUrl,
                 email,
                 password,
-                allowSelfSignedCerts);
+                allowSelfSignedCerts,
+                targetConfig);  // Pass target config
 
             if (result.Success)
             {
-                printerConfig.Obico.AuthToken = result.AuthToken!;
-                printerConfig.Obico.IsPro = result.IsPro;
-                printerConfig.Obico.ObicoName = result.PrinterName ?? "My Printer";
-                printerConfig.Obico.ObicoPrinterId = result.PrinterId;
-                printerConfig.Obico.TargetFps = result.IsPro ? 25 : 5;
+                targetConfig.AuthToken = result.AuthToken!;
+                targetConfig.IsPro = result.IsPro;
+                targetConfig.ObicoName = result.PrinterName ?? "My Printer";
+                targetConfig.ObicoPrinterId = result.PrinterId;
+                targetConfig.TargetFps = result.IsPro ? 25 : 5;
 
                 await ConfigManager.SaveAsync(config);
 
                 _ui.WriteLine();
-                _ui.WriteSuccess($"Printer '{selectedName}' linked to Obico!");
+                _ui.WriteSuccess($"Printer '{selectedName}' linked to {label}!");
                 _ui.WriteInfo($"Obico name: {result.PrinterName}");
                 _ui.WriteInfo($"Account type: {(result.IsPro ? "Pro" : "Free")}");
 
@@ -2247,7 +2264,7 @@ WantedBy=multi-user.target
         _ui.WriteLine();
 
         // Generate fresh device ID for manual linking
-        printerConfig.Obico.ObicoDeviceId = Guid.NewGuid().ToString("N");
+        targetConfig.ObicoDeviceId = Guid.NewGuid().ToString("N");
 
         using var manualLinkingService = new ObicoLinkingService();
         var manualCts = new CancellationTokenSource();
@@ -2281,7 +2298,8 @@ WantedBy=multi-user.target
                 _ui.WriteMarkup($"4. Enter the code: [cyan]{passcode}[/]");
                 _ui.WriteLine();
             },
-            ct: manualCts.Token);
+            ct: manualCts.Token,
+            configOverride: targetConfig);  // Pass target config
 
         try
         {
@@ -2318,16 +2336,16 @@ WantedBy=multi-user.target
 
             if (result.Success)
             {
-                printerConfig.Obico.AuthToken = result.AuthToken!;
-                printerConfig.Obico.IsPro = result.IsPro;
-                printerConfig.Obico.ObicoName = result.PrinterName ?? "My Printer";
-                printerConfig.Obico.ObicoPrinterId = result.PrinterId;
-                printerConfig.Obico.TargetFps = result.IsPro ? 25 : 5;
+                targetConfig.AuthToken = result.AuthToken!;
+                targetConfig.IsPro = result.IsPro;
+                targetConfig.ObicoName = result.PrinterName ?? "My Printer";
+                targetConfig.ObicoPrinterId = result.PrinterId;
+                targetConfig.TargetFps = result.IsPro ? 25 : 5;
 
                 await ConfigManager.SaveAsync(config);
 
                 _ui.WriteLine();
-                _ui.WriteSuccess($"Printer '{selectedName}' linked to Obico!");
+                _ui.WriteSuccess($"Printer '{selectedName}' linked to {label}!");
                 _ui.WriteInfo($"Obico name: {result.PrinterName}");
                 _ui.WriteInfo($"Account type: {(result.IsPro ? "Pro" : "Free")}");
 
@@ -2368,8 +2386,8 @@ WantedBy=multi-user.target
         _ui.WriteRule("Unlink Printer from Obico");
         _ui.WriteLine();
 
-        // Find linked and enabled printers
-        var linkedPrinters = config.Printers.Where(p => p.Enabled && p.Obico.IsLinked).ToList();
+        // Find printers with at least one linked connection (local or cloud)
+        var linkedPrinters = config.Printers.Where(p => p.Enabled && (p.Obico.IsLinked || p.ObicoCloud.IsLinked)).ToList();
 
         if (linkedPrinters.Count == 0)
         {
@@ -2379,27 +2397,57 @@ WantedBy=multi-user.target
         }
 
         var printerNames = linkedPrinters.Select(p => p.Name).ToArray();
-        var selectedName = _ui.SelectOneWithEscape("Select printer to unlink:", printerNames);
+        var selectedName = _ui.SelectOneWithEscape("Select printer:", printerNames);
         if (selectedName == null)
             return;
 
-        if (!_ui.Confirm($"Unlink '{selectedName}' from Obico?", false))
+        var printerConfig = linkedPrinters.First(p => p.Name == selectedName);
+
+        // Build list of linked connections
+        var connectionChoices = new List<string>();
+        if (printerConfig.Obico.IsLinked)
+            connectionChoices.Add($"Local server ({printerConfig.Obico.ServerUrl})");
+        if (printerConfig.ObicoCloud.IsLinked)
+            connectionChoices.Add("Obico Cloud (app.obico.io)");
+
+        if (connectionChoices.Count == 0)
+        {
+            _ui.WriteWarning("This printer is not linked to any Obico server.");
+            _ui.WaitForKey();
+            return;
+        }
+
+        string? connectionChoice = null;
+        if (connectionChoices.Count == 1)
+        {
+            connectionChoice = connectionChoices[0];
+        }
+        else
+        {
+            connectionChoice = _ui.SelectOneWithEscape("Select connection to unlink:", connectionChoices.ToArray());
+            if (connectionChoice == null)
+                return;
+        }
+
+        bool isCloud = connectionChoice.Contains("Cloud");
+        var targetConfig = isCloud ? printerConfig.ObicoCloud : printerConfig.Obico;
+        var serverUrl = targetConfig.ServerUrl;
+        var label = isCloud ? "Obico Cloud" : "local Obico";
+
+        if (!_ui.Confirm($"Unlink '{selectedName}' from {label}?", false))
             return;
 
-        var printerConfig = config.Printers.First(p => p.Name == selectedName);
-        var serverUrl = printerConfig.Obico.ServerUrl;
-
-        // Clear local config
-        printerConfig.Obico.AuthToken = "";
-        printerConfig.Obico.DeviceSecret = "";
-        printerConfig.Obico.IsPro = false;
-        printerConfig.Obico.ObicoName = "";
-        printerConfig.Obico.ObicoPrinterId = 0;
+        // Clear config for selected connection
+        targetConfig.AuthToken = "";
+        targetConfig.DeviceSecret = "";
+        targetConfig.IsPro = false;
+        targetConfig.ObicoName = "";
+        targetConfig.ObicoPrinterId = 0;
 
         await ConfigManager.SaveAsync(config);
 
         _ui.WriteLine();
-        _ui.WriteSuccess($"Printer '{selectedName}' unlinked from Obico.");
+        _ui.WriteSuccess($"Printer '{selectedName}' unlinked from {label}.");
         _ui.WriteLine();
         _ui.WriteWarning("Note: To fully remove the printer, delete it manually from the Obico web UI:");
         _ui.WriteInfo($"  {serverUrl}/printers/");
@@ -2418,23 +2466,45 @@ WantedBy=multi-user.target
 
         foreach (var printer in config.Printers)
         {
-            var isLinked = printer.Obico.IsLinked;
-            var statusColor = isLinked ? "green" : "grey";
-            var statusText = isLinked ? "Linked" : "Not linked";
-
-            _ui.WriteMarkup($"[white]{printer.Name}[/]");
-            _ui.WriteLine();
-            _ui.WriteMarkup($"  Status: [{statusColor}]{statusText}[/]");
+            _ui.WriteMarkup($"[white bold]{printer.Name}[/]");
             _ui.WriteLine();
 
-            if (isLinked)
+            // Local instance status
+            var localLinked = printer.Obico.IsLinked;
+            var localColor = localLinked ? "green" : "grey";
+            var localStatus = localLinked ? "Linked" : "Not linked";
+
+            _ui.WriteMarkup($"  [cyan]Local Instance:[/]");
+            _ui.WriteLine();
+            _ui.WriteMarkup($"    Status: [{localColor}]{localStatus}[/]");
+            _ui.WriteLine();
+
+            if (localLinked)
             {
-                _ui.WriteLine($"  Server: {printer.Obico.ServerUrl}");
-                _ui.WriteLine($"  Obico name: {printer.Obico.ObicoName}");
-                _ui.WriteLine($"  Account: {(printer.Obico.IsPro ? "Pro" : "Free")}");
-                _ui.WriteLine($"  Snapshots: {(printer.Obico.SnapshotsEnabled ? "Enabled" : "Disabled")} ({printer.Obico.TargetFps} FPS)");
+                _ui.WriteLine($"    Server: {printer.Obico.ServerUrl}");
+                _ui.WriteLine($"    Obico name: {printer.Obico.ObicoName}");
+                _ui.WriteLine($"    Snapshots: {(printer.Obico.SnapshotsEnabled ? "Enabled" : "Disabled")} ({printer.Obico.TargetFps} FPS)");
             }
 
+            // Cloud status
+            var cloudLinked = printer.ObicoCloud.IsLinked;
+            var cloudColor = cloudLinked ? "green" : "grey";
+            var cloudStatus = cloudLinked ? "Linked" : "Not linked";
+
+            _ui.WriteLine();
+            _ui.WriteMarkup($"  [cyan]Obico Cloud:[/]");
+            _ui.WriteLine();
+            _ui.WriteMarkup($"    Status: [{cloudColor}]{cloudStatus}[/]");
+            _ui.WriteLine();
+
+            if (cloudLinked)
+            {
+                _ui.WriteLine($"    Obico name: {printer.ObicoCloud.ObicoName}");
+                _ui.WriteLine($"    Account: {(printer.ObicoCloud.IsPro ? "Pro" : "Free")}");
+                _ui.WriteLine($"    Snapshots: {(printer.ObicoCloud.SnapshotsEnabled ? "Enabled" : "Disabled")} ({printer.ObicoCloud.TargetFps} FPS)");
+            }
+
+            _ui.WriteLine();
             _ui.WriteLine($"  Firmware: {printer.Firmware.Type} {printer.Firmware.Version}");
             _ui.WriteLine($"  Moonraker: {(printer.Firmware.MoonrakerAvailable ? "Available" : "Not available")}");
             _ui.WriteLine();
@@ -2464,33 +2534,58 @@ WantedBy=multi-user.target
             _ui.WriteRule($"Obico Settings - {selectedName}");
             _ui.WriteLine();
 
-            var choices = new[]
+            // Build menu with both local and cloud settings
+            var choices = new List<string>
             {
-                $"Enable/Disable Obico: {(printerConfig.Obico.Enabled ? "Enabled" : "Disabled")}",
-                $"Enable/Disable Snapshots: {(printerConfig.Obico.SnapshotsEnabled ? "Enabled" : "Disabled")}",
-                $"Target FPS: {printerConfig.Obico.TargetFps}",
+                // Local settings header
+                $"[Local] Enable/Disable: {(printerConfig.Obico.Enabled ? "Enabled" : "Disabled")}",
+                $"[Local] Snapshots: {(printerConfig.Obico.SnapshotsEnabled ? "Enabled" : "Disabled")}",
+                $"[Local] Target FPS: {printerConfig.Obico.TargetFps}",
+
+                // Cloud settings header
+                $"[Cloud] Enable/Disable: {(printerConfig.ObicoCloud.Enabled ? "Enabled" : "Disabled")}",
+                $"[Cloud] Snapshots: {(printerConfig.ObicoCloud.SnapshotsEnabled ? "Enabled" : "Disabled")}",
+                $"[Cloud] Target FPS: {printerConfig.ObicoCloud.TargetFps}",
+
+                // Other options
                 "Detect firmware",
                 "Back"
             };
 
-            var choice = _ui.SelectOne("Select setting:", choices);
+            var choice = _ui.SelectOne("Select setting:", choices.ToArray());
             if (choice == null || choice == "Back")
                 break;
 
-            if (choice.StartsWith("Enable/Disable Obico"))
+            if (choice.StartsWith("[Local] Enable"))
             {
                 printerConfig.Obico.Enabled = !printerConfig.Obico.Enabled;
             }
-            else if (choice.StartsWith("Enable/Disable Snapshots"))
+            else if (choice.StartsWith("[Local] Snapshots"))
             {
                 printerConfig.Obico.SnapshotsEnabled = !printerConfig.Obico.SnapshotsEnabled;
             }
-            else if (choice.StartsWith("Target FPS"))
+            else if (choice.StartsWith("[Local] Target"))
             {
                 var fpsStr = _ui.Ask($"Enter target FPS (1-25, current: {printerConfig.Obico.TargetFps}):");
                 if (int.TryParse(fpsStr, out var fps) && fps >= 1 && fps <= 25)
                 {
                     printerConfig.Obico.TargetFps = fps;
+                }
+            }
+            else if (choice.StartsWith("[Cloud] Enable"))
+            {
+                printerConfig.ObicoCloud.Enabled = !printerConfig.ObicoCloud.Enabled;
+            }
+            else if (choice.StartsWith("[Cloud] Snapshots"))
+            {
+                printerConfig.ObicoCloud.SnapshotsEnabled = !printerConfig.ObicoCloud.SnapshotsEnabled;
+            }
+            else if (choice.StartsWith("[Cloud] Target"))
+            {
+                var fpsStr = _ui.Ask($"Enter target FPS (1-25, current: {printerConfig.ObicoCloud.TargetFps}):");
+                if (int.TryParse(fpsStr, out var fps) && fps >= 1 && fps <= 25)
+                {
+                    printerConfig.ObicoCloud.TargetFps = fps;
                 }
             }
             else if (choice == "Detect firmware")

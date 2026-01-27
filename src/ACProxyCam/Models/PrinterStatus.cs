@@ -47,8 +47,11 @@ public class PrinterStatus
     // Camera LED status
     public LedStatus? CameraLed { get; set; }
 
-    // Obico status
+    // Obico status (local server)
     public ObicoStatus ObicoStatus { get; set; } = new();
+
+    // Obico Cloud status (app.obico.io)
+    public ObicoStatus ObicoCloudStatus { get; set; } = new();
 }
 
 public enum PrinterState
@@ -155,6 +158,21 @@ public class ObicoStatus
     /// Target FPS for snapshot uploads.
     /// </summary>
     public int TargetFps { get; set; }
+
+    /// <summary>
+    /// Whether snapshots are enabled.
+    /// </summary>
+    public bool SnapshotsEnabled { get; set; }
+
+    /// <summary>
+    /// Server URL (displayed for local instances, null for cloud).
+    /// </summary>
+    public string? ServerUrl { get; set; }
+
+    /// <summary>
+    /// Printer name as shown in Obico dashboard.
+    /// </summary>
+    public string? ObicoName { get; set; }
 
     /// <summary>
     /// Last error message if any.

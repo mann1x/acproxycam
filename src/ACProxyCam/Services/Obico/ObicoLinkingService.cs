@@ -224,24 +224,28 @@ public class ObicoLinkingService : IDisposable
     /// <param name="serverUrl">Obico server URL</param>
     /// <param name="onPasscodeReceived">Callback when one-time passcode is received</param>
     /// <param name="ct">Cancellation token</param>
+    /// <param name="configOverride">Optional config override for cloud vs local instance. If null, uses printerConfig.Obico.</param>
     /// <returns>LinkingResult with all fields populated</returns>
     public async Task<LinkingResult> StartManualLinkingAsync(
         PrinterConfig printerConfig,
         string serverUrl,
         Action<string>? onPasscodeReceived = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        PrinterObicoConfig? configOverride = null)
     {
+        var obicoConfig = configOverride ?? printerConfig.Obico;
+
         // Generate or use existing device ID
-        var deviceId = printerConfig.Obico.ObicoDeviceId;
+        var deviceId = obicoConfig.ObicoDeviceId;
         if (string.IsNullOrEmpty(deviceId))
         {
             deviceId = Guid.NewGuid().ToString("N");
-            printerConfig.Obico.ObicoDeviceId = deviceId;
+            obicoConfig.ObicoDeviceId = deviceId;
         }
 
         // Generate device secret locally (no discovery server needed)
         var deviceSecret = GenerateDeviceSecret();
-        printerConfig.Obico.DeviceSecret = deviceSecret;
+        obicoConfig.DeviceSecret = deviceSecret;
 
         Log($"[{printerConfig.Name}] Starting manual linking...");
 
@@ -482,6 +486,7 @@ public class ObicoLinkingService : IDisposable
     /// <param name="email">User's email address</param>
     /// <param name="password">User's password</param>
     /// <param name="allowSelfSignedCerts">Allow self-signed SSL certificates</param>
+    /// <param name="configOverride">Optional config override for cloud vs local instance. If null, uses printerConfig.Obico.</param>
     /// <param name="ct">Cancellation token</param>
     public async Task<LinkingResult> LinkWithCredentialsAsync(
         PrinterConfig printerConfig,
@@ -489,8 +494,11 @@ public class ObicoLinkingService : IDisposable
         string email,
         string password,
         bool allowSelfSignedCerts = false,
+        PrinterObicoConfig? configOverride = null,
         CancellationToken ct = default)
     {
+        var obicoConfig = configOverride ?? printerConfig.Obico;
+
         try
         {
             using var server = new ObicoServerConnection(serverUrl, "");
@@ -546,9 +554,9 @@ public class ObicoLinkingService : IDisposable
             }
 
             // Generate device ID if not set
-            if (string.IsNullOrEmpty(printerConfig.Obico.ObicoDeviceId))
+            if (string.IsNullOrEmpty(obicoConfig.ObicoDeviceId))
             {
-                printerConfig.Obico.ObicoDeviceId = Guid.NewGuid().ToString("N");
+                obicoConfig.ObicoDeviceId = Guid.NewGuid().ToString("N");
             }
 
             // Update printer name on server to match ACProxyCam config

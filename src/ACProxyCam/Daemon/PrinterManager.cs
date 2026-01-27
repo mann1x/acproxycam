@@ -34,7 +34,7 @@ public class PrinterManager
                     // Find old config for comparison
                     var oldPrinterConfig = oldConfig.Printers.FirstOrDefault(p => p.Name == newPrinterConfig.Name);
 
-                    // Check if Obico config changed
+                    // Check if local Obico config changed
                     var obicoChanged = oldPrinterConfig == null ||
                                        oldPrinterConfig.Obico.AuthToken != newPrinterConfig.Obico.AuthToken ||
                                        oldPrinterConfig.Obico.Enabled != newPrinterConfig.Obico.Enabled ||
@@ -42,8 +42,19 @@ public class PrinterManager
 
                     if (obicoChanged)
                     {
-                        // Fire and forget - update Obico config asynchronously
+                        // Fire and forget - update local Obico config asynchronously
                         _ = thread.UpdateObicoConfigAsync(newPrinterConfig.Obico);
+                    }
+
+                    // Check if Obico Cloud config changed
+                    var obicoCloudChanged = oldPrinterConfig == null ||
+                                            oldPrinterConfig.ObicoCloud.AuthToken != newPrinterConfig.ObicoCloud.AuthToken ||
+                                            oldPrinterConfig.ObicoCloud.Enabled != newPrinterConfig.ObicoCloud.Enabled;
+
+                    if (obicoCloudChanged)
+                    {
+                        // Fire and forget - update cloud Obico config asynchronously
+                        _ = thread.UpdateObicoCloudConfigAsync(newPrinterConfig.ObicoCloud);
                     }
                 }
             }
@@ -219,7 +230,16 @@ public class PrinterManager
             {
                 Enabled = config.Obico.Enabled,
                 IsLinked = config.Obico.IsLinked,
-                State = "Disabled"
+                State = "Disabled",
+                ServerUrl = config.Obico.ServerUrl,
+                ObicoName = config.Obico.ObicoName
+            },
+            ObicoCloudStatus = new ObicoStatus
+            {
+                Enabled = config.ObicoCloud.Enabled,
+                IsLinked = config.ObicoCloud.IsLinked,
+                State = "Disabled",
+                ObicoName = config.ObicoCloud.ObicoName
             }
         };
     }
