@@ -18,6 +18,11 @@ Docker container for ACProxyCam - an Anycubic 3D printer camera proxy that conve
 ghcr.io/mann1x/acproxycam:latest
 ```
 
+**Alternative (Docker Hub):**
+```
+mannixita/acproxycam:latest
+```
+
 ## Quick Start
 
 ### Using Docker Run

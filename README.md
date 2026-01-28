@@ -75,6 +75,8 @@ docker run -d \
   ghcr.io/mann1x/acproxycam:latest
 ```
 
+**Alternative:** Also available on Docker Hub as `mannixita/acproxycam`
+
 See [docker/README.md](docker/README.md) for complete Docker documentation including web terminal setup and Janus WebRTC configuration.
 
 ## Usage
