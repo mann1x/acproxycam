@@ -78,9 +78,12 @@ RUN S6_ARCH=$(case "${TARGETARCH}" in \
 # Copy s6 service definitions
 COPY docker/rootfs/ /
 
-# Fix line endings for s6 service files (Windows CRLF -> Unix LF)
+# Fix line endings for s6 service files (Windows CRLF -> Unix LF) and set execute permissions
 RUN find /etc/s6-overlay -type f -exec sed -i 's/\r$//' {} \; && \
-    find /etc/cont-init.d -type f -exec sed -i 's/\r$//' {} \;
+    find /etc/cont-init.d -type f -exec sed -i 's/\r$//' {} \; && \
+    chmod +x /etc/cont-init.d/* && \
+    chmod +x /etc/s6-overlay/s6-rc.d/*/run 2>/dev/null || true && \
+    chmod +x /etc/s6-overlay/s6-rc.d/*/finish 2>/dev/null || true
 
 # Copy application binary
 COPY --from=build /publish/acproxycam /usr/local/bin/acproxycam
