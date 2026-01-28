@@ -1,28 +1,21 @@
 # ACProxyCam
 
-Anycubic Camera Proxy for Linux - Converts FLV camera streams from Anycubic 3D printers to MJPEG for Mainsail/Fluidd/Moonraker compatibility.
+Anycubic Camera Proxy for Linux - Stream your Anycubic 3D printer camera to Mainsail, Fluidd, Home Assistant, Obico & more.
 
 ![ACProxyCam Management Interface](docs/screenshot.png)
 
 ## Features
 
-- Multi-printer support with individual MJPEG streams on separate ports
-- Auto-detection of printer model code and device ID via MQTT
-- Auto-retrieval of MQTT credentials from printer via SSH
-- **Stream recovery** - intercepts external stop commands (from slicers) and instantly restarts camera, with automatic SSH+LAN mode retry when MQTT fails
-- **Configurable FPS** - MaxFps for streaming, IdleFps for snapshots when no clients connected
-- **CPU affinity** - distributes printer threads across CPU cores for better performance
-- **Camera LED control** - toggle camera LED via HTTP API or management interface, with optional auto-control
-- **HLS streaming** - Low-Latency HLS (LL-HLS) for modern players with ~1-2s latency, plus legacy HLS endpoint
-- **BedMesh Calibration** - run bed mesh calibration with visual heatmap display
-- **BedMesh Analysis** - run multiple calibrations with IQR-based statistical analysis and outlier detection
-- Systemd service with watchdog support
-- Interactive terminal management interface using Spectre.Console with auto-refresh
-- Pre-flight connectivity check when adding printers
-- Encrypted credential storage (AES-256-GCM with machine-specific key)
-- Automatic retry with intelligent backoff (5s if responsive, 30s if offline)
-- Log rotation via logrotate
-- **HomeAssistant integration** - REST API compatible with HomeAssistant switches
+- **Multi-format streaming** - MJPEG, H.264 WebSocket (jmuxer), HLS, and Low-Latency HLS (~1s delay)
+- **Obico integration** - AI failure detection with simultaneous local server and Obico Cloud support
+- **Multi-printer support** - Individual streams on separate ports with per-printer configuration
+- **Streamer controls** - Enable/disable individual endpoints (H.264, HLS, LL-HLS, MJPEG) to minimize CPU
+- **Smart camera control** - AutoLanMode keeps camera accessible, auto-recovery from slicer stop commands
+- **LED management** - Toggle via HTTP API or CLI, auto-control with configurable standby timeout
+- **BedMesh tools** - Calibration with heat soak, analysis with 3D visualization and outlier detection
+- **Home Assistant ready** - REST API for snapshots, status, and LED control
+- **Encrypted config** - AES-256-GCM with machine-specific key derivation
+- **Docker support** - Multi-arch image with web terminal (ttyd) and Janus WebRTC gateway
 
 ## Requirements
 
@@ -31,8 +24,6 @@ Anycubic Camera Proxy for Linux - Converts FLV camera streams from Anycubic 3D p
 - Anycubic printer with camera (Kobra S1, etc.)
 
 ### FFmpeg Installation
-
-The application requires FFmpeg runtime libraries (not just the binary). Install the appropriate packages for your distribution:
 
 **Debian/Ubuntu/Raspberry Pi OS:**
 ```bash
@@ -49,17 +40,20 @@ sudo dnf install ffmpeg ffmpeg-devel
 sudo pacman -S ffmpeg
 ```
 
-> **Note:** The app requires FFmpeg 6.x or newer. Older distributions with FFmpeg 4.x are not supported.
+> **Note:** FFmpeg 6.x or newer required. Older distributions with FFmpeg 4.x are not supported.
 
 ## Quick Start
 
+### Native Installation
+
 ```bash
 # Download the latest release for your architecture
-wget https://github.com/yourusername/acproxycam/releases/latest/download/acproxycam-linux-x64
-chmod +x acproxycam-linux-x64
+wget https://github.com/mann1x/acproxycam/releases/latest/download/acproxycam-linux-arm64-v1.4.0.zip
+unzip acproxycam-linux-arm64-v1.4.0.zip
+chmod +x acproxycam
 
 # Run with sudo for installation
-sudo ./acproxycam-linux-x64
+sudo ./acproxycam
 ```
 
 The interactive installer will:
@@ -69,21 +63,27 @@ The interactive installer will:
 4. Install and start the systemd service
 5. Configure log rotation
 
+### Docker Installation
+
+```bash
+docker run -d \
+  --name acproxycam \
+  --restart unless-stopped \
+  --network host \
+  -v acproxycam-config:/etc/acproxycam \
+  -v /etc/machine-id:/etc/machine-id:ro \
+  ghcr.io/mann1x/acproxycam:latest
+```
+
+See [docker/README.md](docker/README.md) for complete Docker documentation including web terminal setup and Janus WebRTC configuration.
+
 ## Usage
 
 ### Management Interface
 
 Run `sudo acproxycam` to enter the interactive management interface.
 
-**Service Controls:**
-| Key | Action |
-|-----|--------|
-| `S` | Stop/Start service |
-| `R` | Restart service |
-| `U` | Uninstall service |
-| `L` | Change listening interfaces |
-
-**Printer Controls:**
+**Main Menu:**
 | Key | Action |
 |-----|--------|
 | `A` | Add printer |
@@ -92,88 +92,142 @@ Run `sudo acproxycam` to enter the interactive management interface.
 | `Space` | Pause/Resume printer |
 | `T` | Toggle camera LED |
 | `Enter` | View printer details |
+| `B` | BedMesh calibration menu |
+| `O` | Obico integration menu |
 | `Q` | Quit |
+
+**Service Controls (native only, hidden in Docker):**
+| Key | Action |
+|-----|--------|
+| `S` | Stop/Start service |
+| `R` | Restart service |
+| `U` | Uninstall service |
+| `L` | Change listening interfaces |
 
 ### Adding a Printer
 
 Press `A` and provide:
 - **Printer name** - Unique identifier for this printer
 - **Printer IP address** - IP address of the printer on your network
-- **MJPEG listening port** - Port for the MJPEG stream (default: 8080)
-- **SSH port** - SSH port on printer (default: 22)
+- **HTTP port** - Port for all streaming endpoints (default: 8080)
 - **SSH credentials** - Username/password (default: root/rockchip)
-- **MQTT port** - MQTT broker port on printer (default: 9883)
+- **Streaming options** - Enable/disable H.264, HLS, LL-HLS, MJPEG endpoints
+
+### Streamer Configuration
+
+Each streaming endpoint can be individually enabled or disabled:
+
+| Streamer | Default | Description |
+|----------|---------|-------------|
+| H.264 WebSocket | Enabled | Low-latency stream for jmuxer (Mainsail/Fluidd) |
+| HLS | Enabled | HTTP Live Streaming for browsers |
+| LL-HLS | Enabled | Low-Latency HLS (~1s delay) |
+| MJPEG | Disabled | Higher CPU usage, legacy compatibility |
+
+HTTP endpoints (snapshot, status, LED control) are always available regardless of streamer settings.
+
+### AutoLanMode
+
+AutoLanMode ensures the printer's camera remains accessible by automatically enabling LAN mode when needed. This prevents issues where the camera becomes unavailable after being accessed by the Anycubic slicer or cloud services.
+
+Configure per-printer in the Modify menu.
+
+### LED Auto-Control
+
+When enabled, the camera LED automatically:
+- Turns on when streaming clients connect
+- Turns off after a configurable standby timeout (default: 20 minutes) when no clients are connected
+
+Configure per-printer in the Modify menu.
+
+### FPS Display
+
+The dashboard shows real-time FPS measured from actual H.264 packets received from the printer. This may differ significantly from the FPS advertised in the stream metadata.
+
+**Example:** The Kobra S1 stream metadata declares 10fps, but the printer actually delivers ~4fps. ACProxyCam measures and displays the true incoming frame rate, helping you understand actual camera performance.
+
+> **Note:** The "declared" FPS in printer details shows the metadata value. The dashboard FPS column shows real-time measured rate.
 
 ### Accessing Streams
 
-Once a printer is configured and running, access the streams at:
+Once a printer is configured and running:
 
 | Endpoint | URL | Description |
 |----------|-----|-------------|
-| MJPEG Stream | `http://server-ip:8080/stream` | Live video stream |
-| Snapshot | `http://server-ip:8080/snapshot` | Current frame as JPEG |
-| H.264 WebSocket | `ws://server-ip:8080/h264` | H.264 stream for jmuxer |
-| Status | `http://server-ip:8080/status` | JSON status info |
-| HLS (LL-HLS) | `http://server-ip:8080/hls/playlist.m3u8` | Low-Latency HLS stream (~1-2s latency) |
-| HLS (Legacy) | `http://server-ip:8080/hls/legacy.m3u8` | Standard HLS for older players |
-| LED Status | `http://server-ip:8080/led` | GET: JSON `{"state":"on\|off","brightness":0-100}` |
-| LED On | `http://server-ip:8080/led/on` | POST: Turn LED on |
-| LED Off | `http://server-ip:8080/led/off` | POST: Turn LED off |
+| Snapshot | `http://server:8080/snapshot` | Current frame as JPEG |
+| Status | `http://server:8080/status` | JSON status info |
+| H.264 WebSocket | `ws://server:8080/h264` | H.264 stream for jmuxer |
+| HLS (LL-HLS) | `http://server:8080/hls/playlist.m3u8` | Low-Latency HLS (~1-2s) |
+| HLS (Legacy) | `http://server:8080/hls/legacy.m3u8` | Standard HLS for older players |
+| MJPEG Stream | `http://server:8080/stream` | Live MJPEG (if enabled) |
+| LED Status | `http://server:8080/led` | GET: `{"state":"on|off","brightness":0-100}` |
+| LED On/Off | `http://server:8080/led/on` | POST: Toggle LED |
 
 ### Mainsail/Fluidd Configuration
 
-**MJPEG Stream (Default):**
+**H.264 Stream (Recommended - Lower CPU):**
 
-Configure the webcam in Mainsail/Fluidd UI settings with:
-- Stream URL: `http://<acproxycam-ip>:8080/stream`
-- Snapshot URL: `http://<acproxycam-ip>:8080/snapshot`
-
-**H.264 Stream (jmuxer - Lower CPU Usage):**
-
-For H.264 streaming via jmuxer, add this to `moonraker.conf` or `moonraker.custom.conf`:
+Add to `moonraker.conf`:
 
 ```ini
 [webcam Webcam]
 enabled: True
 service: jmuxer-stream
-target_fps: 10
+target_fps: 15
 target_fps_idle: 5
-stream_url: ws://192.168.178.12:8081/h264
-snapshot_url: http://192.168.178.12:8081/snapshot
+stream_url: ws://<acproxycam-ip>:8080/h264
+snapshot_url: http://<acproxycam-ip>:8080/snapshot
 rotation: 0
 ```
 
-Replace the IP and port with your ACProxyCam server address.
+**MJPEG Stream (Legacy):**
 
-### HLS Streaming
+Configure in Mainsail/Fluidd UI:
+- Stream URL: `http://<acproxycam-ip>:8080/stream`
+- Snapshot URL: `http://<acproxycam-ip>:8080/snapshot`
 
-ACProxyCam provides HLS (HTTP Live Streaming) endpoints for players that don't support MJPEG:
+## Obico Integration
 
-- **LL-HLS** (`/hls/playlist.m3u8`) - Low-Latency HLS with partial segments for reduced latency (~1-2 seconds). Works with modern players like hls.js and Safari.
+ACProxyCam includes full Obico integration for AI-powered print failure detection. You can connect to both a local Obico server and Obico Cloud simultaneously.
 
-- **Legacy HLS** (`/hls/legacy.m3u8`) - Standard HLS v3 for older players. Compatible with MPC-HC (Media Player Classic).
+### Obico Menu
 
-**Player Compatibility:**
+Press `O` in the management interface:
 
-| Player | LL-HLS | Legacy HLS |
-|--------|--------|------------|
-| Safari | Yes | Yes |
-| hls.js (web) | Yes | Yes |
-| MPC-HC | N/A | Yes |
-| VLC | No | No |
-| PotPlayer | No | No |
+| Key | Action |
+|-----|--------|
+| `1` | Configure local Obico server |
+| `2` | Configure Obico Cloud |
+| `3` | View Obico status dashboard |
+| `Esc` | Return to main menu |
 
-> **Note:** VLC and PotPlayer have strict timing requirements that cause issues with our HLS implementation. Use MPC-HC or a browser-based hls.js player instead.
+### Features
 
-**HomeAssistant Note:** HA's stream integration **produces** HLS from RTSP/H.264 sources - it does not consume HLS as input. For HA camera integration, use the MJPEG platform (see [HomeAssistant Integration](#homeassistant-integration)).
+- **AI Failure Detection** - Obico's AI monitors your prints for spaghetti and other failures
+- **Dual Connection** - Connect to both self-hosted Obico server and Obico Cloud simultaneously
+- **Native H.264 Streaming** - WebRTC via Janus gateway for efficient video delivery
+- **Print Status Sync** - Real-time progress, layer info, temperatures reported to Obico
+- **Firmware Sync** - Print cancellation from Obico properly notifies Anycubic firmware
+
+### Setup
+
+1. **Link Printer**: In the Obico menu, select your connection type (local or cloud)
+2. **Authenticate**: Three options available:
+   - **Direct login** - Enter your Obico email/password to automatically link the printer (works with both local and cloud)
+   - **Verification code** - Get a 6-digit code from Obico web UI to link the printer
+   - **Direct token** - Enter auth token manually for advanced setups
+3. **Configure Janus**: For WebRTC streaming, configure Janus gateway URL (required for video)
+
+### Janus WebRTC Gateway
+
+For H.264 streaming to Obico, a Janus WebRTC gateway is required:
+
+- **Docker**: Janus is included and auto-configured
+- **Native**: Install Janus separately and configure the WebSocket URL in Obico settings
 
 ## BedMesh Calibration & Analysis
 
-ACProxyCam includes built-in bed mesh calibration and analysis tools that work directly with Anycubic printers via their local API.
-
-### BedMesh Menu
-
-Press `B` in the management interface to access the BedMesh menu:
+Press `B` in the management interface:
 
 | Key | Action |
 |-----|--------|
@@ -187,154 +241,61 @@ Press `B` in the management interface to access the BedMesh menu:
 
 ![BedMesh Calibration](docs/calibration.png)
 
-Run a single bed mesh calibration with optional heat soak:
-
-1. Select a printer from the list
-2. Enter heat soak time in minutes (0 to skip)
-3. Optionally name the calibration for later reference
-4. The calibration runs automatically (preheat → wipe → probe → save)
-5. View results with a color-coded heatmap showing bed deviation
-
-**Heatmap Features:**
-- Color gradient from blue (low) to red (high)
-- Grid shows probe point positions
-- Statistics display: min, max, range, average deviation
-- Coordinates of min/max points shown
+1. Select a printer
+2. Enter heat soak time (0 to skip)
+3. Optionally name the calibration
+4. View color-coded heatmap with statistics
 
 ### Analysis (Multiple Calibrations)
 
 ![BedMesh Analysis](docs/analysis.png)
 
-Run multiple calibrations to analyze bed mesh repeatability and detect probing errors:
+Run multiple calibrations to detect probing inconsistencies:
 
-1. Select a printer
-2. Enter heat soak time (only applied before first calibration)
-3. Enter number of calibrations to run (minimum 5 recommended for accurate IQR)
-4. Optionally name the analysis
-5. Each calibration runs with a 1-minute pause between runs
-
-**Analysis Statistics:**
-- **Average Mesh** - computed from all calibrations
-- **Standard Deviation** - per-point variation across runs
-- **Range** - min/max deviation across all calibrations
-- **IQR-based Outlier Detection** - identifies probe points with inconsistent readings
-
-**Outlier Detection:**
-- Uses Interquartile Range (IQR) method: values outside Q1-1.5×IQR to Q3+1.5×IQR
-- Minimum threshold of 0.030mm (30 microns) based on strain gauge probe accuracy
-- Shows outlier positions with coordinates, count, average delta, and IQR values
-- Helps identify mechanical issues or probe inconsistencies
-
-### Saved Sessions
-
-All calibrations and analyses are saved to `/etc/acproxycam/sessions/`:
-- Calibrations: `calibrations/*.mesh`
-- Analyses: `analyses/*.analysis`
-
-View saved sessions from the BedMesh menu to review historical data and compare results.
-
-### Multiple Printers
-
-Each printer requires a unique MJPEG port. Example setup:
-- Printer 1: port 8080
-- Printer 2: port 8081
-- Printer 3: port 8082
-
-## Building from Source
-
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/acproxycam.git
-cd acproxycam
-
-# Build for Linux x64
-dotnet publish src/ACProxyCam/ACProxyCam.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true
-
-# Build for Linux arm64 (Raspberry Pi 4+)
-dotnet publish src/ACProxyCam/ACProxyCam.csproj -c Release -r linux-arm64 --self-contained true -p:PublishSingleFile=true
-
-# Output will be in:
-# src/ACProxyCam/bin/Release/net8.0/linux-x64/publish/acproxycam
-# src/ACProxyCam/bin/Release/net8.0/linux-arm64/publish/acproxycam
-```
-
-## Configuration
-
-Configuration is stored at `/etc/acproxycam/config.json`. Sensitive fields (passwords) are encrypted using AES-256-GCM with a key derived from `/etc/machine-id`.
-
-Example configuration:
-```json
-{
-  "listenInterfaces": ["0.0.0.0"],
-  "printers": [
-    {
-      "name": "MyPrinter",
-      "ip": "192.168.1.100",
-      "mjpegPort": 8080,
-      "sshPort": 22,
-      "sshUser": "root",
-      "mqttPort": 9883
-    }
-  ]
-}
-```
+- **IQR-based outlier detection** - Identifies probe points with inconsistent readings
+- **Statistical analysis** - Average mesh, standard deviation, range across runs
+- **Minimum threshold** - 0.030mm based on strain gauge probe accuracy
 
 ## HomeAssistant Integration
 
-You can integrate the camera and LED control with HomeAssistant.
-
 ### Camera Integration
 
-**Option 1: MJPEG IP Camera (Built-in, Recommended)**
-
-Use the MJPEG IP Camera integration via the UI:
+**MJPEG IP Camera (Recommended):**
 
 1. Go to **Settings > Devices & Services > Add Integration**
-2. Search for "MJPEG IP Camera" and select it
-3. Configure the camera:
-   - **MJPEG URL:** `http://<acproxycam-ip>:8081/stream`
-   - **Still image URL:** `http://<acproxycam-ip>:8081/snapshot`
-   - **Username/Password:** Leave empty (no authentication required)
-   - **Verify SSL certificate:** Unchecked
-4. Click **Submit**
+2. Search for "MJPEG IP Camera"
+3. Configure:
+   - MJPEG URL: `http://<acproxycam-ip>:8080/stream`
+   - Still image URL: `http://<acproxycam-ip>:8080/snapshot`
 
-![MJPEG IP Camera Configuration](docs/ha-mjpeg-config.png)
+**WebRTC Camera (HACS - For HLS):**
 
-**Option 2: WebRTC Camera (HACS - For HLS Streaming)**
-
-For HLS streaming with lower latency, install the [WebRTC Camera](https://github.com/AlexxIT/WebRTC) custom component from HACS:
-
-1. Install HACS if not already installed
-2. In HACS, search for "WebRTC Camera" and install it
-3. Restart Home Assistant
-4. Add a WebRTC card to your dashboard with HLS URL:
+Install [WebRTC Camera](https://github.com/AlexxIT/WebRTC) from HACS and add a card:
 
 ```yaml
 type: custom:webrtc-camera
-url: http://<acproxycam-ip>:8081/hls/playlist.m3u8
+url: http://<acproxycam-ip>:8080/hls/playlist.m3u8
 ```
-
-> **Note:** HomeAssistant's built-in Generic Camera integration expects RTSP for its "Stream source URL" field - it does not consume HLS as input. Use the MJPEG IP Camera integration or WebRTC card for ACProxyCam.
 
 ### LED Switch Configuration
 
-Add the LED control switch to your `configuration.yaml`:
+Add to `configuration.yaml`:
 
 ```yaml
 sensor:
   - platform: rest
     name: kobra_s1_camera_led_state
-    resource: http://192.168.178.12:8081/led
+    resource: http://<acproxycam-ip>:8080/led
     scan_interval: 5
     value_template: "{{ value_json.state }}"
     verify_ssl: false
 
 rest_command:
   kobra_s1_led_on:
-    url: http://192.168.178.12:8081/led/on
+    url: http://<acproxycam-ip>:8080/led/on
     method: POST
   kobra_s1_led_off:
-    url: http://192.168.178.12:8081/led/off
+    url: http://<acproxycam-ip>:8080/led/off
     method: POST
 
 switch:
@@ -349,74 +310,57 @@ switch:
           service: rest_command.kobra_s1_led_off
 ```
 
-Replace `192.168.178.12:8081` with your ACProxyCam server IP and port.
+## Multiple Printers
 
-> **Important:** The `verify_ssl: false` is required for the REST sensor to avoid SSL context issues with HTTP URLs.
+Each printer requires a unique HTTP port:
+- Printer 1: port 8080
+- Printer 2: port 8081
+- Printer 3: port 8082
 
-After adding the configuration:
-1. Go to **Developer Tools > YAML > Check Configuration**
-2. Click **Restart** to apply the changes
-3. Find `switch.kobra_s1_camera_led` in **Settings > Devices & Services > Entities**
+## Configuration
 
-### Dashboard Cards
-
-**LED Control Tile:**
-```yaml
-type: tile
-entity: switch.kobra_s1_camera_led
-show_entity_picture: false
-state_content: kobra_s1_camera_led_state
-vertical: false
-tap_action:
-  action: toggle
-icon_tap_action:
-  action: more-info
-features_position: inline
-```
-
-You can add these via **Edit Dashboard > Add Card > Manual** and paste the YAML.
+Configuration is stored at `/etc/acproxycam/config.json`. Sensitive fields are encrypted using AES-256-GCM with a key derived from `/etc/machine-id`.
 
 ## Systemd Service
 
-The service is managed by systemd:
-
 ```bash
-# Check status
-sudo systemctl status acproxycam
-
-# Start/stop/restart
-sudo systemctl start acproxycam
-sudo systemctl stop acproxycam
-sudo systemctl restart acproxycam
-
-# Enable/disable on boot
-sudo systemctl enable acproxycam
-sudo systemctl disable acproxycam
+sudo systemctl status acproxycam    # Check status
+sudo systemctl restart acproxycam   # Restart
+sudo systemctl stop acproxycam      # Stop
+journalctl -u acproxycam -f         # View logs
 ```
 
-## Logs
+Log file: `/var/log/acproxycam/acproxycam.log` (7 days rotation)
 
-- **Journal:** `journalctl -u acproxycam -f`
-- **File:** `/var/log/acproxycam/acproxycam.log`
+## Building from Source
 
-Log rotation is configured to keep 7 days of compressed logs.
+```bash
+git clone https://github.com/mann1x/acproxycam.git
+cd acproxycam
+
+# Build for Linux x64
+dotnet publish src/ACProxyCam/ACProxyCam.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true
+
+# Build for Linux arm64
+dotnet publish src/ACProxyCam/ACProxyCam.csproj -c Release -r linux-arm64 --self-contained true -p:PublishSingleFile=true
+```
 
 ## Troubleshooting
 
 ### Cannot connect to printer
-1. Verify the printer IP is correct and reachable: `ping <printer-ip>`
-2. Check SSH access: `ssh root@<printer-ip>` (default password: rockchip)
-3. Verify MQTT port is accessible: `nc -zv <printer-ip> 9883`
+1. Verify printer IP: `ping <printer-ip>`
+2. Check SSH: `ssh root@<printer-ip>` (password: rockchip)
+3. Check MQTT port: `nc -zv <printer-ip> 9883`
 
 ### Stream not working
-1. Check printer details in management UI (press Enter on printer)
-2. Verify all status indicators are green (SSH, MQTT, Stream)
-3. Check the FLV stream directly: `curl http://<printer-ip>:18088/flv`
+1. Check printer details (press Enter on printer)
+2. Verify status indicators are green
+3. Test FLV stream: `curl http://<printer-ip>:18088/flv`
 
 ### Service won't start
 1. Check logs: `journalctl -u acproxycam -e`
-2. Verify FFmpeg is installed: `ffmpeg -version`
-3. Check permissions on `/etc/acproxycam` and `/var/log/acproxycam`
+2. Verify FFmpeg: `ffmpeg -version`
+3. Check permissions on `/etc/acproxycam`
 
 ## Technical Details
 
@@ -429,13 +373,13 @@ Log rotation is configured to keep 7 days of compressed logs.
 - **Spectre.Console** for terminal UI
 
 ### Protocol Flow
-1. Connect to printer via SSH, retrieve MQTT credentials from `/userdata/app/gk/config/device_account.json`
-2. Connect to MQTT broker on printer (port 9883, TLS)
-3. Subscribe to all topics, auto-detect model code
-4. Send "startCapture" command to enable camera stream
+1. SSH to printer, retrieve MQTT credentials
+2. Connect to MQTT broker (port 9883, TLS)
+3. Subscribe to topics, auto-detect model code
+4. Send "startCapture" to enable camera
 5. Connect to FLV stream at `http://<printer>:18088/flv`
-6. Decode H.264 frames using FFmpeg, convert to JPEG using SkiaSharp
-7. Serve MJPEG stream on configured port
+6. Decode H.264, encode to JPEG/HLS/WebSocket
+7. Serve streams on configured port
 
 ## License
 
@@ -443,4 +387,4 @@ MIT License
 
 ## Acknowledgments
 
-Based on protocol analysis of Anycubic Slicer Next communication with Kobra S1 printers.
+Based on protocol analysis of Anycubic Slicer Next communication with Kobra S1 printer.
