@@ -379,45 +379,55 @@ git tag v1.4.0           # Creates normal release
 
 You can also manually trigger a pre-release from the Actions tab by checking the "Mark as pre-release" option.
 
-#### Step 3: GitHub Actions Builds Automatically
+#### Step 3: Wait for GitHub Actions to Complete
 
 The workflow will:
 1. Build for both `linux-x64` and `linux-arm64`
-2. Create zip files with the `acproxycam` binary
-3. Generate SHA256 checksums
-4. Create a **draft** GitHub release (or pre-release) with all artifacts attached
+2. Build and push Docker images (multi-arch: amd64, arm64)
+3. Create zip files with the `acproxycam` binary
+4. Generate SHA256 checksums
+5. Create a **draft** GitHub release with all artifacts attached
 
-#### Step 4: Update Release Notes and Publish
-
-**IMPORTANT**: The auto-generated release notes are not sufficient. You must:
-
-1. Go to GitHub → Releases → find the draft release
-2. Create proper "What's New" release notes by comparing against the **last stable release** (not pre-releases)
-   - Use `git log v{LAST_STABLE}..v{NEW_VERSION} --oneline` to see all changes
-   - Group changes by category (New Features, Improvements, Bug Fixes)
-   - Write user-friendly descriptions, not just commit messages
-3. Include the Installation section and checksums from the template below
-4. Click "Publish release"
-
-To find the last stable release (excluding pre-releases like -alpha, -beta, -rc):
+**Monitor the workflow:**
 ```bash
-git tag -l | grep -v -E '(-alpha|-beta|-rc|-dev|-preview)' | sort -V | tail -1
+# Check workflow status
+gh run list --limit 1
+
+# Wait for completion and view details
+gh run view <RUN_ID>
 ```
 
-**IMPORTANT**: Before finalizing release notes, review the "What's New" sections of all pre-releases between the last stable release and the new version to ensure no features are missed:
-```bash
-# List pre-releases between last stable and new version
-git tag -l | grep -E '^v1\.3\.[2-9]|^v1\.[4-9]\.' | sort -V
+#### Step 4: Create Release Notes and Publish
 
-# View each pre-release's notes
-gh release view v1.3.2 --json body -q .body
-```
+**When user asks to "create a release", Claude must:**
+
+1. **Wait for artifacts**: Monitor the GitHub Actions workflow until it completes successfully
+2. **Get all changes since last stable release**:
+   ```bash
+   # Find last stable release (excluding pre-releases)
+   git tag -l | grep -v -E '(-alpha|-beta|-rc|-dev|-preview)' | sort -V | tail -1
+
+   # Get all commits since last stable release
+   git log v{LAST_STABLE}..v{NEW_VERSION} --oneline
+   ```
+3. **Download checksums** from the draft release artifacts
+4. **Create proper release notes** with:
+   - `## What's New` section with user-friendly descriptions (not just commit messages)
+   - Group changes by category (Bug Fixes, Improvements, New Features)
+   - Include ALL changes from pre-releases between last stable and this version
+   - `## Installation` section with download/install commands
+   - `## Checksums (SHA256)` section with actual checksums
+5. **Publish the release** using:
+   ```bash
+   gh release edit v{VERSION} --title "v{VERSION} - Short Description" --notes "RELEASE_NOTES" --draft=false
+   ```
 
 **Artifacts created:**
 - `acproxycam-linux-x64-v{VERSION}.zip`
 - `acproxycam-linux-x64-v{VERSION}.zip.sha256`
 - `acproxycam-linux-arm64-v{VERSION}.zip`
 - `acproxycam-linux-arm64-v{VERSION}.zip.sha256`
+- Docker images: `ghcr.io/mann1x/acproxycam:{VERSION}` and `docker.io/mannixita/acproxycam:{VERSION}`
 
 ### Method 2: Manual Build (Alternative)
 
