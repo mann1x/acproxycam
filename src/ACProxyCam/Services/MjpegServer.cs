@@ -226,6 +226,17 @@ public class MjpegServer : IDisposable
     private int _h264ParseFailCount;
     private DateTime _lastH264DiagLog = DateTime.MinValue;
 
+    // Incoming H.264 FPS measurement (measured at packet level for accuracy)
+    private int _inputFpsFrameCount;
+    private DateTime _inputFpsWindowStart = DateTime.MinValue;
+    private int _measuredInputFps;
+    private const int InputFpsWindowMs = 1000; // Calculate FPS over 1 second window
+
+    /// <summary>
+    /// Measured incoming H.264 stream FPS (updated every second based on packet arrivals).
+    /// </summary>
+    public int MeasuredInputFps => _measuredInputFps;
+
     public void PushH264Packet(byte[] data, bool isKeyframe, long pts = 0)
     {
         // Always push to HLS so segments are ready when clients connect
@@ -245,6 +256,23 @@ public class MjpegServer : IDisposable
         _h264PacketCount++;
         if (isKeyframe) _h264KeyframeCount++;
         else _h264NonKeyframeCount++;
+
+        // Measure incoming H.264 FPS (always runs, regardless of clients)
+        var now = DateTime.UtcNow;
+        if (_inputFpsWindowStart == DateTime.MinValue)
+        {
+            _inputFpsWindowStart = now;
+            _inputFpsFrameCount = 0;
+        }
+        _inputFpsFrameCount++;
+
+        var windowElapsed = (now - _inputFpsWindowStart).TotalMilliseconds;
+        if (windowElapsed >= InputFpsWindowMs)
+        {
+            _measuredInputFps = (int)Math.Round(_inputFpsFrameCount * 1000.0 / windowElapsed);
+            _inputFpsWindowStart = now;
+            _inputFpsFrameCount = 0;
+        }
 
         if (nalUnits.Count == 0)
         {
@@ -1013,7 +1041,9 @@ public class MjpegServer : IDisposable
             maxFps = MaxFps,
             idleFps = IdleFps,
             jpegQuality = JpegQuality,
-            framesSkipped = _framesSkipped
+            framesSkipped = _framesSkipped,
+            measuredInputFps = _measuredInputFps,
+            h264PacketCount = _h264PacketCount
         };
 
         var json = System.Text.Json.JsonSerializer.Serialize(status);

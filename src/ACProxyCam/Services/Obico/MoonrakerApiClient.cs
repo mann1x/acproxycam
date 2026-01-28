@@ -420,7 +420,7 @@ public class MoonrakerApiClient : IDisposable
         catch (Exception ex)
         {
             // Log error but don't crash
-            System.Diagnostics.Debug.WriteLine($"Error processing WebSocket message: {ex.Message}");
+            Logger.Debug($"[Moonraker] Error processing WebSocket message: {ex.Message}");
         }
     }
 

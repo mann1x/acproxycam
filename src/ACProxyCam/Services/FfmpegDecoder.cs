@@ -397,7 +397,17 @@ public unsafe class FfmpegDecoder : IDisposable
 
     private bool OpenInput(string url)
     {
-        AVFormatContext* formatContext = null;
+        AVFormatContext* formatContext = ffmpeg.avformat_alloc_context();
+        if (formatContext == null)
+        {
+            StatusChanged?.Invoke(this, "Failed to allocate format context");
+            return false;
+        }
+
+        // Set probing options to detect stream format
+        // Note: AVFMT_FLAG_NOBUFFER causes FPS drops, so we don't use it
+        formatContext->probesize = 128 * 1024; // 128KB - enough to detect H.264 params
+        formatContext->max_analyze_duration = 500000; // 500ms
 
         int ret = ffmpeg.avformat_open_input(&formatContext, url, null, null);
         if (ret < 0)
@@ -407,11 +417,6 @@ public unsafe class FfmpegDecoder : IDisposable
         }
 
         _formatContext = formatContext;
-
-        // Set low-latency options
-        _formatContext->max_analyze_duration = 100000; // 100ms
-        _formatContext->probesize = 32768;             // 32KB
-        _formatContext->flags |= ffmpeg.AVFMT_FLAG_NOBUFFER;
 
         ret = ffmpeg.avformat_find_stream_info(_formatContext, null);
         if (ret < 0)

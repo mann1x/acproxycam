@@ -53,6 +53,12 @@ public class ObicoClient : IDisposable
     private DateTime? _printStartTime;
     private int? _estimatedTotalTime;  // Total estimated print time in seconds
 
+    // File metadata retry mechanism
+    private CancellationTokenSource? _metadataRetryCts;
+    private Task? _metadataRetryTask;
+    private volatile bool _hasAccurateMetadata;
+    private const int MetadataRetryIntervalMs = 5000;  // Retry every 5 seconds
+
     // Viewing state - when user is actively watching the stream
     private volatile bool _isUserViewing;
     private DateTime _lastViewingUpdate = DateTime.MinValue;
@@ -824,6 +830,7 @@ public class ObicoClient : IDisposable
                     _printStartTime = null;
                     _currentFilename = null;
                     _estimatedTotalTime = null;
+                    StopMetadataRetry();
                     ClearPrintState();  // Clear persisted state file
 
                     // Also clear job info and progress in status
@@ -1171,6 +1178,7 @@ public class ObicoClient : IDisposable
             _printStartTime = null;
             _currentFilename = null;
             _estimatedTotalTime = null;
+            StopMetadataRetry();
             ClearPrintState();  // Clear persisted state file
 
             // Update state flags immediately to ensure Obico UI shows correct state
@@ -2089,7 +2097,8 @@ public class ObicoClient : IDisposable
         var isCloud = _isCloud;
         var isPro = _obicoConfig.IsPro;
 
-        Log($"Snapshot upload loop started (isCloud={isCloud}, isPro={isPro}, viewing={_isUserViewing})");
+        if (_verbose)
+            Log($"Snapshot upload loop started (isCloud={isCloud}, isPro={isPro}, viewing={_isUserViewing})");
 
         while (!ct.IsCancellationRequested)
         {
@@ -2415,6 +2424,7 @@ public class ObicoClient : IDisposable
     /// Fetch file metadata (object_height) for maxZ display.
     /// Falls back to virtual_sdcard.model_size_z for Anycubic printers where
     /// files are sent directly to the printer and not through Moonraker's file system.
+    /// If metadata is not immediately available, starts a retry loop to fetch it later.
     /// </summary>
     private async Task FetchFileMetadataAsync()
     {
@@ -2424,24 +2434,14 @@ public class ObicoClient : IDisposable
             return;
         }
 
-        // First try Moonraker's file metadata
-        try
+        _hasAccurateMetadata = false;
+        StopMetadataRetry();
+
+        // First try Moonraker's file metadata (most accurate source)
+        if (await TryFetchMoonrakerMetadataAsync())
         {
-            var metadata = await _moonraker.GetAsync<JsonNode>($"/server/files/metadata?filename={Uri.EscapeDataString(_currentFilename)}");
-            var objectHeight = metadata?["object_height"]?.GetValue<double>();
-            if (objectHeight.HasValue && objectHeight.Value > 0)
-            {
-                lock (_statusLock)
-                {
-                    SetMaxZ(objectHeight.Value);
-                }
-                Log($"File metadata: maxZ={objectHeight.Value:F2}mm");
-                return;
-            }
-        }
-        catch (Exception ex)
-        {
-            Log($"Moonraker file metadata not available: {ex.Message}");
+            _hasAccurateMetadata = true;
+            return;
         }
 
         // Fallback: Try virtual_sdcard.model_size_z (Anycubic printers populate this)
@@ -2455,8 +2455,7 @@ public class ObicoClient : IDisposable
                 {
                     SetMaxZ(modelSizeZ.Value);
                 }
-                Log($"File metadata from virtual_sdcard: maxZ={modelSizeZ.Value:F2}mm");
-                return;
+                Log($"File metadata from virtual_sdcard (fallback): maxZ={modelSizeZ.Value:F2}mm - will retry for accurate metadata");
             }
         }
         catch (Exception ex)
@@ -2464,7 +2463,87 @@ public class ObicoClient : IDisposable
             Log($"Failed to fetch model_size_z from virtual_sdcard: {ex.Message}");
         }
 
-        Log("FetchFileMetadata: maxZ not available from any source");
+        // Start retry loop to fetch accurate metadata from Moonraker
+        StartMetadataRetry();
+    }
+
+    /// <summary>
+    /// Try to fetch file metadata from Moonraker's file metadata API.
+    /// </summary>
+    private async Task<bool> TryFetchMoonrakerMetadataAsync()
+    {
+        if (string.IsNullOrEmpty(_currentFilename))
+            return false;
+
+        try
+        {
+            var metadata = await _moonraker.GetAsync<JsonNode>($"/server/files/metadata?filename={Uri.EscapeDataString(_currentFilename)}");
+            var objectHeight = metadata?["object_height"]?.GetValue<double>();
+            if (objectHeight.HasValue && objectHeight.Value > 0)
+            {
+                lock (_statusLock)
+                {
+                    SetMaxZ(objectHeight.Value);
+                }
+                Log($"File metadata from Moonraker: maxZ={objectHeight.Value:F2}mm");
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            if (_verbose)
+                Log($"Moonraker file metadata not available yet: {ex.Message}");
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Start background retry loop for fetching accurate file metadata.
+    /// Stops when: metadata is fetched or print ends.
+    /// </summary>
+    private void StartMetadataRetry()
+    {
+        if (_hasAccurateMetadata)
+            return;
+
+        _metadataRetryCts = new CancellationTokenSource();
+        var ct = _metadataRetryCts.Token;
+
+        _metadataRetryTask = Task.Run(async () =>
+        {
+            while (!ct.IsCancellationRequested && !_hasAccurateMetadata && !string.IsNullOrEmpty(_currentFilename))
+            {
+                try
+                {
+                    await Task.Delay(MetadataRetryIntervalMs, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
+                if (ct.IsCancellationRequested || string.IsNullOrEmpty(_currentFilename))
+                    break;
+
+                if (await TryFetchMoonrakerMetadataAsync())
+                {
+                    _hasAccurateMetadata = true;
+                    Log("Successfully fetched accurate file metadata from Moonraker");
+                    break;
+                }
+            }
+        }, ct);
+    }
+
+    /// <summary>
+    /// Stop the metadata retry loop.
+    /// </summary>
+    private void StopMetadataRetry()
+    {
+        _metadataRetryCts?.Cancel();
+        _metadataRetryCts?.Dispose();
+        _metadataRetryCts = null;
+        _metadataRetryTask = null;
     }
 
     #endregion
@@ -2477,6 +2556,7 @@ public class ObicoClient : IDisposable
         _isDisposed = true;
         _cts?.Cancel();
         _cts?.Dispose();
+        StopMetadataRetry();
         _h264Streamer?.Dispose();
         _janusStreamer?.Dispose();
         _janusClient?.Dispose();

@@ -211,7 +211,8 @@ public class PrinterThread : IDisposable
                 HlsReady = _mjpegServer?.HlsReady ?? false,
                 IsPaused = _isPaused,
                 CpuAffinity = _cpuAffinity,
-                IncomingH264Fps = _decoder?.MeasuredFps ?? 0,
+                IncomingH264Fps = _decoder?.MeasuredFps ?? _mjpegServer?.MeasuredInputFps ?? 0,
+                DeclaredH264Fps = 0,  // Original decoder doesn't have DeclaredFps
                 JpegQuality = Config.JpegQuality,
                 H264StreamerEnabled = Config.H264StreamerEnabled,
                 HlsEnabled = Config.HlsEnabled,

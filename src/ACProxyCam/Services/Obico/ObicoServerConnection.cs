@@ -332,7 +332,7 @@ public class ObicoServerConnection : IDisposable
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"Error processing Obico message: {ex.Message}");
+            Logger.Debug($"[Obico WS] Error processing message: {ex.Message}");
         }
     }
 

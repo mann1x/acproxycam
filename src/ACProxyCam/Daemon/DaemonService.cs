@@ -17,6 +17,11 @@ public class DaemonService
     private BedMeshManager? _bedMeshManager;
     private AppConfig? _config;
 
+    // Signal handlers - must be stored to prevent GC
+    private PosixSignalRegistration? _sigtermHandler;
+    private PosixSignalRegistration? _sigintHandler;
+    private PosixSignalRegistration? _sighupHandler;
+
     public TimeSpan Uptime => DateTime.UtcNow - _startTime;
 
     public async Task RunAsync()
@@ -125,22 +130,24 @@ public class DaemonService
 
     private void SetupSignalHandlers()
     {
-        // Handle SIGTERM (systemd stop)
-        PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
+        // Handle SIGTERM (systemd stop) - store to prevent GC
+        _sigtermHandler = PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
         {
             Logger.Log("Received SIGTERM");
+            context.Cancel = true;  // Prevent default termination, let us shutdown gracefully
             _cts.Cancel();
         });
 
-        // Handle SIGINT (Ctrl+C)
-        PosixSignalRegistration.Create(PosixSignal.SIGINT, context =>
+        // Handle SIGINT (Ctrl+C) - store to prevent GC
+        _sigintHandler = PosixSignalRegistration.Create(PosixSignal.SIGINT, context =>
         {
             Logger.Log("Received SIGINT");
+            context.Cancel = true;  // Prevent default termination, let us shutdown gracefully
             _cts.Cancel();
         });
 
-        // Handle SIGHUP (reload config)
-        PosixSignalRegistration.Create(PosixSignal.SIGHUP, context =>
+        // Handle SIGHUP (reload config) - store to prevent GC
+        _sighupHandler = PosixSignalRegistration.Create(PosixSignal.SIGHUP, context =>
         {
             Logger.Log("Received SIGHUP - reloading config");
             _ = ReloadConfigAsync();

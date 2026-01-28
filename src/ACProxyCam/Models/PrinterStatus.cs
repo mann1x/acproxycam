@@ -20,7 +20,8 @@ public class PrinterStatus
 
     // Performance settings
     public int CpuAffinity { get; set; } = -1;
-    public int IncomingH264Fps { get; set; }  // Detected incoming H.264 stream FPS
+    public int IncomingH264Fps { get; set; }  // Measured incoming H.264 stream FPS
+    public int DeclaredH264Fps { get; set; }  // Declared FPS from stream metadata (may differ from actual)
     public int JpegQuality { get; set; }      // MJPEG encoding quality (from config)
 
     // Streamer enable flags (from config)
