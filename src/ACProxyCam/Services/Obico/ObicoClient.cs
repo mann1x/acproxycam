@@ -158,6 +158,11 @@ public class ObicoClient : IDisposable
                     _currentStatus.Status.State.Text = "Operational";
                     _currentStatus.Status.State.Flags.Operational = true;
                     _currentStatus.Status.State.Flags.ClosedOrError = false;
+                    // CRITICAL: Set Ready=true when coming back online
+                    // Obico UI shows "Currently Printing" when: operational && !ready
+                    // So we must set ready=true for idle state
+                    _currentStatus.Status.State.Flags.Ready = true;
+                    _currentStatus.Status.State.Flags.Printing = false;
                 }
             }
 
@@ -165,7 +170,9 @@ public class ObicoClient : IDisposable
             SendStatusUpdate(force: true);
 
             // Restart Janus streaming when printer comes back online
-            if (_printerConfig.CameraEnabled && _obicoConfig.Enabled && _janusEnabled)
+            // Note: Don't check _janusEnabled here - it was set to false by StopJanusAsync()
+            // StartJanusAsync() will handle the disabled case based on config
+            if (_printerConfig.CameraEnabled && _obicoConfig.Enabled)
             {
                 _ = Task.Run(async () =>
                 {
@@ -175,6 +182,7 @@ public class ObicoClient : IDisposable
                         await Task.Delay(2000);
                         if (!_printerOffline && _isRunning)
                         {
+                            Log("Attempting to restart Janus after printer came back online...");
                             await StartJanusAsync();
                         }
                     }
@@ -410,6 +418,29 @@ public class ObicoClient : IDisposable
                 return;
             }
 
+            // Cleanup any existing Janus components before creating new ones
+            // This ensures proper recovery after offline/online transitions
+            if (_h264Streamer != null)
+            {
+                Log("[Janus] Cleaning up existing H.264 streamer before restart...");
+                try { await _h264Streamer.StopAsync(); } catch { }
+                try { _h264Streamer.Dispose(); } catch { }
+                _h264Streamer = null;
+            }
+            if (_janusStreamer != null)
+            {
+                Log("[Janus] Cleaning up existing MJPEG streamer before restart...");
+                try { await _janusStreamer.StopAsync(); } catch { }
+                try { _janusStreamer.Dispose(); } catch { }
+                _janusStreamer = null;
+            }
+            if (_janusClient != null)
+            {
+                Log("[Janus] Cleaning up existing Janus client before restart...");
+                try { _janusClient.Dispose(); } catch { }
+                _janusClient = null;
+            }
+
             var streamMode = _obicoConfig.StreamMode;
             Log($"Starting Janus {streamMode} streaming to {janusServer}...");
 
@@ -556,9 +587,19 @@ public class ObicoClient : IDisposable
 
         if (_janusClient != null)
         {
-            await _janusClient.StopAsync();
-            _janusClient.Dispose();
-            _janusClient = null;
+            try
+            {
+                await _janusClient.StopAsync();
+            }
+            catch (Exception ex)
+            {
+                Log($"[Janus] Error stopping Janus client: {ex.Message}");
+            }
+            finally
+            {
+                try { _janusClient.Dispose(); } catch { }
+                _janusClient = null;
+            }
         }
 
         if (wasEnabled)
@@ -820,11 +861,18 @@ public class ObicoClient : IDisposable
                 }
                 else
                 {
+                    // Check if there was a previous print that needs to be closed on Obico
+                    // This handles the case where:
+                    // 1. Print was in progress, service restarted, print completed while service was down
+                    // 2. Print was in progress, printer rebooted
+                    // 3. Obico has stale print state that needs to be cleared
+                    var (savedFilename, savedTimestamp) = await LoadPrintStateAsync();
+                    var hadPreviousPrint = savedTimestamp.HasValue;
+
                     // Clear any stale print state from previous session
-                    // This handles the case where printer was rebooted during a print
-                    if (_currentPrintTs.HasValue)
+                    if (_currentPrintTs.HasValue || hadPreviousPrint)
                     {
-                        Log($"Clearing stale print state (current state: {state})");
+                        Log($"Clearing stale print state (current state: {state}, had saved print: {hadPreviousPrint})");
                     }
                     _currentPrintTs = null;
                     _printStartTime = null;
@@ -841,6 +889,18 @@ public class ObicoClient : IDisposable
                         _currentStatus.Status.CurrentLayer = null;
                         _currentStatus.Status.CurrentZ = null;
                         _currentStatus.Status.Progress = new ObicoProgress();
+                    }
+
+                    // If we had a saved print but printer is no longer printing,
+                    // send PrintDone event to properly close the print on Obico's side
+                    // This ensures Obico doesn't show stale "Printing" status
+                    if (hadPreviousPrint)
+                    {
+                        Log($"Sending PrintDone to close stale print job on Obico (saved: {savedFilename})");
+                        // Temporarily set the timestamp so the event is sent with correct ext_id
+                        _currentPrintTs = savedTimestamp;
+                        SendPrintEvent("PrintDone");
+                        _currentPrintTs = null;
                     }
                 }
             }
@@ -1073,14 +1133,9 @@ public class ObicoClient : IDisposable
         // Update timestamp
         _currentStatus.Status.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-        // Only sync _currentStatus.CurrentPrintTs when _currentPrintTs has a valid value
-        // This prevents race conditions where _currentPrintTs visibility is not guaranteed
-        // (e.g., set by InitializeStatusAsync outside the lock but not yet visible to this thread)
-        // The authoritative set happens in InitializeStatusAsync and HandlePrintStateChangeAsync
-        if (_currentPrintTs.HasValue)
-        {
-            _currentStatus.CurrentPrintTs = _currentPrintTs;
-        }
+        // Always sync _currentStatus.CurrentPrintTs with _currentPrintTs
+        // Use -1 when not printing (Obico server expects -1 to clear print state, null means "unknown/keep existing")
+        _currentStatus.CurrentPrintTs = _currentPrintTs ?? -1;
     }
 
     private string MapPrintState(string moonrakerState)
@@ -2264,9 +2319,9 @@ public class ObicoClient : IDisposable
 
             update = new ObicoStatusUpdate
             {
-                // current_print_ts should only be set when actively printing
-                // When null, ObicoServerConnection will omit it from the message
-                CurrentPrintTs = _currentPrintTs,
+                // current_print_ts: use -1 when not printing (Obico expects -1 to clear print state)
+                // null/missing means "unknown, keep existing state" which causes stale print state
+                CurrentPrintTs = _currentPrintTs ?? -1,
                 Status = _currentStatus.Status
             };
         }
@@ -2295,9 +2350,9 @@ public class ObicoClient : IDisposable
         {
             update = new ObicoStatusUpdate
             {
-                // current_print_ts is the timestamp when print started
-                // When null (not printing), it will be omitted from the message
-                CurrentPrintTs = _currentPrintTs,
+                // current_print_ts: use -1 when not printing (Obico expects -1 to clear print state)
+                // For print events, _currentPrintTs should always have a valid value
+                CurrentPrintTs = _currentPrintTs ?? -1,
                 Status = _currentStatus.Status,
                 Event = new ObicoEvent { EventType = eventType }
             };

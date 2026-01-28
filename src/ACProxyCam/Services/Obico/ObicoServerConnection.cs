@@ -405,16 +405,18 @@ public class ObicoServerConnection : IDisposable
         }
         _lastStatusUpdate = now;
 
-        // Build message - only include current_print_ts when actively printing
-        // Obico server uses "if not msg.get('current_print_ts')" which treats 0 and null as falsy
-        // moonraker-obico omits the field entirely when not printing
+        // Build message - always include current_print_ts
+        // Obico server uses current_print_ts to determine print state:
+        //   -1 = not printing (clears current print)
+        //   >0 = timestamp when print started (active print)
+        //   missing/null = unknown, keep existing state (causes stale "Printing" status)
         var message = new Dictionary<string, object?>
         {
             ["status"] = status.Status
         };
 
-        // Only include current_print_ts when there's an active print (non-null, non-zero value)
-        if (status.CurrentPrintTs.HasValue && status.CurrentPrintTs.Value > 0)
+        // Always include current_print_ts when it has a value (including -1 for "not printing")
+        if (status.CurrentPrintTs.HasValue)
         {
             message["current_print_ts"] = status.CurrentPrintTs.Value;
         }
