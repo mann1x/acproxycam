@@ -26,6 +26,11 @@ public unsafe class FfmpegDecoder : IDisposable
     private bool _isRunning;
     private bool _disposed;
 
+    // Generation counter to prevent race conditions when Stop/Start is called quickly
+    // Only the current generation's events should be processed
+    private int _decoderGeneration;
+    private int _currentGeneration;
+
     // Stream health monitoring
     private long _lastPts = long.MinValue;
     private DateTime _lastFrameTime = DateTime.MinValue;
@@ -218,8 +223,12 @@ public unsafe class FfmpegDecoder : IDisposable
         // Reset log throttling for fresh start
         ResetLogThrottling();
 
+        // Increment generation to invalidate any stale decoder threads
+        _currentGeneration = Interlocked.Increment(ref _decoderGeneration);
+        var generation = _currentGeneration;
+
         _cts = new CancellationTokenSource();
-        _decodingThread = new Thread(() => DecodingLoop(url, _cts.Token))
+        _decodingThread = new Thread(() => DecodingLoop(url, _cts.Token, generation))
         {
             IsBackground = true,
             Name = "FfmpegDecodingThread"
@@ -241,7 +250,7 @@ public unsafe class FfmpegDecoder : IDisposable
         // Note: _isRunning is set to false and DecodingStopped is invoked in DecodingLoop's finally block
     }
 
-    private void DecodingLoop(string url, CancellationToken ct)
+    private void DecodingLoop(string url, CancellationToken ct, int generation)
     {
         try
         {
@@ -274,7 +283,11 @@ public unsafe class FfmpegDecoder : IDisposable
 
             var stream = _formatContext->streams[_videoStreamIndex];
             StatusChanged?.Invoke(this, $"Decoding {Width}x{Height}, time_base={stream->time_base.num}/{stream->time_base.den}");
-            DecodingStarted?.Invoke(this, EventArgs.Empty);
+            // Only invoke DecodingStarted if this is still the current generation
+            if (generation == _currentGeneration)
+            {
+                DecodingStarted?.Invoke(this, EventArgs.Empty);
+            }
 
             // Allocate frames
             _frame = ffmpeg.av_frame_alloc();
@@ -391,7 +404,13 @@ public unsafe class FfmpegDecoder : IDisposable
         {
             Cleanup();
             _isRunning = false;
-            DecodingStopped?.Invoke(this, EventArgs.Empty);
+            // Only invoke DecodingStopped if this is still the current generation
+            // This prevents race conditions when Stop/Start is called quickly and
+            // an old orphaned thread finishes after a new one has started
+            if (generation == _currentGeneration)
+            {
+                DecodingStopped?.Invoke(this, EventArgs.Empty);
+            }
         }
     }
 
