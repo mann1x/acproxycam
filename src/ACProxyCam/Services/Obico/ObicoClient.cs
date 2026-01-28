@@ -67,6 +67,9 @@ public class ObicoClient : IDisposable
     private volatile bool _printerOffline;
     private DateTime _lastOfflineLogTime = DateTime.MinValue;
 
+    // Camera availability tracking - when camera stream is down but printer is still reachable
+    private volatile bool _cameraAvailable = true;
+
     // Verbose logging (set via ACPROXYCAM_VERBOSE=1 environment variable)
     private readonly bool _verbose;
 
@@ -183,6 +186,62 @@ public class ObicoClient : IDisposable
                         if (!_printerOffline && _isRunning)
                         {
                             Log("Attempting to restart Janus after printer came back online...");
+                            await StartJanusAsync();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"Error restarting Janus: {ex.Message}");
+                    }
+                });
+            }
+        }
+    }
+
+    /// <summary>
+    /// Sets the camera availability state. Called by PrinterThread when camera stream goes up/down.
+    /// This only affects Janus streaming - Obico connection and status updates continue normally.
+    /// Use this instead of SetPrinterOffline when only the camera is unavailable but the printer is still reachable.
+    /// </summary>
+    public void SetCameraAvailable(bool available)
+    {
+        if (_cameraAvailable == available)
+            return;
+
+        _cameraAvailable = available;
+
+        if (!available)
+        {
+            Log("Camera marked unavailable - stopping Janus streaming (Obico connection continues)");
+
+            // Stop Janus streaming when camera goes down
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await StopJanusAsync();
+                }
+                catch (Exception ex)
+                {
+                    Log($"Error stopping Janus: {ex.Message}");
+                }
+            });
+        }
+        else
+        {
+            Log("Camera marked available - restarting Janus streaming");
+
+            // Restart Janus streaming when camera comes back
+            if (_printerConfig.CameraEnabled && _obicoConfig.Enabled && !_printerOffline)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        // Small delay to let stream stabilize
+                        await Task.Delay(2000);
+                        if (_cameraAvailable && !_printerOffline && _isRunning)
+                        {
                             await StartJanusAsync();
                         }
                     }
@@ -615,8 +674,8 @@ public class ObicoClient : IDisposable
     /// </summary>
     private async void OnJanusMessageFromServer(object? sender, string janusJson)
     {
-        // Skip Janus relay when printer is offline - no point relaying if stream is down
-        if (_printerOffline)
+        // Skip Janus relay when printer is offline or camera is unavailable
+        if (_printerOffline || !_cameraAvailable)
             return;
 
         if (_janusClient == null)
@@ -671,8 +730,8 @@ public class ObicoClient : IDisposable
     /// </summary>
     private void OnJanusMessageFromJanus(object? sender, System.Text.Json.Nodes.JsonNode janusMsg)
     {
-        // Skip relay when printer is offline
-        if (_printerOffline)
+        // Skip relay when printer is offline or camera is unavailable
+        if (_printerOffline || !_cameraAvailable)
             return;
 
         if (_obicoServer?.IsConnected == true)

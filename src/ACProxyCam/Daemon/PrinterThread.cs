@@ -1448,8 +1448,9 @@ public class PrinterThread : IDisposable
                         _streamFailedAt = DateTime.MinValue;
                         _lastLanModeAttempt = DateTime.MinValue; // Reset LAN mode tracking
                         _state = PrinterState.Running; // Ensure state is Running after recovery
-                        _obicoClient?.SetPrinterOffline(false); // Printer is back online
-                        _obicoCloudClient?.SetPrinterOffline(false);
+                        // Camera is back - resume Janus streaming (Obico connection was never dropped)
+                        _obicoClient?.SetCameraAvailable(true);
+                        _obicoCloudClient?.SetCameraAvailable(true);
                     }
                     _lastSeenOnline = DateTime.UtcNow;
                     _streamFailedAt = DateTime.MinValue; // Reset failure tracking
@@ -1517,9 +1518,9 @@ public class PrinterThread : IDisposable
                         _streamFailedAt = DateTime.UtcNow;
                         _state = PrinterState.Retrying; // Update state so UI reflects recovery mode
 
-                        // Mark printer offline to suppress Obico/Janus logging during recovery
-                        _obicoClient?.SetPrinterOffline(true);
-                        _obicoCloudClient?.SetPrinterOffline(true);
+                        // Camera unavailable - stop Janus but keep Obico connection for status updates
+                        _obicoClient?.SetCameraAvailable(false);
+                        _obicoCloudClient?.SetCameraAvailable(false);
                     }
 
                     var failureDuration = DateTime.UtcNow - _streamFailedAt;
