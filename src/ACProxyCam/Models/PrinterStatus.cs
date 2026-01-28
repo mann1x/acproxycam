@@ -181,6 +181,12 @@ public class ObicoStatus
     public string? LastError { get; set; }
 
     /// <summary>
+    /// Whether the last error was an HTTP error (403, 404, 500, etc.)
+    /// HTTP errors indicate real problems vs transient network issues.
+    /// </summary>
+    public bool IsHttpError { get; set; }
+
+    /// <summary>
     /// Whether connected to Janus WebRTC server.
     /// </summary>
     public bool JanusConnected { get; set; }

@@ -35,7 +35,8 @@ public class ObicoClient : IDisposable
     private StreamingConfig? _serverStreamingConfig;
 
     // Reconnection settings
-    private const int ReconnectDelaySeconds = 5;
+    private const int ReconnectDelaySeconds = 5;           // Transient errors (timeout, network)
+    private const int HttpErrorRetryDelaySeconds = 60;     // HTTP errors (403, 404, 500) - longer delay
     private const int MaxReconnectAttempts = 10;
 
     // Snapshot upload intervals (in seconds)
@@ -66,6 +67,13 @@ public class ObicoClient : IDisposable
     // Printer offline tracking - when Moonraker is disconnected
     private volatile bool _printerOffline;
     private DateTime _lastOfflineLogTime = DateTime.MinValue;
+
+    // Reconnection log throttling - prevent log spam during reconnection cycles
+    private volatile bool _reconnectionLoggedThisCycle;
+
+    // Track last error type - HTTP errors (403, 404, etc.) vs transient (timeout, network)
+    private volatile bool _lastErrorIsHttpError;
+    private volatile string? _lastErrorMessage;
 
     // Camera availability tracking - when camera stream is down but printer is still reachable
     private volatile bool _cameraAvailable = true;
@@ -104,6 +112,10 @@ public class ObicoClient : IDisposable
     public bool JanusConnected => _janusClient?.IsConnected ?? false;
     public string? JanusServer => _janusEnabled ? GetJanusServerAddress() : null;
     public bool JanusStreaming { get; private set; }
+
+    // Error tracking for UI display
+    public bool LastErrorIsHttpError => _lastErrorIsHttpError;
+    public string? LastErrorMessage => _lastErrorMessage;
 
     /// <summary>
     /// Sets the printer offline state. Called by PrinterThread when printer becomes unavailable.
@@ -1620,7 +1632,12 @@ public class ObicoClient : IDisposable
     {
         if (!connected && _isRunning)
         {
-            Log("Obico server disconnected - will attempt reconnection");
+            // Only log once per reconnection cycle to avoid spam
+            if (!_reconnectionLoggedThisCycle)
+            {
+                Log("Obico server disconnected - will attempt reconnection");
+                _reconnectionLoggedThisCycle = true;
+            }
             SetState(ObicoClientState.Reconnecting);
             TriggerReconnection();
         }
@@ -1723,16 +1740,23 @@ public class ObicoClient : IDisposable
     private async Task ReconnectionLoopAsync(CancellationToken ct)
     {
         var attempts = 0;
+        string? lastError = null;
+        var useHttpErrorDelay = false;
 
         while (!ct.IsCancellationRequested && _isRunning && attempts < MaxReconnectAttempts)
         {
             attempts++;
-            Log($"Reconnection attempt {attempts}/{MaxReconnectAttempts}...");
+
+            // Wait before reconnecting (use longer delay for HTTP errors)
+            var delay = useHttpErrorDelay ? HttpErrorRetryDelaySeconds : ReconnectDelaySeconds;
+            if (attempts == 1)
+            {
+                Log($"Starting reconnection (max {MaxReconnectAttempts} attempts)...");
+            }
+            await Task.Delay(TimeSpan.FromSeconds(delay), ct);
 
             try
             {
-                // Wait before reconnecting
-                await Task.Delay(TimeSpan.FromSeconds(ReconnectDelaySeconds), ct);
 
                 // Check if Moonraker connection needs reconnecting
                 // Only reconnect if we own the Moonraker connection (not shared)
@@ -1802,7 +1826,6 @@ public class ObicoClient : IDisposable
                 // Check if Obico connection needs reconnecting
                 if (_obicoServer != null && !_obicoServer.IsConnected)
                 {
-                    Log("Reconnecting to Obico server...");
                     await _obicoServer.ConnectAsync(ct);
 
                     // Verify tier status on reconnection
@@ -1816,9 +1839,12 @@ public class ObicoClient : IDisposable
                 // Check if both are connected
                 if (_moonraker.IsConnected && (_obicoServer?.IsConnected ?? false))
                 {
-                    Log("Reconnection successful");
+                    Log($"Reconnection successful after {attempts} attempt(s)");
                     SetState(ObicoClientState.Running);
                     _reconnecting = false;
+                    _reconnectionLoggedThisCycle = false;
+                    _lastErrorIsHttpError = false;
+                    _lastErrorMessage = null;
                     return;
                 }
             }
@@ -1828,17 +1854,45 @@ public class ObicoClient : IDisposable
             }
             catch (Exception ex)
             {
-                Log($"Reconnection attempt {attempts} failed: {ex.Message}");
+                // Store last error for final failure message
+                lastError = ex.Message;
+                _lastErrorMessage = ex.Message;
+
+                // Check if this is an HTTP error (403, 404, 500, etc.) vs transient
+                _lastErrorIsHttpError = IsHttpError(ex.Message);
+
+                if (_lastErrorIsHttpError && !useHttpErrorDelay)
+                {
+                    // HTTP errors indicate a real problem (auth expired, server error)
+                    // Use longer delay for subsequent attempts
+                    Log($"HTTP error detected: {ex.Message} - switching to {HttpErrorRetryDelaySeconds}s retry interval");
+                    useHttpErrorDelay = true;
+                }
             }
         }
 
         if (attempts >= MaxReconnectAttempts)
         {
-            Log($"Reconnection failed after {MaxReconnectAttempts} attempts");
+            Log($"Reconnection failed after {MaxReconnectAttempts} attempts: {lastError}");
             SetState(ObicoClientState.Failed);
         }
 
         _reconnecting = false;
+        _reconnectionLoggedThisCycle = false;
+    }
+
+    /// <summary>
+    /// Check if an error message indicates an HTTP error (vs transient network error).
+    /// HTTP errors like 403, 404, 500 indicate real problems that won't resolve quickly.
+    /// </summary>
+    private static bool IsHttpError(string errorMessage)
+    {
+        // WebSocket errors contain "status code 'NNN'" pattern
+        // HTTP errors are 4xx (client errors) and 5xx (server errors)
+        return System.Text.RegularExpressions.Regex.IsMatch(
+            errorMessage,
+            @"status code '([45]\d{2})'",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
     }
 
     #endregion

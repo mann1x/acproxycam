@@ -2329,15 +2329,19 @@ WantedBy=multi-user.target
         // Determine status indicator based on runtime state
         var (statusColor, statusIcon) = GetObicoStatusIndicator(status);
 
+        // Determine status text - show "Error" for HTTP errors (auth expired, etc.)
+        var isHttpError = status?.IsHttpError ?? false;
+        var statusText = isHttpError ? "Error" : "Linked";
+
         // Only show tier (Pro/Free) for Cloud - it's not relevant for local Obico
         if (isCloud)
         {
             var tier = obicoConfig.IsPro ? "Pro" : "Free";
-            lines.Add($"[{statusColor}]{statusIcon}[/] Linked ({tier})");
+            lines.Add($"[{statusColor}]{statusIcon}[/] {statusText} ({tier})");
         }
         else
         {
-            lines.Add($"[{statusColor}]{statusIcon}[/] Linked");
+            lines.Add($"[{statusColor}]{statusIcon}[/] {statusText}");
         }
 
         // Line 2: Obico device name
@@ -2377,10 +2381,15 @@ WantedBy=multi-user.target
         if (status == null)
             return ("grey", "○");
 
+        // If reconnecting with HTTP error (403, 404, 500), show red to indicate real problem
+        if (status.State == "Reconnecting" && status.IsHttpError)
+            return ("red", "✗");
+
         return status.State switch
         {
             "Running" => ("green", "●"),
             "Connecting" => ("blue", "◌"),
+            "Reconnecting" => ("yellow", "◌"),
             "Failed" => ("red", "✗"),
             "Stopped" => ("grey", "○"),
             "No Moonraker" => ("orange3", "⚠"),
@@ -3064,6 +3073,9 @@ WantedBy=multi-user.target
 
             await ConfigManager.SaveAsync(config);
         }
+
+        // Notify daemon of config changes so Obico clients can start/stop as needed
+        await ReloadDaemonConfigAsync();
     }
 
     private async Task DetectFirmwareAsync(AppConfig config, List<PrinterStatus> printers)

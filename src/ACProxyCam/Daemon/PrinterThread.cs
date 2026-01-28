@@ -1071,13 +1071,15 @@ public class PrinterThread : IDisposable
         _obicoStatus.State = state.ToString();
         _obicoStatus.ServerConnected = state == ObicoClientState.Running;
 
-        // Update Janus status from ObicoClient
+        // Update Janus status and error tracking from ObicoClient
         if (_obicoClient != null)
         {
             _obicoStatus.JanusEnabled = _obicoClient.JanusEnabled;
             _obicoStatus.JanusConnected = _obicoClient.JanusConnected;
             _obicoStatus.JanusServer = _obicoClient.JanusServer;
             _obicoStatus.JanusStreaming = _obicoClient.JanusStreaming;
+            _obicoStatus.LastError = _obicoClient.LastErrorMessage;
+            _obicoStatus.IsHttpError = _obicoClient.LastErrorIsHttpError;
         }
 
         // When ObicoClient fails (Moonraker not available), try to enable LAN mode
@@ -1142,13 +1144,15 @@ public class PrinterThread : IDisposable
         _obicoCloudStatus.State = state.ToString();
         _obicoCloudStatus.ServerConnected = state == ObicoClientState.Running;
 
-        // Update Janus status from ObicoCloudClient
+        // Update Janus status and error tracking from ObicoCloudClient
         if (_obicoCloudClient != null)
         {
             _obicoCloudStatus.JanusEnabled = _obicoCloudClient.JanusEnabled;
             _obicoCloudStatus.JanusConnected = _obicoCloudClient.JanusConnected;
             _obicoCloudStatus.JanusServer = _obicoCloudClient.JanusServer;
             _obicoCloudStatus.JanusStreaming = _obicoCloudClient.JanusStreaming;
+            _obicoCloudStatus.LastError = _obicoCloudClient.LastErrorMessage;
+            _obicoCloudStatus.IsHttpError = _obicoCloudClient.LastErrorIsHttpError;
         }
 
         // When ObicoClient fails (Moonraker not available), try to enable LAN mode
