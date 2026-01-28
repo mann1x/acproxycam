@@ -16,7 +16,7 @@ env:
   REGISTRY_GHCR: ghcr.io
   REGISTRY_DOCKER: docker.io
   IMAGE_NAME: ${{ github.repository }}
-  DOCKERHUB_IMAGE: mann1x/acproxycam
+  DOCKERHUB_IMAGE: mannixita/acproxycam
 
 jobs:
   build-and-push:
