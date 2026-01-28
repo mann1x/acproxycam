@@ -387,11 +387,31 @@ The workflow will:
 3. Generate SHA256 checksums
 4. Create a **draft** GitHub release (or pre-release) with all artifacts attached
 
-#### Step 4: Publish the Release
+#### Step 4: Update Release Notes and Publish
+
+**IMPORTANT**: The auto-generated release notes are not sufficient. You must:
 
 1. Go to GitHub → Releases → find the draft release
-2. Edit the release notes (auto-generated from commits)
-3. Click "Publish release"
+2. Create proper "What's New" release notes by comparing against the **last stable release** (not pre-releases)
+   - Use `git log v{LAST_STABLE}..v{NEW_VERSION} --oneline` to see all changes
+   - Group changes by category (New Features, Improvements, Bug Fixes)
+   - Write user-friendly descriptions, not just commit messages
+3. Include the Installation section and checksums from the template below
+4. Click "Publish release"
+
+To find the last stable release (excluding pre-releases like -alpha, -beta, -rc):
+```bash
+git tag -l | grep -v -E '(-alpha|-beta|-rc|-dev|-preview)' | sort -V | tail -1
+```
+
+**IMPORTANT**: Before finalizing release notes, review the "What's New" sections of all pre-releases between the last stable release and the new version to ensure no features are missed:
+```bash
+# List pre-releases between last stable and new version
+git tag -l | grep -E '^v1\.3\.[2-9]|^v1\.[4-9]\.' | sort -V
+
+# View each pre-release's notes
+gh release view v1.3.2 --json body -q .body
+```
 
 **Artifacts created:**
 - `acproxycam-linux-x64-v{VERSION}.zip`
