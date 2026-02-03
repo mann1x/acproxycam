@@ -1412,18 +1412,172 @@ WantedBy=multi-user.target
             standbyLedTimeout = AskValidatedInt("Standby LED timeout (minutes):", 1, 1440, 20);
         }
 
-        // Streamer enable settings
+        // Video source detection and configuration
         _ui.WriteLine();
-        var h264Enabled = _ui.Confirm("Enable the H264 Streamer?", true);
-        var hlsEnabled = _ui.Confirm("Enable the HLS Streamer?", true);
-        var llHlsEnabled = hlsEnabled && _ui.Confirm("Enable the LowLatency-HLS Streamer?", true);
-        _ui.WriteLine();
-        var mjpegEnabled = _ui.Confirm("Enable the MJPEG Streamer?", false);
+        _ui.WriteInfo("Detecting h264-streamer...");
 
-        // MJPEG Encoding settings (only if MJPEG enabled)
+        var preflightChecker = new PrinterPreflightChecker();
+        var preflightResult = await preflightChecker.CheckAsync(ip);
+
+        // Video source settings
+        var videoSource = "h264";
+        var h264StreamerControlPort = 0;
+        var h264StreamerStreamingPort = 8080;
+        var h264StreamerEncoderType = "";
+        string? mjpegStreamUrl = null;
+        string? snapshotUrl = null;
+
+        if (preflightResult.H264StreamerDetected && preflightResult.StreamerConfig != null)
+        {
+            var config_detected = preflightResult.StreamerConfig;
+            h264StreamerControlPort = preflightResult.ControlPort;
+            h264StreamerStreamingPort = config_detected.StreamingPort;
+            h264StreamerEncoderType = config_detected.EncoderType;
+
+            _ui.WriteSuccess($"h264-streamer detected! Encoder: {config_detected.EncoderType}");
+            _ui.WriteInfo($"  Control port: {preflightResult.ControlPort}");
+            _ui.WriteInfo($"  Streaming port: {config_detected.StreamingPort}");
+
+            _ui.WriteLine();
+            _ui.WriteInfo($"Recommended video source: {preflightResult.RecommendedVideoSource.ToUpperInvariant()}");
+            _ui.WriteInfo($"  Reason: {preflightResult.RecommendationReason}");
+
+            // Present video source choices
+            var sourceChoices = new List<string>();
+            if (preflightResult.RecommendedVideoSource == "h264")
+            {
+                sourceChoices.Add("H.264 (recommended - matches encoder)");
+                if (preflightResult.MjpegStreamAvailable)
+                    sourceChoices.Add("MJPEG (available but may be suboptimal)");
+            }
+            else
+            {
+                if (preflightResult.MjpegStreamAvailable)
+                    sourceChoices.Add("MJPEG (recommended - matches encoder)");
+                if (preflightResult.NativeH264Available)
+                    sourceChoices.Add("H.264 (available but may be suboptimal)");
+            }
+            sourceChoices.Add("Manual configuration");
+
+            _ui.WriteLine();
+            var sourceChoice = _ui.SelectOne("Select video source:", sourceChoices);
+
+            if (sourceChoice.StartsWith("H.264"))
+            {
+                videoSource = "h264";
+            }
+            else if (sourceChoice.StartsWith("MJPEG"))
+            {
+                videoSource = "mjpeg";
+            }
+            else
+            {
+                // Manual configuration
+                var manualChoices = new List<string> { "H.264", "MJPEG" };
+                var manualSource = _ui.SelectOne("Video source type:", manualChoices);
+                videoSource = manualSource == "MJPEG" ? "mjpeg" : "h264";
+
+                if (videoSource == "mjpeg")
+                {
+                    mjpegStreamUrl = AskValidatedString("MJPEG stream URL:",
+                        (s) => Uri.TryCreate(s, UriKind.Absolute, out _) ? null : "Invalid URL",
+                        $"http://{ip}:{h264StreamerStreamingPort}/stream");
+                    snapshotUrl = AskValidatedString("Snapshot URL:",
+                        (s) => Uri.TryCreate(s, UriKind.Absolute, out _) ? null : "Invalid URL",
+                        $"http://{ip}:{h264StreamerStreamingPort}/snapshot");
+                }
+
+                // Warn if suboptimal
+                var warning = preflightChecker.GetSuboptimalWarning(preflightResult, videoSource);
+                if (warning != null)
+                {
+                    _ui.WriteLine();
+                    _ui.WriteWarning(warning);
+                    if (!_ui.Confirm("Continue with this configuration?", true))
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        else
+        {
+            // h264-streamer not detected
+            if (preflightResult.NativeH264Available)
+            {
+                _ui.WriteInfo("h264-streamer not detected, using native H.264 stream.");
+                videoSource = "h264";
+            }
+            else if (preflightResult.MjpegStreamAvailable)
+            {
+                _ui.WriteInfo("Using MJPEG stream (no native H.264 available).");
+                videoSource = "mjpeg";
+            }
+            else
+            {
+                _ui.WriteWarning("No video endpoints detected. Defaulting to H.264 (printer may need to be started).");
+                videoSource = "h264";
+            }
+
+            // Check for custom h264-streamer port
+            if (_ui.Confirm("Is h264-streamer running on a custom port?", false))
+            {
+                var customPort = AskValidatedPort("h264-streamer control port:", 8081);
+                if (customPort != null)
+                {
+                    var customResult = await preflightChecker.TryGetStreamerConfigAsync(ip, customPort.Value);
+                    if (customResult != null)
+                    {
+                        _ui.WriteSuccess($"h264-streamer found! Encoder: {customResult.EncoderType}");
+                        h264StreamerControlPort = customPort.Value;
+                        h264StreamerStreamingPort = customResult.StreamingPort;
+                        h264StreamerEncoderType = customResult.EncoderType;
+
+                        // Re-run recommendation
+                        if (customResult.IsOptimizedForMjpeg)
+                        {
+                            videoSource = "mjpeg";
+                            _ui.WriteInfo("Switched to MJPEG source (encoder optimized for MJPEG).");
+                        }
+                    }
+                    else
+                    {
+                        _ui.WriteWarning($"Could not connect to h264-streamer on port {customPort}.");
+                    }
+                }
+            }
+        }
+
+        // Streamer enable settings (only relevant for H.264 source mode)
+        var h264Enabled = true;
+        var hlsEnabled = true;
+        var llHlsEnabled = true;
+        var mjpegEnabled = true;
+
+        if (videoSource == "h264")
+        {
+            _ui.WriteLine();
+            _ui.WriteInfo("Output endpoint settings:");
+            h264Enabled = _ui.Confirm("Enable H.264 WebSocket endpoint (/h264)?", true);
+            hlsEnabled = _ui.Confirm("Enable HLS endpoint (/hls/*)?", true);
+            llHlsEnabled = hlsEnabled && _ui.Confirm("Enable Low-Latency HLS?", true);
+            mjpegEnabled = _ui.Confirm("Enable MJPEG endpoint (/stream)?", true);
+        }
+        else
+        {
+            // MJPEG source mode - H.264/HLS not available
+            _ui.WriteLine();
+            _ui.WriteInfo("MJPEG source mode: H.264 WebSocket and HLS endpoints will not be available.");
+            h264Enabled = false;
+            hlsEnabled = false;
+            llHlsEnabled = false;
+            mjpegEnabled = true;
+        }
+
+        // MJPEG Encoding settings (only if MJPEG enabled and H.264 source)
         var maxFps = 15;
         var jpegQuality = 80;
-        if (mjpegEnabled)
+        if (mjpegEnabled && videoSource == "h264")
         {
             _ui.WriteInfo("MJPEG Encoding settings:");
             maxFps = AskValidatedInt("Max FPS:", 0, 120, 15);
@@ -1443,6 +1597,12 @@ WantedBy=multi-user.target
             AutoLanMode = autoLanMode,
             LedAutoControl = ledAutoControl,
             StandbyLedTimeoutMinutes = standbyLedTimeout,
+            VideoSource = videoSource,
+            H264StreamerControlPort = h264StreamerControlPort,
+            H264StreamerStreamingPort = h264StreamerStreamingPort,
+            H264StreamerEncoderType = h264StreamerEncoderType,
+            MjpegStreamUrl = mjpegStreamUrl,
+            SnapshotUrl = snapshotUrl,
             H264StreamerEnabled = h264Enabled,
             HlsEnabled = hlsEnabled,
             LlHlsEnabled = llHlsEnabled,
@@ -1471,6 +1631,8 @@ WantedBy=multi-user.target
         if (success)
         {
             _ui.WriteSuccess("Printer added successfully!");
+            _ui.WriteInfo($"Video source: {videoSource.ToUpperInvariant()}" +
+                (h264StreamerEncoderType != "" ? $" (h264-streamer {h264StreamerEncoderType})" : ""));
             _ui.WriteInfo($"HTTP endpoints: http://<server>:{httpPort}/snapshot, /status, /led");
             if (h264Enabled)
                 _ui.WriteInfo($"H.264 WebSocket: ws://<server>:{httpPort}/h264");

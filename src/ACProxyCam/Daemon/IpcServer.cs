@@ -28,7 +28,7 @@ public class IpcServer
         _bedMeshManager = bedMeshManager;
     }
 
-    public async Task StartAsync()
+    public Task StartAsync()
     {
         // Remove stale socket file
         if (File.Exists(SocketPath))
@@ -60,6 +60,8 @@ public class IpcServer
 #pragma warning restore CA1416
 
         _acceptTask = AcceptClientsAsync(_cts.Token);
+
+        return Task.CompletedTask;
     }
 
     public void Stop()

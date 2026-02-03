@@ -53,6 +53,10 @@ public class MjpegServer : IDisposable
     private readonly object _snapshotCacheLock = new();
     private const int SnapshotMaxFps = 10; // Max 10 decodes per second
 
+    // MJPEG source mode flag (set when using MjpegSourceClient instead of FFmpeg H.264 decoder)
+    private bool _mjpegSourceMode;
+    private bool _lastKeyframeIsJpeg; // When true, _lastKeyframe is JPEG, not H.264
+
     public event EventHandler<string>? StatusChanged;
 
     public MjpegServer()
@@ -236,6 +240,83 @@ public class MjpegServer : IDisposable
     /// Measured incoming H.264 stream FPS (updated every second based on packet arrivals).
     /// </summary>
     public int MeasuredInputFps => _measuredInputFps;
+
+    /// <summary>
+    /// Video source mode: "h264" or "mjpeg".
+    /// When "mjpeg", H.264/HLS endpoints return 503 Service Unavailable.
+    /// </summary>
+    public string VideoSourceMode
+    {
+        get => _mjpegSourceMode ? "mjpeg" : "h264";
+        set => _mjpegSourceMode = value?.ToLowerInvariant() == "mjpeg";
+    }
+
+    /// <summary>
+    /// Push a pre-encoded JPEG frame directly (from MJPEG source).
+    /// No decoding or re-encoding needed - direct passthrough.
+    /// </summary>
+    /// <param name="jpegData">JPEG-encoded frame data</param>
+    public void PushJpegFrame(byte[] jpegData)
+    {
+        if (jpegData == null || jpegData.Length == 0)
+            return;
+
+        var now = DateTime.UtcNow;
+
+        // Update JPEG frame cache
+        lock (_frameLock)
+        {
+            _lastJpegFrame = jpegData;
+            _lastEncodeTime = now;
+        }
+
+        // Update keyframe cache for snapshot (JPEG is always a "keyframe")
+        lock (_keyframeLock)
+        {
+            _lastKeyframe = jpegData;
+            _lastKeyframeIsJpeg = true;
+        }
+
+        // Measure input FPS
+        if (_inputFpsWindowStart == DateTime.MinValue)
+        {
+            _inputFpsWindowStart = now;
+            _inputFpsFrameCount = 0;
+        }
+        _inputFpsFrameCount++;
+
+        var windowElapsed = (now - _inputFpsWindowStart).TotalMilliseconds;
+        if (windowElapsed >= InputFpsWindowMs)
+        {
+            _measuredInputFps = (int)Math.Round(_inputFpsFrameCount * 1000.0 / windowElapsed);
+            _inputFpsWindowStart = now;
+            _inputFpsFrameCount = 0;
+        }
+
+        // Send to all MJPEG streaming clients
+        lock (_clientLock)
+        {
+            var deadClients = new List<ClientConnection>();
+
+            foreach (var client in _clients)
+            {
+                if (client.IsStreaming)
+                {
+                    if (!client.TrySendFrame(jpegData))
+                    {
+                        deadClients.Add(client);
+                    }
+                }
+            }
+
+            // Remove disconnected clients
+            foreach (var dead in deadClients)
+            {
+                _clients.Remove(dead);
+                dead.Dispose();
+            }
+        }
+    }
 
     public void PushH264Packet(byte[] data, bool isKeyframe, long pts = 0)
     {
@@ -828,6 +909,12 @@ public class MjpegServer : IDisposable
             if (path.Equals("/h264", StringComparison.OrdinalIgnoreCase) &&
                 request.Contains("Upgrade: websocket", StringComparison.OrdinalIgnoreCase))
             {
+                // H.264 WebSocket not available in MJPEG source mode
+                if (_mjpegSourceMode)
+                {
+                    SendServiceUnavailable(client, "H.264 streaming not available in MJPEG source mode");
+                    return;
+                }
                 HandleH264WebSocketUpgrade(client, request);
                 return;
             }
@@ -867,10 +954,20 @@ public class MjpegServer : IDisposable
                     break;
 
                 case "/hls/playlist.m3u8":
+                    if (_mjpegSourceMode)
+                    {
+                        SendServiceUnavailable(client, "HLS not available in MJPEG source mode");
+                        break;
+                    }
                     HandleHlsPlaylistRequestAsync(client, queryParams);
                     break;
 
                 case "/hls/legacy.m3u8":
+                    if (_mjpegSourceMode)
+                    {
+                        SendServiceUnavailable(client, "HLS not available in MJPEG source mode");
+                        break;
+                    }
                     HandleHlsLegacyPlaylistRequest(client);
                     break;
 
@@ -879,6 +976,11 @@ public class MjpegServer : IDisposable
                     if (path.StartsWith("/hls/part", StringComparison.OrdinalIgnoreCase) &&
                         path.EndsWith(".ts", StringComparison.OrdinalIgnoreCase))
                     {
+                        if (_mjpegSourceMode)
+                        {
+                            SendServiceUnavailable(client, "HLS not available in MJPEG source mode");
+                            break;
+                        }
                         HandleHlsPartRequest(client, path);
                         break;
                     }
@@ -887,6 +989,11 @@ public class MjpegServer : IDisposable
                     if (path.StartsWith("/hls/legacy-segment", StringComparison.OrdinalIgnoreCase) &&
                         path.EndsWith(".ts", StringComparison.OrdinalIgnoreCase))
                     {
+                        if (_mjpegSourceMode)
+                        {
+                            SendServiceUnavailable(client, "HLS not available in MJPEG source mode");
+                            break;
+                        }
                         HandleHlsLegacySegmentRequest(client, path);
                         break;
                     }
@@ -895,6 +1002,11 @@ public class MjpegServer : IDisposable
                     if (path.StartsWith("/hls/segment", StringComparison.OrdinalIgnoreCase) &&
                         path.EndsWith(".ts", StringComparison.OrdinalIgnoreCase))
                     {
+                        if (_mjpegSourceMode)
+                        {
+                            SendServiceUnavailable(client, "HLS not available in MJPEG source mode");
+                            break;
+                        }
                         HandleHlsSegmentRequest(client, path);
                         break;
                     }
@@ -961,11 +1073,13 @@ public class MjpegServer : IDisposable
     /// </summary>
     private void HandleSnapshotRequest(ClientConnection client)
     {
-        // Get the cached keyframe (Annex B format with SPS/PPS)
+        // Get the cached keyframe
         byte[]? keyframeData;
+        bool isJpeg;
         lock (_keyframeLock)
         {
             keyframeData = _lastKeyframe;
+            isJpeg = _lastKeyframeIsJpeg;
         }
 
         if (keyframeData == null)
@@ -978,30 +1092,39 @@ public class MjpegServer : IDisposable
 
         byte[]? jpegData;
 
-        lock (_snapshotCacheLock)
+        if (isJpeg)
         {
-            var now = DateTime.UtcNow;
-            var minInterval = TimeSpan.FromSeconds(1.0 / SnapshotMaxFps);
-            var cacheValid = _cachedSnapshotJpeg != null &&
-                             (now - _lastSnapshotDecodeTime) < minInterval &&
-                             ReferenceEquals(_cachedSnapshotKeyframeSource, keyframeData);
-
-            if (cacheValid)
+            // MJPEG source mode - keyframe is already JPEG, use directly
+            jpegData = keyframeData;
+        }
+        else
+        {
+            // H.264 source mode - need to decode keyframe to JPEG
+            lock (_snapshotCacheLock)
             {
-                // Use cached JPEG - rate limited
-                jpegData = _cachedSnapshotJpeg;
-            }
-            else
-            {
-                // Need to decode - either cache expired or keyframe changed
-                _snapshotDecoder.JpegQuality = JpegQuality;
-                jpegData = _snapshotDecoder.DecodeKeyframeToJpeg(keyframeData);
+                var now = DateTime.UtcNow;
+                var minInterval = TimeSpan.FromSeconds(1.0 / SnapshotMaxFps);
+                var cacheValid = _cachedSnapshotJpeg != null &&
+                                 (now - _lastSnapshotDecodeTime) < minInterval &&
+                                 ReferenceEquals(_cachedSnapshotKeyframeSource, keyframeData);
 
-                if (jpegData != null)
+                if (cacheValid)
                 {
-                    _cachedSnapshotJpeg = jpegData;
-                    _cachedSnapshotKeyframeSource = keyframeData;
-                    _lastSnapshotDecodeTime = now;
+                    // Use cached JPEG - rate limited
+                    jpegData = _cachedSnapshotJpeg;
+                }
+                else
+                {
+                    // Need to decode - either cache expired or keyframe changed
+                    _snapshotDecoder.JpegQuality = JpegQuality;
+                    jpegData = _snapshotDecoder.DecodeKeyframeToJpeg(keyframeData);
+
+                    if (jpegData != null)
+                    {
+                        _cachedSnapshotJpeg = jpegData;
+                        _cachedSnapshotKeyframeSource = keyframeData;
+                        _lastSnapshotDecodeTime = now;
+                    }
                 }
             }
         }

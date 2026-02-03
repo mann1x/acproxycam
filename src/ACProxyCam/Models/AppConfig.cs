@@ -142,6 +142,49 @@ public class PrinterConfig
     public bool CameraEnabled { get; set; } = true;
 
     /// <summary>
+    /// Video source type: "h264" (default) for native H.264 stream, or "mjpeg" for h264-streamer MJPEG.
+    /// When "mjpeg", connects to h264-streamer's /stream endpoint instead of native FLV.
+    /// </summary>
+    [JsonPropertyName("videoSource")]
+    public string VideoSource { get; set; } = "h264";
+
+    /// <summary>
+    /// h264-streamer control endpoint port. 0 = not configured/detected.
+    /// Used to query h264-streamer configuration via /api/config.
+    /// </summary>
+    [JsonPropertyName("h264StreamerControlPort")]
+    public int H264StreamerControlPort { get; set; } = 0;
+
+    /// <summary>
+    /// h264-streamer streaming port (default 8080, obtained from /api/config).
+    /// Used when VideoSource = "mjpeg" to construct stream URLs.
+    /// </summary>
+    [JsonPropertyName("h264StreamerStreamingPort")]
+    public int H264StreamerStreamingPort { get; set; } = 8080;
+
+    /// <summary>
+    /// h264-streamer encoder type detected via /api/config.
+    /// Values: "gkcam", "rkmpi", "rkmpi-yuyv", or empty if not using h264-streamer.
+    /// Used to recommend video source: rkmpi = MJPEG preferred, gkcam/rkmpi-yuyv = H.264 preferred.
+    /// </summary>
+    [JsonPropertyName("h264StreamerEncoderType")]
+    public string H264StreamerEncoderType { get; set; } = "";
+
+    /// <summary>
+    /// Custom MJPEG stream URL override. When set, used instead of default URL construction.
+    /// Default format: http://{Ip}:{H264StreamerStreamingPort}/stream
+    /// </summary>
+    [JsonPropertyName("mjpegStreamUrl")]
+    public string? MjpegStreamUrl { get; set; }
+
+    /// <summary>
+    /// Custom snapshot URL override. When set, used instead of default URL construction.
+    /// Default format: http://{Ip}:{H264StreamerStreamingPort}/snapshot
+    /// </summary>
+    [JsonPropertyName("snapshotUrl")]
+    public string? SnapshotUrl { get; set; }
+
+    /// <summary>
     /// Enable H.264 WebSocket streaming endpoint (/h264).
     /// Used by Mainsail/Fluidd jmuxer for low-CPU streaming.
     /// Default: true.

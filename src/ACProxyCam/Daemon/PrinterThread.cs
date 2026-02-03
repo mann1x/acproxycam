@@ -38,6 +38,7 @@ public class PrinterThread : IDisposable
     private LanModeService? _lanModeService;
     private MqttCameraController? _mqttController;
     private FfmpegDecoder? _decoder;
+    private MjpegSourceClient? _mjpegSource;     // For MJPEG source mode (h264-streamer)
     private MjpegServer? _mjpegServer;
     private MoonrakerApiClient? _sharedMoonraker; // Shared Moonraker connection for all Obico clients
     private ObicoClient? _obicoClient;           // Local Obico server
@@ -198,6 +199,11 @@ public class PrinterThread : IDisposable
             var hasExternal = _mjpegServer?.HasExternalStreamingClient == true;
             var hlsActive = _mjpegServer?.HasHlsActivity == true;
 
+            // Measure FPS based on video source mode
+            var measuredFps = Config.VideoSource?.ToLowerInvariant() == "mjpeg"
+                ? _mjpegSource?.MeasuredFps ?? _mjpegServer?.MeasuredInputFps ?? 0
+                : _decoder?.MeasuredFps ?? _mjpegServer?.MeasuredInputFps ?? 0;
+
             return new PrinterStatus
             {
                 Name = Config.Name,
@@ -211,9 +217,11 @@ public class PrinterThread : IDisposable
                 HlsReady = _mjpegServer?.HlsReady ?? false,
                 IsPaused = _isPaused,
                 CpuAffinity = _cpuAffinity,
-                IncomingH264Fps = _decoder?.MeasuredFps ?? _mjpegServer?.MeasuredInputFps ?? 0,
+                IncomingH264Fps = (int)measuredFps,
                 DeclaredH264Fps = 0,  // Original decoder doesn't have DeclaredFps
                 JpegQuality = Config.JpegQuality,
+                VideoSource = Config.VideoSource ?? "h264",
+                H264StreamerEncoderType = Config.H264StreamerEncoderType ?? "",
                 H264StreamerEnabled = Config.H264StreamerEnabled,
                 HlsEnabled = Config.HlsEnabled,
                 LlHlsEnabled = Config.LlHlsEnabled,
@@ -1322,6 +1330,22 @@ public class PrinterThread : IDisposable
 
     private async Task RunStreamingLoopAsync(CancellationToken ct)
     {
+        // Route to appropriate source based on config
+        if (Config.VideoSource?.ToLowerInvariant() == "mjpeg")
+        {
+            await RunMjpegSourceLoopAsync(ct);
+        }
+        else
+        {
+            await RunH264SourceLoopAsync(ct);
+        }
+    }
+
+    /// <summary>
+    /// Run the H.264 source loop using FFmpeg decoder (default mode).
+    /// </summary>
+    private async Task RunH264SourceLoopAsync(CancellationToken ct)
+    {
         _streamStatus.Connected = false;
         _streamStatus.FramesDecoded = 0;
         _streamStalled = false;
@@ -1603,6 +1627,139 @@ public class PrinterThread : IDisposable
                 _decoder.StreamStalled -= (s, e) => _streamStalled = true;
             }
             _decoder?.Stop();
+        }
+    }
+
+    /// <summary>
+    /// Run the MJPEG source loop using MjpegSourceClient (for h264-streamer MJPEG mode).
+    /// </summary>
+    private async Task RunMjpegSourceLoopAsync(CancellationToken ct)
+    {
+        _streamStatus.Connected = false;
+        _streamStatus.FramesDecoded = 0;
+        _streamStalled = false;
+        _streamFailedAt = DateTime.MinValue;
+        _streamStartedAt = DateTime.MinValue;
+
+        // Build stream URLs from config
+        var streamingPort = Config.H264StreamerStreamingPort > 0 ? Config.H264StreamerStreamingPort : 8080;
+        var streamUrl = Config.MjpegStreamUrl ?? $"http://{Config.Ip}:{streamingPort}/stream";
+        var snapshotUrl = Config.SnapshotUrl ?? $"http://{Config.Ip}:{streamingPort}/snapshot";
+
+        LogStatus($"MJPEG source mode - connecting to: {streamUrl}");
+
+        // Set MjpegServer to MJPEG source mode (disables H.264/HLS endpoints)
+        if (_mjpegServer != null)
+        {
+            _mjpegServer.VideoSourceMode = "mjpeg";
+        }
+
+        _mjpegSource = new MjpegSourceClient(streamUrl, snapshotUrl);
+
+        _mjpegSource.Connected += () =>
+        {
+            _streamStatus.Connected = true;
+            _streamStartedAt = DateTime.UtcNow;
+            _state = PrinterState.Running;
+            _lastSeenOnline = DateTime.UtcNow;
+            _streamStalled = false;
+            _streamFailedAt = DateTime.MinValue;
+            LogStatus("MJPEG stream connected");
+
+            // Start Obico client now that the stream is ready
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await StartObicoClientAsync(ct);
+                }
+                catch (Exception ex)
+                {
+                    LogStatus($"Failed to start Obico client: {ex.Message}");
+                }
+            }, ct);
+        };
+
+        _mjpegSource.Disconnected += () =>
+        {
+            _streamStatus.Connected = false;
+            _streamStartedAt = DateTime.MinValue;
+            LogStatus("MJPEG stream disconnected");
+
+            // Camera unavailable - stop Janus but keep Obico connection
+            _obicoClient?.SetCameraAvailable(false);
+            _obicoCloudClient?.SetCameraAvailable(false);
+        };
+
+        _mjpegSource.Error += (msg) =>
+        {
+            LogStatusThrottled("mjpeg_source_error", $"MJPEG source error: {msg}");
+            if (_streamFailedAt == DateTime.MinValue)
+            {
+                _streamFailedAt = DateTime.UtcNow;
+                _state = PrinterState.Retrying;
+            }
+        };
+
+        _mjpegSource.FrameReceived += (jpegData) =>
+        {
+            _streamStatus.FramesDecoded++;
+            _lastSeenOnline = DateTime.UtcNow;
+
+            // Push directly to MjpegServer - no decode/re-encode needed!
+            _mjpegServer?.PushJpegFrame(jpegData);
+
+            // Camera available - resume Janus if needed
+            if (_streamFailedAt != DateTime.MinValue)
+            {
+                _streamFailedAt = DateTime.MinValue;
+                _obicoClient?.SetCameraAvailable(true);
+                _obicoCloudClient?.SetCameraAvailable(true);
+                ResetLogThrottling();
+            }
+        };
+
+        // Register callback for snapshot requests when no frame available
+        if (_mjpegServer != null)
+        {
+            _mjpegServer.SnapshotRequested += OnSnapshotRequested;
+        }
+
+        try
+        {
+            await _mjpegSource.StartAsync(ct);
+
+            // Wait for cancellation - MjpegSourceClient handles reconnection internally
+            while (!ct.IsCancellationRequested && !_isPaused)
+            {
+                // Update status periodically
+                if (_mjpegSource.IsConnected)
+                {
+                    _lastSeenOnline = DateTime.UtcNow;
+                }
+                else if (_streamFailedAt == DateTime.MinValue && _streamStartedAt != DateTime.MinValue)
+                {
+                    // Lost connection after being connected
+                    _streamFailedAt = DateTime.UtcNow;
+                    _state = PrinterState.Retrying;
+                }
+
+                await Task.Delay(1000, ct);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown
+        }
+        finally
+        {
+            if (_mjpegServer != null)
+            {
+                _mjpegServer.SnapshotRequested -= OnSnapshotRequested;
+            }
+            _mjpegSource?.Stop();
+            _mjpegSource?.Dispose();
+            _mjpegSource = null;
         }
     }
 
@@ -2101,6 +2258,14 @@ public class PrinterThread : IDisposable
             _decoder.Stop();
             _decoder.Dispose();
             _decoder = null;
+        }
+
+        // Stop MJPEG source client
+        if (_mjpegSource != null)
+        {
+            _mjpegSource.Stop();
+            _mjpegSource.Dispose();
+            _mjpegSource = null;
         }
 
         // Stop MJPEG server

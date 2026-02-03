@@ -24,6 +24,10 @@ public class PrinterStatus
     public int DeclaredH264Fps { get; set; }  // Declared FPS from stream metadata (may differ from actual)
     public int JpegQuality { get; set; }      // MJPEG encoding quality (from config)
 
+    // Video source mode
+    public string VideoSource { get; set; } = "h264";      // "h264" or "mjpeg"
+    public string H264StreamerEncoderType { get; set; } = "";  // "gkcam", "rkmpi", "rkmpi-yuyv"
+
     // Streamer enable flags (from config)
     public bool H264StreamerEnabled { get; set; }
     public bool HlsEnabled { get; set; }
