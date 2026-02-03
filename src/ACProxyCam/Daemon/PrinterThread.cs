@@ -1185,6 +1185,9 @@ public class PrinterThread : IDisposable
             _obicoClient,
             _obicoStatus,
             isCloud: false);
+
+        // Dispose shared Moonraker if both clients are now disabled
+        DisposeSharedMoonrakerIfUnused();
     }
 
     /// <summary>
@@ -1199,6 +1202,23 @@ public class PrinterThread : IDisposable
             _obicoCloudClient,
             _obicoCloudStatus,
             isCloud: true);
+
+        // Dispose shared Moonraker if both clients are now disabled
+        DisposeSharedMoonrakerIfUnused();
+    }
+
+    /// <summary>
+    /// Dispose the shared Moonraker connection if no Obico clients are using it.
+    /// </summary>
+    private void DisposeSharedMoonrakerIfUnused()
+    {
+        if (_sharedMoonraker != null && _obicoClient == null && _obicoCloudClient == null)
+        {
+            LogStatus("Obico: Both clients disabled - disposing shared Moonraker connection");
+            _sharedMoonraker.ConnectionStateChanged -= OnSharedMoonrakerConnectionChanged;
+            _sharedMoonraker.Dispose();
+            _sharedMoonraker = null;
+        }
     }
 
     /// <summary>
@@ -1351,7 +1371,8 @@ public class PrinterThread : IDisposable
 
             // Start Obico client now that the printer/stream is ready
             // This ensures LAN mode is properly enabled before Obico tries to connect to Moonraker
-            if (_obicoClient == null && Config.Obico.Enabled)
+            if (_obicoClient == null && _obicoCloudClient == null &&
+                (Config.Obico.Enabled || Config.ObicoCloud.Enabled))
             {
                 try
                 {

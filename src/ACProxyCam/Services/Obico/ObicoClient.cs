@@ -779,7 +779,11 @@ public class ObicoClient : IDisposable
         // Stop Janus streaming
         await StopJanusAsync();
 
-        await _moonraker.DisconnectWebSocketAsync();
+        // Only disconnect Moonraker if we own it (not shared)
+        if (_ownsMoonraker)
+        {
+            await _moonraker.DisconnectWebSocketAsync();
+        }
 
         if (_obicoServer != null)
         {
