@@ -32,6 +32,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     janus lua-cjson lua-ansicolors \
     # s6-overlay dependencies
     xz-utils \
+    # VAAPI support (enables GPU encoding when /dev/dri is mounted via compose override)
+    libva2 libva-drm2 \
     # Utilities
     curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

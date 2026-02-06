@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ACProxyCam is a C# (.NET 8.0) Linux daemon that proxies Anycubic 3D printer camera streams. It converts FLV/H.264 video from printers to MJPEG format for Mainsail/Fluidd/Moonraker compatibility.
+ACProxyCam is a C# (.NET 8.0) Linux daemon that proxies Anycubic 3D printer camera streams. It converts FLV/H.264 video from printers to MJPEG format for Mainsail/Fluidd/Moonraker compatibility. It can also encode MJPEG streams to H.264 server-side with hardware encoder auto-detection, enabling full H.264/HLS/FLV output from MJPEG-only sources.
 
 ## Build Commands
 
@@ -33,7 +33,10 @@ Program.cs (Entry Point)
 │               ├── SshCredentialService → retrieves MQTT creds via SSH
 │               ├── MqttCameraController → monitors MQTT, sends startCapture, intercepts stops
 │               ├── FfmpegDecoder → H.264 FLV to BGR24 frames
-│               └── MjpegServer → HTTP /stream, /snapshot, /status
+│               ├── FfmpegEncoder → MJPEG to H.264 AVCC (optional)
+│               ├── FfmpegEncoderDetector → HW/SW encoder detection
+│               ├── FlvMuxer → AVCC H.264 to FLV container
+│               └── MjpegServer → HTTP /stream, /snapshot, /status, /flv, /h264, /hls
 │
 └── Management Mode (no args)
     └── ManagementCli (Spectre.Console interactive UI)
@@ -46,17 +49,32 @@ Program.cs (Entry Point)
 |-----------|---------|
 | `Models/` | Data structures: `AppConfig`, `PrinterConfig`, `PrinterStatus` |
 | `Daemon/` | Service logic: `DaemonService`, `PrinterManager`, `PrinterThread`, `ConfigManager`, `IpcServer` |
-| `Services/` | I/O: `FfmpegDecoder`, `MjpegServer`, `MqttCameraController`, `SshCredentialService`, `CpuAffinityService` |
+| `Services/` | I/O: `FfmpegDecoder`, `FfmpegEncoder`, `FfmpegEncoderDetector`, `FlvMuxer`, `MjpegServer`, `MqttCameraController`, `SshCredentialService`, `CpuAffinityService` |
 | `Client/` | CLI: `ManagementCli`, `IpcClient`, `IConsoleUI`, `SpectreConsoleUI`, `SimpleConsoleUI` |
 
 ### Per-Printer Flow
 
+**Native H.264 mode** (`VideoSource = "h264"`):
 1. SSH to printer → read `/userdata/app/gk/config/device_account.json` for MQTT credentials
 2. MQTT connect (port 9883, TLS) → subscribe to `#` → detect model code via regex
 3. Publish `startCapture` to `anycubic/anycubicCloud/v1/web/printer/{modelCode}/{deviceId}/video`
 4. **MQTT stays connected** to monitor for external stop commands and enable instant recovery
 5. HTTP GET `http://<printer>:18088/flv` → FFmpeg decode H.264 → SkiaSharp encode JPEG
-6. Serve MJPEG on configured port
+6. Serve MJPEG, H.264 WebSocket, HLS, and FLV on configured port
+
+**MJPEG source mode** (`VideoSource = "mjpeg"`):
+1. Connect to MJPEG source (h264-streamer)
+2. Push JPEG frames to MjpegServer for MJPEG/snapshot endpoints
+3. If `H264EncodingEnabled`: feed frames to FfmpegEncoder → AVCC H.264 packets
+4. Push AVCC packets to MjpegServer → H.264 WebSocket, HLS, and FLV endpoints
+5. SPS/PPS extracted from encoder extradata via `ParseAvccExtradata()`
+
+**FLV streaming pipeline**:
+- Each `/flv` client gets a per-client `FlvMuxer` with independent timestamps
+- FLV header + AMF0 metadata + AVC decoder config sent on connect
+- P-frames skipped until first keyframe (keyframe-first delivery)
+- NAL types 7/8 (SPS/PPS) filtered from video tags — placed only in decoder config
+- Content-Type: `text/plain` with large Content-Length for slicer compatibility
 
 ### Stream Recovery
 
@@ -77,7 +95,7 @@ Key code in `MqttCameraController.cs`:
 
 ## Key Dependencies
 
-- **FFmpeg.AutoGen** - P/Invoke bindings for video decoding (unsafe code)
+- **FFmpeg.AutoGen** - P/Invoke bindings for video decoding and encoding (unsafe code)
 - **SkiaSharp** - Cross-platform JPEG encoding
 - **MQTTnet** - MQTT client for printer control
 - **SSH.NET** - SSH for credential retrieval
@@ -93,6 +111,14 @@ Key code in `MqttCameraController.cs`:
 | `IdleFps` | 1 | FPS when no clients (for snapshot availability, 0 = disabled) |
 | `JpegQuality` | 80 | JPEG encoding quality (1-100) |
 | `SendStopCommand` | false | Send stopCapture via MQTT when stopping (disabled to avoid interfering with slicers) |
+| `H264EncodingEnabled` | false | Enable MJPEG→H.264 server-side encoding |
+| `H264Encoder` | "auto" | Encoder name or "auto" for best available |
+| `H264Bitrate` | 1024 | Encoding bitrate in kbps |
+| `H264RateControl` | "vbr" | Rate control: "cbr" or "vbr" |
+| `H264GopSize` | 30 | Keyframe interval in frames |
+| `H264Preset` | "medium" | Encoding preset (ultrafast→veryslow for libx264) |
+| `H264Profile` | "main" | H.264 profile (baseline, main, high) |
+| `H264EncodingMaxFps` | 0 | Max encode FPS (0 = match source) |
 
 ### CPU Affinity
 
@@ -109,7 +135,10 @@ Key code in `MqttCameraController.cs`:
   sudo chown acproxycam:acproxycam /etc/acproxycam/config.json
   sudo chmod 600 /etc/acproxycam/config.json
   ```
-- **FFmpeg**: Uses system FFmpeg libraries (`libavcodec`, `libavformat`). Code in `FfmpegDecoder.cs` uses unsafe C#.
+- **FFmpeg**: Uses system FFmpeg libraries (`libavcodec`, `libavformat`, `libswscale`). Code in `FfmpegDecoder.cs` and `FfmpegEncoder.cs` uses unsafe C#.
+- **FfmpegEncoder**: MJPEG→H.264 encoding pipeline. Decodes JPEG via MJPEG codec, optional `sws_scale` for pixel format conversion, encodes H.264 with detected encoder. Outputs Annex B which is converted to AVCC format. Uses `AV_CODEC_FLAG_GLOBAL_HEADER` for extradata SPS/PPS.
+- **FfmpegEncoderDetector**: Probes available H.264 encoders at runtime by attempting `avcodec_open2()` with minimal params. For VAAPI, also checks `/dev/dri/renderD128` and `av_hwdevice_ctx_create()`.
+- **FlvMuxer**: Converts AVCC H.264 packets to FLV container format. Creates FLV header, AMF0 metadata, AVC decoder config from SPS/PPS, and video tags. Filters SPS/PPS NALs (types 7,8) from video tags.
 - **Threading**: One thread per printer (`PrinterThread`). Thread-safe operations use explicit `lock()` on object monitors. State fields marked `volatile`.
 - **IPC**: Unix socket at `/run/acproxycam/acproxycam.sock` for daemon-CLI communication.
 - **MQTT Connection**: Stays connected during streaming for instant camera restart on external stop.

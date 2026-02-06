@@ -196,6 +196,7 @@ public class PrinterThread : IDisposable
         {
             var mjpegClients = _mjpegServer?.ConnectedClients ?? 0;
             var h264Clients = _mjpegServer?.H264WebSocketClients ?? 0;
+            var flvClients = _mjpegServer?.FlvClients ?? 0;
             var hasExternal = _mjpegServer?.HasExternalStreamingClient == true;
             var hlsActive = _mjpegServer?.HasHlsActivity == true;
 
@@ -211,8 +212,9 @@ public class PrinterThread : IDisposable
                 MjpegPort = Config.MjpegPort,
                 DeviceType = Config.DeviceType,
                 State = _state,
-                ConnectedClients = mjpegClients + h264Clients + (hasExternal ? 1 : 0) + (hlsActive ? 1 : 0),
+                ConnectedClients = mjpegClients + h264Clients + flvClients + (hasExternal ? 1 : 0) + (hlsActive ? 1 : 0),
                 H264WebSocketClients = h264Clients,
+                FlvClients = flvClients,
                 HlsClients = hlsActive ? 1 : 0,
                 HlsReady = _mjpegServer?.HlsReady ?? false,
                 IsPaused = _isPaused,
@@ -226,6 +228,7 @@ public class PrinterThread : IDisposable
                 HlsEnabled = Config.HlsEnabled,
                 LlHlsEnabled = Config.LlHlsEnabled,
                 MjpegStreamerEnabled = Config.MjpegStreamerEnabled,
+                FlvEnabled = Config.H264StreamerEnabled || Config.H264EncodingEnabled,
                 IsOnline = _state == PrinterState.Running,
                 LastError = _lastError,
                 LastErrorAt = _lastErrorAt,
@@ -1648,10 +1651,59 @@ public class PrinterThread : IDisposable
 
         LogStatus($"MJPEG source mode - connecting to: {streamUrl}");
 
-        // Set MjpegServer to MJPEG source mode (disables H.264/HLS endpoints)
-        if (_mjpegServer != null)
+        // Initialize FFmpeg encoder if H.264 encoding is enabled
+        FfmpegEncoder? encoder = null;
+        bool encoderParamsSet = false;
+
+        if (Config.H264EncodingEnabled)
         {
-            _mjpegServer.VideoSourceMode = "mjpeg";
+            try
+            {
+                encoder = new FfmpegEncoder
+                {
+                    EncoderName = Config.H264Encoder,
+                    Bitrate = Config.H264Bitrate,
+                    RateControl = Config.H264RateControl,
+                    GopSize = Config.H264GopSize,
+                    Preset = Config.H264Preset,
+                    Profile = Config.H264Profile,
+                    MaxFps = Config.H264EncodingMaxFps
+                };
+
+                // Connect encoder output to MjpegServer H.264 input
+                encoder.EncodedPacketReceived += (_, e) =>
+                {
+                    _mjpegServer?.PushH264Packet(e.Data, e.IsKeyframe, e.Pts);
+                };
+
+                // Set video source mode to h264 so H.264/HLS endpoints are available
+                if (_mjpegServer != null)
+                {
+                    _mjpegServer.VideoSourceMode = "h264";
+                }
+
+                LogStatus($"MJPEG→H.264 encoding enabled (encoder: {Config.H264Encoder})");
+            }
+            catch (Exception ex)
+            {
+                LogStatus($"Failed to initialize H.264 encoder: {ex.Message}. Falling back to MJPEG-only mode.");
+                encoder?.Dispose();
+                encoder = null;
+
+                // Fall back to MJPEG-only mode
+                if (_mjpegServer != null)
+                {
+                    _mjpegServer.VideoSourceMode = "mjpeg";
+                }
+            }
+        }
+        else
+        {
+            // Set MjpegServer to MJPEG source mode (disables H.264/HLS endpoints)
+            if (_mjpegServer != null)
+            {
+                _mjpegServer.VideoSourceMode = "mjpeg";
+            }
         }
 
         _mjpegSource = new MjpegSourceClient(streamUrl, snapshotUrl);
@@ -1709,6 +1761,22 @@ public class PrinterThread : IDisposable
             // Push directly to MjpegServer - no decode/re-encode needed!
             _mjpegServer?.PushJpegFrame(jpegData);
 
+            // Feed encoder if H.264 encoding is enabled
+            if (encoder != null)
+            {
+                encoder.PushJpegFrame(jpegData);
+
+                // Extract SPS/PPS on first successful encode
+                if (!encoderParamsSet && encoder.Extradata != null)
+                {
+                    var (sps, pps, nalLen) = ParseAvccExtradata(encoder.Extradata);
+                    _mjpegServer?.SetH264Parameters(sps, pps, nalLen);
+                    encoderParamsSet = true;
+                    LogStatus($"H.264 encoder active: {encoder.ActiveEncoderName}" +
+                        (encoder.IsHardwareEncoder ? " (HW)" : " (SW)"));
+                }
+            }
+
             // Camera available - resume Janus if needed
             if (_streamFailedAt != DateTime.MinValue)
             {
@@ -1757,6 +1825,7 @@ public class PrinterThread : IDisposable
             {
                 _mjpegServer.SnapshotRequested -= OnSnapshotRequested;
             }
+            encoder?.Dispose();
             _mjpegSource?.Stop();
             _mjpegSource?.Dispose();
             _mjpegSource = null;

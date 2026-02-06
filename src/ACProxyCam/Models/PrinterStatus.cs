@@ -15,6 +15,7 @@ public class PrinterStatus
     public int ConnectedClients { get; set; }
     public int H264WebSocketClients { get; set; }
     public int HlsClients { get; set; }
+    public int FlvClients { get; set; }
     public bool HlsReady { get; set; }
     public bool IsPaused { get; set; }
 
@@ -33,6 +34,7 @@ public class PrinterStatus
     public bool HlsEnabled { get; set; }
     public bool LlHlsEnabled { get; set; }
     public bool MjpegStreamerEnabled { get; set; }
+    public bool FlvEnabled { get; set; }
 
     // Detailed status
     public bool IsOnline { get; set; }

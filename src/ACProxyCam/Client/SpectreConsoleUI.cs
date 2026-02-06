@@ -97,7 +97,7 @@ public class SpectreConsoleUI : IConsoleUI
     {
         return AnsiConsole.Prompt(
             new SelectionPrompt<string>()
-                .Title(title)
+                .Title(Markup.Escape(title))
                 .AddChoices(choices));
     }
 
@@ -117,7 +117,7 @@ public class SpectreConsoleUI : IConsoleUI
         int selectedIndex = Math.Max(0, Math.Min(startIndex, choiceList.Count - 1));
 
         // Write title
-        AnsiConsole.MarkupLine(title);
+        AnsiConsole.MarkupLine(Markup.Escape(title));
 
         // Custom selection loop with Escape support
         while (true)

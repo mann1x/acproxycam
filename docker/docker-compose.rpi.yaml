@@ -1,0 +1,11 @@
+# Docker Compose override for Raspberry Pi V4L2 M2M hardware encoding
+# Usage: docker compose -f docker-compose.yaml -f docker-compose.rpi.yaml up -d
+
+services:
+  acproxycam:
+    devices:
+      - /dev/video10:/dev/video10
+      - /dev/video11:/dev/video11
+      - /dev/video12:/dev/video12
+    group_add:
+      - video

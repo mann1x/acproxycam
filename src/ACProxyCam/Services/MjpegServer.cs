@@ -21,8 +21,10 @@ public class MjpegServer : IDisposable
     private readonly List<TcpListener> _listeners = new();
     private readonly List<ClientConnection> _clients = new();
     private readonly List<H264WebSocketClient> _h264Clients = new();
+    private readonly List<FlvStreamClient> _flvClients = new();
     private readonly object _clientLock = new();
     private readonly object _h264ClientLock = new();
+    private readonly object _flvClientLock = new();
     private CancellationTokenSource? _cts;
     private Thread? _acceptThread;
     private bool _disposed;
@@ -99,6 +101,20 @@ public class MjpegServer : IDisposable
             lock (_h264ClientLock)
             {
                 return _h264Clients.Count;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Number of connected FLV streaming clients.
+    /// </summary>
+    public int FlvClients
+    {
+        get
+        {
+            lock (_flvClientLock)
+            {
+                return _flvClients.Count;
             }
         }
     }
@@ -216,6 +232,16 @@ public class MjpegServer : IDisposable
         _ppsNal = pps;
         _nalLengthSize = nalLengthSize >= 1 && nalLengthSize <= 4 ? nalLengthSize : 4;
         _hlsService.SetH264Parameters(sps, pps, nalLengthSize);
+
+        // Update FLV clients with new SPS/PPS
+        if (sps != null && pps != null)
+        {
+            lock (_flvClientLock)
+            {
+                foreach (var client in _flvClients)
+                    client.UpdateParameters(sps, pps);
+            }
+        }
     }
 
     /// <summary>
@@ -380,6 +406,29 @@ public class MjpegServer : IDisposable
             _h264NonKeyframeCount = 0;
             _h264ParseFailCount = 0;
             _lastH264DiagLog = DateTime.UtcNow;
+        }
+
+        // Send to FLV clients (uses AVCC data directly, no conversion needed)
+        List<FlvStreamClient>? flvClients = null;
+        lock (_flvClientLock)
+        {
+            if (_flvClients.Count > 0)
+                flvClients = _flvClients.ToList();
+        }
+
+        if (flvClients != null)
+        {
+            foreach (var flvClient in flvClients)
+            {
+                try
+                {
+                    flvClient.PushPacket(data, isKeyframe);
+                }
+                catch
+                {
+                    RemoveFlvClient(flvClient);
+                }
+            }
         }
 
         // Check if we need Annex B frame (for keyframe caching or WebSocket clients)
@@ -556,6 +605,22 @@ public class MjpegServer : IDisposable
         {
             client.Dispose();
             StatusChanged?.Invoke(this, $"H.264 WebSocket client disconnected (total: {remaining})");
+        }
+    }
+
+    private void RemoveFlvClient(FlvStreamClient client)
+    {
+        bool removed;
+        int remaining;
+        lock (_flvClientLock)
+        {
+            removed = _flvClients.Remove(client);
+            remaining = _flvClients.Count;
+        }
+        if (removed)
+        {
+            client.Dispose();
+            StatusChanged?.Invoke(this, $"FLV client disconnected (total: {remaining})");
         }
     }
 
@@ -937,6 +1002,15 @@ public class MjpegServer : IDisposable
                     HandleH264InfoRequest(client);
                     break;
 
+                case "/flv":
+                    if (_mjpegSourceMode)
+                    {
+                        SendServiceUnavailable(client, "FLV streaming not available in MJPEG source mode");
+                        break;
+                    }
+                    HandleFlvStreamRequest(client);
+                    break;
+
                 case "/status":
                     HandleStatusRequest(client);
                     break;
@@ -1155,9 +1229,10 @@ public class MjpegServer : IDisposable
         var status = new
         {
             running = IsRunning,
-            clients = ConnectedClients + H264WebSocketClients,
+            clients = ConnectedClients + H264WebSocketClients + FlvClients,
             mjpegClients = ConnectedClients,
             h264Clients = H264WebSocketClients,
+            flvClients = FlvClients,
             frameWidth = _frameWidth,
             frameHeight = _frameHeight,
             hasFrame = _lastJpegFrame != null,
@@ -1688,6 +1763,92 @@ public class MjpegServer : IDisposable
 
         SendJsonResponse(client, info);
     }
+
+    #region FLV Streaming
+
+    /// <summary>
+    /// Handle /flv endpoint - continuous FLV stream compatible with Anycubic slicer.
+    /// Uses Content-Type: text/plain and large Content-Length to match gkcam format.
+    /// </summary>
+    private void HandleFlvStreamRequest(ClientConnection client)
+    {
+        // Create per-client FLV muxer and stream client
+        var muxer = new FlvMuxer(_frameWidth, _frameHeight, _measuredInputFps > 0 ? _measuredInputFps : 15);
+        var flvClient = new FlvStreamClient(client, muxer, _spsNal, _ppsNal, _nalLengthSize);
+
+        // Send HTTP response header (matches gkcam format)
+        var header = "HTTP/1.1 200 OK\r\n" +
+                     "Content-Type: text/plain\r\n" +
+                     "Access-Control-Allow-Origin: *\r\n" +
+                     "Content-Length: 99999999999\r\n" +
+                     "\r\n";
+
+        if (!client.TrySend(Encoding.ASCII.GetBytes(header)))
+        {
+            client.Dispose();
+            return;
+        }
+
+        // Send FLV header + metadata
+        if (!client.TrySend(FlvMuxer.CreateHeader()) ||
+            !client.TrySend(muxer.CreateMetadataTag()))
+        {
+            client.Dispose();
+            return;
+        }
+
+        // Send AVC decoder config immediately if SPS/PPS available
+        if (_spsNal != null && _ppsNal != null)
+        {
+            var configTag = muxer.CreateDecoderConfigTag(_spsNal, _ppsNal);
+            if (!client.TrySend(configTag))
+            {
+                client.Dispose();
+                return;
+            }
+        }
+
+        // Register client for receiving H.264 packets
+        lock (_flvClientLock)
+        {
+            _flvClients.Add(flvClient);
+        }
+
+        StatusChanged?.Invoke(this, $"FLV client connected (total: {FlvClients})");
+
+        // Monitor connection in background thread
+        ThreadPool.QueueUserWorkItem(_ => MonitorFlvClient(flvClient));
+    }
+
+    /// <summary>
+    /// Monitor FLV client connection. Detects disconnection via periodic send checks.
+    /// </summary>
+    private void MonitorFlvClient(FlvStreamClient client)
+    {
+        var ct = _cts?.Token ?? CancellationToken.None;
+
+        try
+        {
+            while (!ct.IsCancellationRequested && client.IsConnected)
+            {
+                Thread.Sleep(1000);
+
+                // Check if client is still alive by checking the underlying socket
+                if (!client.IsConnected)
+                    break;
+            }
+        }
+        catch
+        {
+            // Connection error
+        }
+        finally
+        {
+            RemoveFlvClient(client);
+        }
+    }
+
+    #endregion
 
     #region HLS Streaming
 
@@ -2275,6 +2436,95 @@ public class MjpegServer : IDisposable
             Array.Copy(payload, 0, frame, headerLength, payload.Length);
 
             return frame;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            _connection.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Represents a connected FLV streaming client.
+    /// Receives H.264 packets in AVCC format and sends them as FLV video tags.
+    /// Only sends P-frames after a keyframe has been delivered.
+    /// </summary>
+    private class FlvStreamClient : IDisposable
+    {
+        private readonly ClientConnection _connection;
+        private readonly FlvMuxer _muxer;
+        private readonly object _sendLock = new();
+        private bool _disposed;
+        private bool _sentKeyframe;
+        private byte[]? _spsNal;
+        private byte[]? _ppsNal;
+        private readonly int _nalLengthSize;
+
+        public bool IsConnected => !_disposed;
+
+        public FlvStreamClient(ClientConnection connection, FlvMuxer muxer, byte[]? spsNal, byte[]? ppsNal, int nalLengthSize = 4)
+        {
+            _connection = connection;
+            _muxer = muxer;
+            _spsNal = spsNal;
+            _ppsNal = ppsNal;
+            _nalLengthSize = nalLengthSize;
+        }
+
+        /// <summary>
+        /// Push an AVCC H.264 packet to this FLV client.
+        /// Skips P-frames until a keyframe has been sent.
+        /// </summary>
+        public void PushPacket(byte[] avccData, bool isKeyframe)
+        {
+            if (_disposed) return;
+
+            // Skip P-frames until we've sent a keyframe
+            if (!_sentKeyframe && !isKeyframe)
+                return;
+
+            // If this is a keyframe and we haven't sent decoder config yet, send it now
+            if (isKeyframe && !_muxer.HasDecoderConfig && _spsNal != null && _ppsNal != null)
+            {
+                var configTag = _muxer.CreateDecoderConfigTag(_spsNal, _ppsNal);
+                lock (_sendLock)
+                {
+                    if (!_connection.TrySend(configTag))
+                    {
+                        _disposed = true;
+                        return;
+                    }
+                }
+            }
+
+            // Mux and send (filters out SPS/PPS NALs)
+            var flvTag = _muxer.MuxAvccPacket(avccData, isKeyframe, _nalLengthSize);
+            if (flvTag == null)
+                return; // No video NALs in this packet (SPS/PPS only)
+
+            lock (_sendLock)
+            {
+                if (!_connection.TrySend(flvTag))
+                {
+                    _disposed = true;
+                    return;
+                }
+            }
+
+            if (isKeyframe)
+                _sentKeyframe = true;
+        }
+
+        /// <summary>
+        /// Update SPS/PPS NALs (called when encoder parameters change).
+        /// </summary>
+        public void UpdateParameters(byte[]? sps, byte[]? pps)
+        {
+            _spsNal = sps;
+            _ppsNal = pps;
         }
 
         public void Dispose()

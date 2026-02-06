@@ -1,0 +1,13 @@
+# Docker Compose override for NVIDIA GPU hardware encoding
+# Requires nvidia-container-toolkit to be installed on the host
+# Usage: docker compose -f docker-compose.yaml -f docker-compose.nvidia.yaml up -d
+
+services:
+  acproxycam:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video]

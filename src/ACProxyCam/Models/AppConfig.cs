@@ -236,6 +236,71 @@ public class PrinterConfig
     public int CameraKeepaliveSeconds { get; set; } = 0;
 
     /// <summary>
+    /// Enable MJPEG→H.264 encoding via FFmpeg on this server.
+    /// When enabled, JPEG frames from MJPEG source are encoded to H.264 locally,
+    /// enabling H.264 WebSocket and HLS endpoints even from MJPEG-only sources.
+    /// Default: false.
+    /// </summary>
+    [JsonPropertyName("h264EncodingEnabled")]
+    public bool H264EncodingEnabled { get; set; } = false;
+
+    /// <summary>
+    /// H.264 encoder to use for MJPEG→H.264 encoding.
+    /// "auto" = detect best available (HW first, then SW).
+    /// Specific names: "libx264", "h264_vaapi", "h264_v4l2m2m", "h264_nvenc", "h264_qsv".
+    /// Default: "auto".
+    /// </summary>
+    [JsonPropertyName("h264Encoder")]
+    public string H264Encoder { get; set; } = "auto";
+
+    /// <summary>
+    /// H.264 encoding bitrate in kbps. Default: 1024.
+    /// </summary>
+    [JsonPropertyName("h264Bitrate")]
+    public int H264Bitrate { get; set; } = 1024;
+
+    /// <summary>
+    /// H.264 encoding rate control mode: "vbr" (variable) or "cbr" (constant).
+    /// VBR allows quality to vary within bitrate budget. CBR maintains constant rate.
+    /// Default: "vbr".
+    /// </summary>
+    [JsonPropertyName("h264RateControl")]
+    public string H264RateControl { get; set; } = "vbr";
+
+    /// <summary>
+    /// H.264 encoding GOP (Group of Pictures) size - keyframe interval in frames.
+    /// Smaller values = more keyframes = faster seek/recovery but higher bitrate.
+    /// Default: 30.
+    /// </summary>
+    [JsonPropertyName("h264GopSize")]
+    public int H264GopSize { get; set; } = 30;
+
+    /// <summary>
+    /// H.264 encoding preset. Controls speed/quality tradeoff.
+    /// For libx264: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow.
+    /// For NVENC: p1 (fastest) to p7 (slowest).
+    /// Default: "medium".
+    /// </summary>
+    [JsonPropertyName("h264Preset")]
+    public string H264Preset { get; set; } = "medium";
+
+    /// <summary>
+    /// H.264 encoding profile. Higher profiles = better compression but more CPU.
+    /// Values: "baseline", "main", "high".
+    /// Default: "main".
+    /// </summary>
+    [JsonPropertyName("h264Profile")]
+    public string H264Profile { get; set; } = "main";
+
+    /// <summary>
+    /// Maximum encoding FPS. 0 = match source frame rate (no limit).
+    /// Use to limit CPU usage when source provides high frame rate.
+    /// Default: 0.
+    /// </summary>
+    [JsonPropertyName("h264EncodingMaxFps")]
+    public int H264EncodingMaxFps { get; set; } = 0;
+
+    /// <summary>
     /// Per-printer Obico integration settings (local self-hosted server).
     /// </summary>
     [JsonPropertyName("obico")]

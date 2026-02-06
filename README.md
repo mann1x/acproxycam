@@ -6,10 +6,12 @@ Anycubic Camera Proxy for Linux - Stream your Anycubic 3D printer camera to Main
 
 ## Features
 
-- **Multi-format streaming** - MJPEG, H.264 WebSocket (jmuxer), HLS, and Low-Latency HLS (~1s delay)
+- **Multi-format streaming** - MJPEG, H.264 WebSocket (jmuxer), HLS, Low-Latency HLS (~1s delay), and FLV
+- **MJPEG→H.264 encoding** - Server-side encoding with hardware encoder auto-detection (VAAPI, V4L2M2M, NVENC, QSV, libx264)
+- **FLV streaming** - Native FLV endpoint compatible with Anycubic slicer for offloading H.264 encoding from the printer
 - **Obico integration** - AI failure detection with simultaneous local server and Obico Cloud support
 - **Multi-printer support** - Individual streams on separate ports with per-printer configuration
-- **Streamer controls** - Enable/disable individual endpoints (H.264, HLS, LL-HLS, MJPEG) to minimize CPU
+- **Streamer controls** - Enable/disable individual endpoints (H.264, HLS, LL-HLS, MJPEG, FLV) to minimize CPU
 - **Smart camera control** - AutoLanMode keeps camera accessible, auto-recovery from slicer stop commands
 - **LED management** - Toggle via HTTP API or CLI, auto-control with configurable standby timeout
 - **BedMesh tools** - Calibration with heat soak, analysis with 3D visualization and outlier detection
@@ -79,6 +81,19 @@ docker run -d \
 
 See [docker/README.md](docker/README.md) for complete Docker documentation including web terminal setup and Janus WebRTC configuration.
 
+**GPU Passthrough** for hardware-accelerated encoding:
+
+```bash
+# Intel/AMD VAAPI
+docker compose -f docker/docker-compose.yaml -f docker/docker-compose.vaapi.yaml up -d
+
+# NVIDIA (requires nvidia-container-toolkit)
+docker compose -f docker/docker-compose.yaml -f docker/docker-compose.nvidia.yaml up -d
+
+# Raspberry Pi V4L2M2M
+docker compose -f docker/docker-compose.yaml -f docker/docker-compose.rpi.yaml up -d
+```
+
 ## Usage
 
 ### Management Interface
@@ -125,8 +140,24 @@ Each streaming endpoint can be individually enabled or disabled:
 | HLS | Enabled | HTTP Live Streaming for browsers |
 | LL-HLS | Enabled | Low-Latency HLS (~1s delay) |
 | MJPEG | Disabled | Higher CPU usage, legacy compatibility |
+| FLV | Enabled | FLV stream compatible with Anycubic slicer |
 
 HTTP endpoints (snapshot, status, LED control) are always available regardless of streamer settings.
+
+### MJPEG→H.264 Encoding
+
+When using h264-streamer with the `rkmpi` encoder in MJPEG-only mode, ACProxyCam can encode the MJPEG stream to H.264 server-side using FFmpeg. This enables all H.264-based endpoints (WebSocket, HLS, FLV) even from MJPEG-only sources.
+
+**Hardware encoder auto-detection** (in priority order):
+1. `h264_v4l2m2m` — Raspberry Pi hardware encoder
+2. `h264_vaapi` — Intel/AMD GPU (requires `/dev/dri/renderD128`)
+3. `h264_nvenc` — NVIDIA GPU
+4. `h264_qsv` — Intel QuickSync
+5. `libx264` — Software fallback (always available)
+
+Configure encoding when adding or modifying a printer — the CLI will detect available encoders and guide you through bitrate, rate control, GOP size, and preset selection.
+
+> **Note:** Software encoding (libx264) uses significant CPU. Use the `ultrafast` preset on low-power systems.
 
 ### AutoLanMode
 
@@ -162,6 +193,7 @@ Once a printer is configured and running:
 | HLS (LL-HLS) | `http://server:8080/hls/playlist.m3u8` | Low-Latency HLS (~1-2s) |
 | HLS (Legacy) | `http://server:8080/hls/legacy.m3u8` | Standard HLS for older players |
 | MJPEG Stream | `http://server:8080/stream` | Live MJPEG (if enabled) |
+| FLV Stream | `http://server:8080/flv` | FLV/H.264 stream (slicer compatible) |
 | LED Status | `http://server:8080/led` | GET: `{"state":"on|off","brightness":0-100}` |
 | LED On/Off | `http://server:8080/led/on` | POST: Toggle LED |
 
@@ -368,20 +400,30 @@ dotnet publish src/ACProxyCam/ACProxyCam.csproj -c Release -r linux-arm64 --self
 
 ### Architecture
 - **.NET 8.0** single-file self-contained executable
-- **FFmpeg** via system libraries for H.264 decoding
+- **FFmpeg** via system libraries for H.264 decoding and optional MJPEG→H.264 encoding
 - **SkiaSharp** for JPEG encoding
 - **MQTTnet** for printer camera control
 - **SSH.NET** for credential retrieval
 - **Spectre.Console** for terminal UI
 
 ### Protocol Flow
+
+**Native H.264 mode** (default):
 1. SSH to printer, retrieve MQTT credentials
 2. Connect to MQTT broker (port 9883, TLS)
 3. Subscribe to topics, auto-detect model code
 4. Send "startCapture" to enable camera
 5. Connect to FLV stream at `http://<printer>:18088/flv`
-6. Decode H.264, encode to JPEG/HLS/WebSocket
+6. Decode H.264, encode to JPEG/HLS/WebSocket/FLV
 7. Serve streams on configured port
+
+**MJPEG→H.264 encoding mode** (for MJPEG-only sources):
+1. Receive MJPEG frames from h264-streamer
+2. Decode JPEG → YUV420P via FFmpeg MJPEG decoder
+3. Encode YUV420P → H.264 via detected hardware or software encoder
+4. Convert Annex B output → AVCC format
+5. Feed AVCC packets to H.264 WebSocket, HLS, and FLV endpoints
+6. Serve all stream formats on configured port
 
 ## License
 

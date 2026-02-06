@@ -1,0 +1,10 @@
+# Docker Compose override for Intel/AMD VAAPI GPU hardware encoding
+# Usage: docker compose -f docker-compose.yaml -f docker-compose.vaapi.yaml up -d
+
+services:
+  acproxycam:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
