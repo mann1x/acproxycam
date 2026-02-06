@@ -1383,7 +1383,7 @@ WantedBy=multi-user.target
         if (ip == null) return;
 
         // Get HTTP port (validated, with retry on conflict)
-        var httpPort = await AskPortWithRetryAsync("HTTP port:", 8080, name);
+        var httpPort = await AskPortWithRetryAsync("Listen HTTP Port for proxy:", 8080, name);
         if (httpPort == null) return;
 
         // SSH settings
@@ -1551,16 +1551,78 @@ WantedBy=multi-user.target
             }
         }
 
-        // Streamer enable settings (only relevant for H.264 source mode)
+        // Output endpoint settings
         var h264Enabled = true;
         var hlsEnabled = true;
         var llHlsEnabled = true;
         var mjpegEnabled = true;
 
-        if (videoSource == "h264")
+        _ui.WriteLine();
+        _ui.WriteInfo("Output endpoint settings:");
+
+        if (preflightResult.H264StreamerDetected && preflightResult.StreamerConfig != null)
         {
-            _ui.WriteLine();
-            _ui.WriteInfo("Output endpoint settings:");
+            var encoderType = h264StreamerEncoderType.ToLowerInvariant();
+
+            // For rkmpi encoder (HW MJPEG mode), offer choice between proxy H.264 or MJPEG-only
+            if (encoderType == "rkmpi")
+            {
+                _ui.WriteLine();
+                _ui.WriteInfo("H.264 Output Mode:");
+                _ui.WriteLine("  The rkmpi encoder produces native MJPEG from the camera.");
+                _ui.WriteLine("  H.264/HLS requires proxying the printer's native FLV stream (18088:/flv).");
+                _ui.WriteLine();
+                _ui.WriteLine("  Options:");
+                _ui.WriteLine("    1. Proxy native H.264 from printer + MJPEG from h264-streamer");
+                _ui.WriteLine("    2. MJPEG only (no H.264/HLS - lower CPU usage)");
+
+                var h264SourceChoices = new List<string>
+                {
+                    "Proxy native H.264 + MJPEG (recommended)",
+                    "MJPEG only (disable H.264/HLS)"
+                };
+                var h264Choice = _ui.SelectOne("Output mode:", h264SourceChoices);
+
+                if (h264Choice.Contains("MJPEG only"))
+                {
+                    videoSource = "mjpeg";
+                    _ui.WriteInfo("Using MJPEG-only mode. H.264/HLS endpoints will be disabled.");
+                }
+                else
+                {
+                    videoSource = "h264";
+                    _ui.WriteInfo("H.264/HLS proxied from 18088:/flv, MJPEG from h264-streamer.");
+                }
+            }
+            else
+            {
+                // rkmpi-yuyv and gkcam: proxy native H.264
+                _ui.WriteInfo($"Using {encoderType} encoder:");
+                _ui.WriteLine($"  H.264/HLS proxied from printer (18088:/flv)");
+                _ui.WriteLine($"  MJPEG/Snapshot from h264-streamer (:{h264StreamerStreamingPort})");
+                videoSource = "h264";
+            }
+
+            // Ask about endpoint enablement based on mode
+            if (videoSource == "h264")
+            {
+                h264Enabled = _ui.Confirm("Enable H.264 WebSocket endpoint (/h264)?", true);
+                hlsEnabled = _ui.Confirm("Enable HLS endpoint (/hls/*)?", true);
+                llHlsEnabled = hlsEnabled && _ui.Confirm("Enable Low-Latency HLS?", true);
+                mjpegEnabled = _ui.Confirm("Enable MJPEG endpoint (/stream)?", true);
+            }
+            else
+            {
+                // MJPEG only mode
+                h264Enabled = false;
+                hlsEnabled = false;
+                llHlsEnabled = false;
+                mjpegEnabled = true;
+            }
+        }
+        else if (videoSource == "h264")
+        {
+            // No h264-streamer detected, using native H.264
             h264Enabled = _ui.Confirm("Enable H.264 WebSocket endpoint (/h264)?", true);
             hlsEnabled = _ui.Confirm("Enable HLS endpoint (/hls/*)?", true);
             llHlsEnabled = hlsEnabled && _ui.Confirm("Enable Low-Latency HLS?", true);
@@ -1568,8 +1630,7 @@ WantedBy=multi-user.target
         }
         else
         {
-            // MJPEG source mode - H.264/HLS not available
-            _ui.WriteLine();
+            // MJPEG source mode without h264-streamer - H.264/HLS not available
             _ui.WriteInfo("MJPEG source mode: H.264 WebSocket and HLS endpoints will not be available.");
             h264Enabled = false;
             hlsEnabled = false;
@@ -1577,14 +1638,24 @@ WantedBy=multi-user.target
             mjpegEnabled = true;
         }
 
-        // MJPEG Encoding settings (only if MJPEG enabled and H.264 source)
+        // MJPEG Encoding settings (only if MJPEG enabled, H.264 source, and NOT using h264-streamer for MJPEG)
+        // When h264-streamer provides MJPEG, we're just proxying - no encoding needed
         var maxFps = 15;
         var jpegQuality = 80;
-        if (mjpegEnabled && videoSource == "h264")
+        var needsMjpegEncoding = mjpegEnabled && videoSource == "h264" &&
+                                  !(preflightResult.H264StreamerDetected && preflightResult.StreamerConfig != null);
+        if (needsMjpegEncoding)
         {
-            _ui.WriteInfo("MJPEG Encoding settings:");
+            _ui.WriteInfo("MJPEG Encoding settings (decoding H.264 to MJPEG):");
             maxFps = AskValidatedInt("Max FPS:", 0, 120, 15);
             jpegQuality = AskValidatedInt("JPEG quality:", 1, 100, 80);
+        }
+        else if (preflightResult.H264StreamerDetected && mjpegEnabled)
+        {
+            // Using h264-streamer for MJPEG - just proxy, but still set defaults
+            _ui.WriteInfo("MJPEG will be proxied from h264-streamer (no encoding needed).");
+            maxFps = 0;  // No limit, pass through
+            jpegQuality = 80;  // Not used for proxying
         }
 
         // Create printer config
@@ -1757,7 +1828,7 @@ WantedBy=multi-user.target
         var ip = AskValidatedString($"IP/hostname [{existingConfig.Ip}]:", ValidateIpAddress, existingConfig.Ip);
         if (ip == null) return;
 
-        var httpPort = await AskPortWithRetryAsync($"HTTP port [{existingConfig.MjpegPort}]:", existingConfig.MjpegPort, originalName, originalPort);
+        var httpPort = await AskPortWithRetryAsync($"Listen HTTP Port for proxy [{existingConfig.MjpegPort}]:", existingConfig.MjpegPort, originalName, originalPort);
         if (httpPort == null) return;
 
         var sshPort = AskValidatedPort($"SSH port [{existingConfig.SshPort}]:", existingConfig.SshPort);
@@ -1794,6 +1865,10 @@ WantedBy=multi-user.target
         var h264StreamerEncoderType = currentEncoderType;
         var mjpegStreamUrl = existingConfig.MjpegStreamUrl;
         var snapshotUrl = existingConfig.SnapshotUrl;
+
+        // Track h264-streamer detection for output endpoint configuration
+        var h264StreamerDetectedInPreflight = !string.IsNullOrEmpty(currentEncoderType);
+        PrinterPreflightResult? preflightResult = null;
 
         if (changeVideoSource)
         {
@@ -1849,47 +1924,24 @@ WantedBy=multi-user.target
                 h264StreamerEncoderType = result.StreamerConfig.EncoderType;
             }
 
-            // Video source selection
-            _ui.WriteLine();
-            _ui.WriteInfo("Recommended configuration:");
-            _ui.WriteLine("  - rkmpi-yuyv encoder (HW H.264) - most efficient, low fps");
-            _ui.WriteLine("  - rkmpi encoder (HW MJPEG) - less efficient, higher fps");
-            _ui.WriteLine();
-            _ui.WriteInfo($"Detected: {result.RecommendedVideoSource} - {result.RecommendationReason}");
+            // Store preflight result for endpoint settings
+            h264StreamerDetectedInPreflight = result.H264StreamerDetected;
+            preflightResult = result;
 
-            var videoSourceChoices = new List<string>();
-            if (result.RecommendedVideoSource == "h264")
+            // Video source selection - only show manual config option, not separate H.264/MJPEG
+            // since output mode will be configured in the endpoint settings section
+            _ui.WriteLine();
+            if (result.H264StreamerDetected && result.StreamerConfig != null)
             {
-                videoSourceChoices.Add("H.264 (recommended)");
-                videoSourceChoices.Add("MJPEG");
+                _ui.WriteSuccess($"h264-streamer detected with {result.StreamerConfig.EncoderType} encoder");
+                _ui.WriteInfo("Output configuration will be set in the next section.");
             }
             else
             {
-                videoSourceChoices.Add("MJPEG (recommended)");
-                videoSourceChoices.Add("H.264");
-            }
-            videoSourceChoices.Add("Manual configuration");
+                _ui.WriteInfo("h264-streamer not detected. Using native streams.");
 
-            var videoChoice = _ui.SelectOne("Video source:", videoSourceChoices);
-
-            if (videoChoice.Contains("H.264"))
-            {
-                videoSource = "h264";
-                mjpegStreamUrl = null;
-                snapshotUrl = null;
-            }
-            else if (videoChoice.Contains("MJPEG") && !videoChoice.Contains("Manual"))
-            {
-                videoSource = "mjpeg";
-                mjpegStreamUrl = null;  // Use defaults from streaming port
-                snapshotUrl = null;
-            }
-            else if (videoChoice.Contains("Manual"))
-            {
-                var manualSourceChoice = _ui.SelectOne("Video source type:", new[] { "H.264", "MJPEG" });
-                videoSource = manualSourceChoice == "H.264" ? "h264" : "mjpeg";
-
-                if (videoSource == "mjpeg")
+                // Only ask for manual URLs if h264-streamer not detected
+                if (_ui.Confirm("Configure custom stream URLs?", false))
                 {
                     var defaultStreamUrl = $"http://{ip}:{h264StreamerStreamingPort}/stream";
                     var defaultSnapshotUrl = $"http://{ip}:{h264StreamerStreamingPort}/snapshot";
@@ -1898,17 +1950,6 @@ WantedBy=multi-user.target
                         s => Uri.TryCreate(s, UriKind.Absolute, out _) ? null : "Invalid URL", defaultStreamUrl);
                     snapshotUrl = AskValidatedString($"Snapshot URL [{defaultSnapshotUrl}]:",
                         s => Uri.TryCreate(s, UriKind.Absolute, out _) ? null : "Invalid URL", defaultSnapshotUrl);
-                }
-            }
-
-            // Warn if suboptimal configuration
-            var warning = preflight.GetSuboptimalWarning(result, videoSource);
-            if (warning != null)
-            {
-                _ui.WriteWarning(warning);
-                if (!_ui.Confirm("Continue anyway?", false))
-                {
-                    return;
                 }
             }
         }
@@ -1923,22 +1964,102 @@ WantedBy=multi-user.target
             standbyLedTimeout = AskValidatedInt($"Standby LED timeout (minutes) [{existingConfig.StandbyLedTimeoutMinutes}]:", 1, 1440, existingConfig.StandbyLedTimeoutMinutes);
         }
 
-        // Streamer enable settings
-        _ui.WriteLine();
-        var h264Enabled = _ui.Confirm($"Enable the H264 Streamer [{(existingConfig.H264StreamerEnabled ? "Yes" : "No")}]?", existingConfig.H264StreamerEnabled);
-        var hlsEnabled = _ui.Confirm($"Enable the HLS Streamer [{(existingConfig.HlsEnabled ? "Yes" : "No")}]?", existingConfig.HlsEnabled);
-        var llHlsEnabled = hlsEnabled && _ui.Confirm($"Enable the LowLatency-HLS Streamer [{(existingConfig.LlHlsEnabled ? "Yes" : "No")}]?", existingConfig.LlHlsEnabled);
-        _ui.WriteLine();
-        var mjpegEnabled = _ui.Confirm($"Enable the MJPEG Streamer [{(existingConfig.MjpegStreamerEnabled ? "Yes" : "No")}]?", existingConfig.MjpegStreamerEnabled);
+        // Output endpoint settings
+        var h264Enabled = existingConfig.H264StreamerEnabled;
+        var hlsEnabled = existingConfig.HlsEnabled;
+        var llHlsEnabled = existingConfig.LlHlsEnabled;
+        var mjpegEnabled = existingConfig.MjpegStreamerEnabled;
 
-        // MJPEG Encoding settings (only if MJPEG enabled)
+        _ui.WriteLine();
+        _ui.WriteInfo("Output endpoint settings:");
+
+        // Use encoder type from preflight (if changed) or existing config
+        var effectiveEncoderType = (preflightResult?.StreamerConfig?.EncoderType ?? h264StreamerEncoderType).ToLowerInvariant();
+        var effectiveH264StreamerDetected = h264StreamerDetectedInPreflight || !string.IsNullOrEmpty(effectiveEncoderType);
+
+        if (effectiveH264StreamerDetected && !string.IsNullOrEmpty(effectiveEncoderType))
+        {
+            // For rkmpi encoder (HW MJPEG mode), offer choice between proxy H.264 or MJPEG-only
+            if (effectiveEncoderType == "rkmpi")
+            {
+                _ui.WriteLine();
+                _ui.WriteInfo("H.264 Output Mode:");
+                _ui.WriteLine("  The rkmpi encoder produces native MJPEG from the camera.");
+                _ui.WriteLine("  H.264/HLS requires proxying the printer's native FLV stream (18088:/flv).");
+                _ui.WriteLine();
+                _ui.WriteLine("  Options:");
+                _ui.WriteLine("    1. Proxy native H.264 from printer + MJPEG from h264-streamer");
+                _ui.WriteLine("    2. MJPEG only (no H.264/HLS - lower CPU usage)");
+
+                var currentMode = videoSource == "mjpeg" ? "MJPEG only" : "Proxy native H.264 + MJPEG";
+                _ui.WriteLine($"  Current: {currentMode}");
+
+                var h264SourceChoices = new List<string>
+                {
+                    "Proxy native H.264 + MJPEG (recommended)",
+                    "MJPEG only (disable H.264/HLS)"
+                };
+                var h264Choice = _ui.SelectOne("Output mode:", h264SourceChoices);
+
+                if (h264Choice.Contains("MJPEG only"))
+                {
+                    videoSource = "mjpeg";
+                    h264Enabled = false;
+                    hlsEnabled = false;
+                    llHlsEnabled = false;
+                    mjpegEnabled = true;
+                    _ui.WriteInfo("Using MJPEG-only mode. H.264/HLS endpoints will be disabled.");
+                }
+                else
+                {
+                    videoSource = "h264";
+                    _ui.WriteInfo("H.264/HLS proxied from 18088:/flv, MJPEG from h264-streamer.");
+
+                    h264Enabled = _ui.Confirm($"Enable H.264 WebSocket endpoint (/h264) [{(existingConfig.H264StreamerEnabled ? "Yes" : "No")}]?", existingConfig.H264StreamerEnabled);
+                    hlsEnabled = _ui.Confirm($"Enable HLS endpoint (/hls/*) [{(existingConfig.HlsEnabled ? "Yes" : "No")}]?", existingConfig.HlsEnabled);
+                    llHlsEnabled = hlsEnabled && _ui.Confirm($"Enable Low-Latency HLS [{(existingConfig.LlHlsEnabled ? "Yes" : "No")}]?", existingConfig.LlHlsEnabled);
+                    mjpegEnabled = _ui.Confirm($"Enable MJPEG endpoint (/stream) [{(existingConfig.MjpegStreamerEnabled ? "Yes" : "No")}]?", existingConfig.MjpegStreamerEnabled);
+                }
+            }
+            else
+            {
+                // rkmpi-yuyv and gkcam: proxy native H.264
+                _ui.WriteInfo($"Using {effectiveEncoderType} encoder:");
+                _ui.WriteLine($"  H.264/HLS proxied from printer (18088:/flv)");
+                _ui.WriteLine($"  MJPEG/Snapshot from h264-streamer (:{h264StreamerStreamingPort})");
+                videoSource = "h264";
+
+                h264Enabled = _ui.Confirm($"Enable H.264 WebSocket endpoint (/h264) [{(existingConfig.H264StreamerEnabled ? "Yes" : "No")}]?", existingConfig.H264StreamerEnabled);
+                hlsEnabled = _ui.Confirm($"Enable HLS endpoint (/hls/*) [{(existingConfig.HlsEnabled ? "Yes" : "No")}]?", existingConfig.HlsEnabled);
+                llHlsEnabled = hlsEnabled && _ui.Confirm($"Enable Low-Latency HLS [{(existingConfig.LlHlsEnabled ? "Yes" : "No")}]?", existingConfig.LlHlsEnabled);
+                mjpegEnabled = _ui.Confirm($"Enable MJPEG endpoint (/stream) [{(existingConfig.MjpegStreamerEnabled ? "Yes" : "No")}]?", existingConfig.MjpegStreamerEnabled);
+            }
+        }
+        else
+        {
+            // No h264-streamer detected - use existing enable/disable logic
+            h264Enabled = _ui.Confirm($"Enable H.264 WebSocket endpoint (/h264) [{(existingConfig.H264StreamerEnabled ? "Yes" : "No")}]?", existingConfig.H264StreamerEnabled);
+            hlsEnabled = _ui.Confirm($"Enable HLS endpoint (/hls/*) [{(existingConfig.HlsEnabled ? "Yes" : "No")}]?", existingConfig.HlsEnabled);
+            llHlsEnabled = hlsEnabled && _ui.Confirm($"Enable Low-Latency HLS [{(existingConfig.LlHlsEnabled ? "Yes" : "No")}]?", existingConfig.LlHlsEnabled);
+            _ui.WriteLine();
+            mjpegEnabled = _ui.Confirm($"Enable MJPEG endpoint (/stream) [{(existingConfig.MjpegStreamerEnabled ? "Yes" : "No")}]?", existingConfig.MjpegStreamerEnabled);
+        }
+
+        // MJPEG Encoding settings (only if MJPEG enabled, H.264 source, and NOT using h264-streamer for MJPEG)
         var maxFps = existingConfig.MaxFps;
         var jpegQuality = existingConfig.JpegQuality;
-        if (mjpegEnabled)
+        var needsMjpegEncoding = mjpegEnabled && videoSource == "h264" && !effectiveH264StreamerDetected;
+
+        if (needsMjpegEncoding)
         {
-            _ui.WriteInfo("MJPEG Encoding settings:");
+            _ui.WriteInfo("MJPEG Encoding settings (decoding H.264 to MJPEG):");
             maxFps = AskValidatedInt($"Max FPS [{existingConfig.MaxFps}]:", 0, 120, existingConfig.MaxFps);
             jpegQuality = AskValidatedInt($"JPEG quality [{existingConfig.JpegQuality}]:", 1, 100, existingConfig.JpegQuality);
+        }
+        else if (effectiveH264StreamerDetected && mjpegEnabled)
+        {
+            _ui.WriteInfo("MJPEG will be proxied from h264-streamer (no encoding needed).");
+            maxFps = 0;  // No limit, pass through
         }
 
         // Update config

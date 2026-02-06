@@ -456,6 +456,14 @@ public unsafe class FfmpegDecoder : IDisposable
                 _videoStreamIndex = i;
                 Width = _formatContext->streams[i]->codecpar->width;
                 Height = _formatContext->streams[i]->codecpar->height;
+
+                // Validate dimensions - 0x0 causes FFmpeg to abort in sws_getContext
+                if (Width <= 0 || Height <= 0)
+                {
+                    StatusChanged?.Invoke(this, $"Invalid video dimensions: {Width}x{Height}");
+                    return false;
+                }
+
                 return true;
             }
         }
