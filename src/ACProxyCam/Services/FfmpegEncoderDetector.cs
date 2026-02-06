@@ -134,8 +134,8 @@ public static unsafe class FfmpegEncoderDetector
             if (ctx == null)
                 return false;
 
-            ctx->width = 640;
-            ctx->height = 480;
+            ctx->width = 64;
+            ctx->height = 64;
             ctx->pix_fmt = AVPixelFormat.AV_PIX_FMT_YUV420P;
             ctx->time_base = new AVRational { num = 1, den = 30 };
             ctx->framerate = new AVRational { num = 30, den = 1 };
@@ -144,27 +144,22 @@ public static unsafe class FfmpegEncoderDetector
             ctx->gop_size = 30;
 
             // libx264 needs preset to open quickly
+            AVDictionary* opts = null;
             if (name == "libx264")
             {
-                AVDictionary* opts = null;
                 ffmpeg.av_dict_set(&opts, "preset", "ultrafast", 0);
                 ffmpeg.av_dict_set(&opts, "tune", "zerolatency", 0);
-                int ret = ffmpeg.avcodec_open2(ctx, codec, &opts);
+            }
+
+            int ret = ffmpeg.avcodec_open2(ctx, codec, &opts);
+            if (opts != null)
                 ffmpeg.av_dict_free(&opts);
-                return ret >= 0;
-            }
+            if (ret < 0)
+                return false;
 
-            // v4l2m2m accepts CPU frames directly
-            if (name == "h264_v4l2m2m")
-            {
-                ctx->pix_fmt = AVPixelFormat.AV_PIX_FMT_YUV420P;
-                int ret = ffmpeg.avcodec_open2(ctx, codec, null);
-                return ret >= 0;
-            }
-
-            // nvenc / qsv: try to open with default settings
-            int result = ffmpeg.avcodec_open2(ctx, codec, null);
-            return result >= 0;
+            // Actually encode a test frame to verify the encoder works at runtime.
+            // Some encoders (e.g. h264_v4l2m2m on Pi 5) pass open2 but fail on encode.
+            return VerifyEncodeTestFrame(ctx);
         }
         catch
         {
@@ -176,6 +171,87 @@ public static unsafe class FfmpegEncoderDetector
             {
                 var tmp = ctx;
                 ffmpeg.avcodec_free_context(&tmp);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Send a blank test frame and verify the encoder can produce output.
+    /// </summary>
+    private static bool VerifyEncodeTestFrame(AVCodecContext* ctx)
+    {
+        AVFrame* frame = null;
+        AVPacket* pkt = null;
+        try
+        {
+            frame = ffmpeg.av_frame_alloc();
+            pkt = ffmpeg.av_packet_alloc();
+            if (frame == null || pkt == null)
+                return false;
+
+            frame->format = (int)ctx->pix_fmt;
+            frame->width = ctx->width;
+            frame->height = ctx->height;
+
+            int ret = ffmpeg.av_frame_get_buffer(frame, 32);
+            if (ret < 0)
+                return false;
+
+            // Fill with black (zero Y, 128 U/V)
+            ffmpeg.av_frame_make_writable(frame);
+            for (int i = 0; i < frame->height; i++)
+                NativeMemory.Fill(frame->data[0] + (nint)(i * frame->linesize[0]), (nuint)frame->width, 0);
+            for (int i = 0; i < frame->height / 2; i++)
+            {
+                NativeMemory.Fill(frame->data[1] + (nint)(i * frame->linesize[1]), (nuint)(frame->width / 2), 128);
+                NativeMemory.Fill(frame->data[2] + (nint)(i * frame->linesize[2]), (nuint)(frame->width / 2), 128);
+            }
+
+            frame->pts = 0;
+
+            ret = ffmpeg.avcodec_send_frame(ctx, frame);
+            if (ret < 0)
+            {
+                Logger.Debug($"Encoder verify: send_frame failed ({ret})");
+                return false;
+            }
+
+            // Try to receive a packet (some encoders need a few frames)
+            // Send a second frame + flush to coax output
+            frame->pts = 1;
+            ffmpeg.avcodec_send_frame(ctx, frame);
+            ffmpeg.avcodec_send_frame(ctx, null); // flush
+
+            for (int i = 0; i < 3; i++)
+            {
+                ret = ffmpeg.avcodec_receive_packet(ctx, pkt);
+                if (ret >= 0)
+                {
+                    ffmpeg.av_packet_unref(pkt);
+                    return true;
+                }
+            }
+
+            Logger.Debug("Encoder verify: no output packet produced");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug($"Encoder verify: exception ({ex.Message})");
+            return false;
+        }
+        finally
+        {
+            if (frame != null)
+            {
+                ffmpeg.av_frame_unref(frame);
+                var tmp = frame;
+                ffmpeg.av_frame_free(&tmp);
+            }
+            if (pkt != null)
+            {
+                var tmp = pkt;
+                ffmpeg.av_packet_free(&tmp);
             }
         }
     }

@@ -36,11 +36,15 @@ public unsafe class FfmpegEncoder : IDisposable
     private readonly object _encodeLock = new();
     private bool _initialized;
     private bool _disposed;
+    private bool _decoderInitFailed;
+    private int _decodeFailCount;
     private int _width;
     private int _height;
     private long _frameCount;
     private long _pts;
     private DateTime _lastEncodeTime = DateTime.MinValue;
+    private int _framesSinceEncoderInit;
+    private readonly HashSet<string> _failedEncoders = new();
 
     // Configuration
     public string EncoderName { get; set; } = "auto";
@@ -100,7 +104,13 @@ public unsafe class FfmpegEncoder : IDisposable
                 // Decode JPEG
                 var decoded = DecodeJpeg(jpegData);
                 if (decoded == null)
+                {
+                    _decodeFailCount++;
+                    if (_decodeFailCount == 1)
+                        Logger.Log($"FfmpegEncoder: JPEG decode failed (decoderInitFailed={_decoderInitFailed})");
                     return;
+                }
+                _decodeFailCount = 0; // Reset on success
 
                 // Lazy init encoder on first successful decode (we need resolution)
                 if (!_initialized)
@@ -114,6 +124,7 @@ public unsafe class FfmpegEncoder : IDisposable
                         return;
                     }
                     _initialized = true;
+                    _framesSinceEncoderInit = 0;
                 }
 
                 // Handle resolution change
@@ -137,6 +148,7 @@ public unsafe class FfmpegEncoder : IDisposable
                 if (frameToEncode == null)
                 {
                     ffmpeg.av_frame_unref(decoded);
+                    TriggerEncoderFallback("pixel format conversion failed");
                     return;
                 }
 
@@ -153,7 +165,10 @@ public unsafe class FfmpegEncoder : IDisposable
                     if (frameToEncode != _scaledFrame)
                         ffmpeg.av_frame_unref(frameToEncode);
                     if (hwFrame == null)
+                    {
+                        TriggerEncoderFallback("hardware upload failed");
                         return;
+                    }
                     frameToEncode = hwFrame;
                 }
 
@@ -177,7 +192,10 @@ public unsafe class FfmpegEncoder : IDisposable
                 // _scaledFrame is reused across calls, don't free it
 
                 if (ret < 0)
+                {
+                    TriggerEncoderFallback($"send_frame error {ret}");
                     return;
+                }
 
                 // Receive encoded packets
                 while (true)
@@ -210,10 +228,29 @@ public unsafe class FfmpegEncoder : IDisposable
 
                 _lastEncodeTime = DateTime.UtcNow;
                 _frameCount++;
+                _framesSinceEncoderInit++;
+
+                // Detect broken encoder: if no extradata after 30 frames, the encoder
+                // is not producing output (e.g. h264_v4l2m2m on Pi 5 which has V4L2
+                // decoder devices but no encoder support). Try the next encoder.
+                if (Extradata == null && _framesSinceEncoderInit >= 30 && ActiveEncoderName != null)
+                {
+                    TriggerEncoderFallback("no output after 30 frames");
+                }
             }
             catch (Exception ex)
             {
-                Logger.Debug($"FfmpegEncoder: encode error: {ex.Message}");
+                if (ActiveEncoderName != null)
+                {
+                    TriggerEncoderFallback(ex.Message);
+                }
+                else
+                {
+                    // Exception before encoder init (e.g. FFmpeg library load failure, decoder error)
+                    _decodeFailCount++;
+                    if (_decodeFailCount == 1)
+                        Logger.Log($"FfmpegEncoder: exception before encoder init: {ex.GetType().Name}: {ex.Message}");
+                }
             }
         }
     }
@@ -226,8 +263,14 @@ public unsafe class FfmpegEncoder : IDisposable
     {
         if (_decoderCtx == null)
         {
-            if (!InitializeDecoder())
+            if (_decoderInitFailed)
                 return null;
+
+            if (!InitializeDecoder())
+            {
+                _decoderInitFailed = true;
+                return null;
+            }
         }
 
         fixed (byte* data = jpegData)
@@ -252,6 +295,9 @@ public unsafe class FfmpegEncoder : IDisposable
     /// </summary>
     private bool InitializeDecoder()
     {
+        // Ensure FFmpeg libraries are loaded before any FFmpeg calls
+        FfmpegDecoder.Initialize();
+
         var codec = ffmpeg.avcodec_find_decoder(AVCodecID.AV_CODEC_ID_MJPEG);
         if (codec == null)
         {
@@ -261,13 +307,17 @@ public unsafe class FfmpegEncoder : IDisposable
 
         _decoderCtx = ffmpeg.avcodec_alloc_context3(codec);
         if (_decoderCtx == null)
+        {
+            Logger.Log("FfmpegEncoder: failed to allocate MJPEG decoder context");
             return false;
+        }
 
         _decoderCtx->thread_count = 1;
 
         int ret = ffmpeg.avcodec_open2(_decoderCtx, codec, null);
         if (ret < 0)
         {
+            Logger.Log($"FfmpegEncoder: failed to open MJPEG decoder (error {ret})");
             fixed (AVCodecContext** ctx = &_decoderCtx)
                 ffmpeg.avcodec_free_context(ctx);
             return false;
@@ -278,10 +328,12 @@ public unsafe class FfmpegEncoder : IDisposable
 
         if (_decoderPacket == null || _decodedFrame == null)
         {
+            Logger.Log("FfmpegEncoder: failed to allocate decoder packet/frame");
             CleanupDecoder();
             return false;
         }
 
+        Logger.Log("FfmpegEncoder: MJPEG decoder initialized");
         return true;
     }
 
@@ -293,8 +345,30 @@ public unsafe class FfmpegEncoder : IDisposable
         // Ensure FFmpeg is initialized
         FfmpegDecoder.Initialize();
 
-        // Select encoder
-        var encoderInfo = FfmpegEncoderDetector.SelectBestEncoder(EncoderName);
+        // Select encoder, skipping any that previously failed to produce output
+        EncoderInfo? encoderInfo;
+        if (_failedEncoders.Count > 0)
+        {
+            var candidates = FfmpegEncoderDetector.DetectEncoders()
+                .Where(e => !_failedEncoders.Contains(e.Name))
+                .ToList();
+
+            if (!string.IsNullOrEmpty(EncoderName) && EncoderName != "auto")
+            {
+                encoderInfo = candidates.FirstOrDefault(e =>
+                    e.Name.Equals(EncoderName, StringComparison.OrdinalIgnoreCase))
+                    ?? candidates.FirstOrDefault();
+            }
+            else
+            {
+                encoderInfo = candidates.FirstOrDefault();
+            }
+        }
+        else
+        {
+            encoderInfo = FfmpegEncoderDetector.SelectBestEncoder(EncoderName);
+        }
+
         if (encoderInfo == null)
         {
             Logger.Log("FfmpegEncoder: no H.264 encoder available");
@@ -741,6 +815,25 @@ public unsafe class FfmpegEncoder : IDisposable
         }
 
         return avcc;
+    }
+
+    /// <summary>
+    /// Check if the current encoder should be considered failed and trigger fallback.
+    /// Called on every encode failure path after encoder is initialized.
+    /// </summary>
+    private void TriggerEncoderFallback(string reason)
+    {
+        _framesSinceEncoderInit++;
+        if (_framesSinceEncoderInit >= 5 && ActiveEncoderName != null)
+        {
+            Logger.Log($"FfmpegEncoder: {ActiveEncoderName} failed after {_framesSinceEncoderInit} frames ({reason}), trying next encoder");
+            _failedEncoders.Add(ActiveEncoderName);
+            CleanupEncoder();
+            _initialized = false;
+            Extradata = null;
+            ActiveEncoderName = null;
+            _pts = 0;
+        }
     }
 
     private void CleanupDecoder()

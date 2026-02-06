@@ -3,6 +3,8 @@
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
 using ACProxyCam.Models;
 using ACProxyCam.Services;
 using ACProxyCam.Services.Obico;
@@ -69,6 +71,7 @@ public class PrinterThread : IDisposable
     private DateTime _streamStartedAt = DateTime.MinValue; // When the stream started (for stabilization)
     private DateTime _lastLanModeAttempt = DateTime.MinValue; // When we last tried enabling LAN mode
     private volatile bool _streamStalled;                 // Flag for stream stall detection
+    private volatile bool _flvProxyActive;                // FLV proxy mode active (suppress external camera stop)
 
     // Watchdog settings
     private const int RetryDelayResponsive = 5;   // 5 seconds if host responds
@@ -1393,6 +1396,9 @@ public class PrinterThread : IDisposable
                     var spsHex = sps.Length >= 4 ? $"[{sps[0]:X2} {sps[1]:X2} {sps[2]:X2} {sps[3]:X2}...]" : BitConverter.ToString(sps);
                     var ppsHex = pps.Length >= 2 ? $"[{pps[0]:X2} {pps[1]:X2}...]" : BitConverter.ToString(pps);
                     LogStatus($"H.264 parameters extracted (SPS: {sps.Length}B {spsHex}, PPS: {pps.Length}B {ppsHex}, NAL size: {nalLengthSize}B)");
+
+                    // Announce FLV endpoint to h264-streamer for proxy mode
+                    _ = Task.Run(() => AnnounceFlvToStreamerAsync(ct), ct);
                 }
             }
 
@@ -1454,6 +1460,9 @@ public class PrinterThread : IDisposable
 
         // Camera keepalive: periodic startCapture to prevent frame rate throttling
         var lastCameraKeepalive = DateTime.UtcNow; // Start from now since camera was just started
+
+        // Periodic FLV re-announcement tracking
+        var lastFlvAnnounce = DateTime.MinValue;
 
         // Initial connection grace period - give decoder time to connect before checking health
         const int InitialConnectionGraceSeconds = 5;
@@ -1558,6 +1567,13 @@ public class PrinterThread : IDisposable
                         {
                             LogStatusThrottled("camera_keepalive_skip", $"Keepalive skipped: no consumers (MJPEG={mjpegClients}, H264={h264Clients}, External={hasExternal}, HLS={hasHls})");
                         }
+                    }
+
+                    // Periodic FLV re-announcement (every 30s) to handle h264-streamer restarts
+                    if ((DateTime.UtcNow - lastFlvAnnounce).TotalSeconds >= 30)
+                    {
+                        lastFlvAnnounce = DateTime.UtcNow;
+                        _ = Task.Run(() => AnnounceFlvToStreamerAsync(ct), ct);
                     }
 
                     await Task.Delay(1000, ct);
@@ -1730,6 +1746,23 @@ public class PrinterThread : IDisposable
                     LogStatus($"Failed to start Obico client: {ex.Message}");
                 }
             }, ct);
+
+            // Query LED status on first connection
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await GetLedStatusAsync(ct);
+                }
+                catch { /* Ignore errors on initial LED query */ }
+            }, ct);
+
+            // Announce FLV endpoint to h264-streamer for proxy mode
+            // (announce early so slicer can start connecting; encoder will start soon)
+            if (encoder != null)
+            {
+                _ = Task.Run(() => AnnounceFlvToStreamerAsync(ct), ct);
+            }
         };
 
         _mjpegSource.Disconnected += () =>
@@ -1758,6 +1791,18 @@ public class PrinterThread : IDisposable
             _streamStatus.FramesDecoded++;
             _lastSeenOnline = DateTime.UtcNow;
 
+            // Extract resolution from JPEG SOF marker on first frame (or when not yet set)
+            if (_streamStatus.Width == 0 && jpegData.Length > 4)
+            {
+                var (w, h) = ParseJpegResolution(jpegData);
+                if (w > 0 && h > 0)
+                {
+                    _streamStatus.Width = w;
+                    _streamStatus.Height = h;
+                    LogStatus($"MJPEG source resolution: {w}x{h}");
+                }
+            }
+
             // Push directly to MjpegServer - no decode/re-encode needed!
             _mjpegServer?.PushJpegFrame(jpegData);
 
@@ -1770,10 +1815,15 @@ public class PrinterThread : IDisposable
                 if (!encoderParamsSet && encoder.Extradata != null)
                 {
                     var (sps, pps, nalLen) = ParseAvccExtradata(encoder.Extradata);
+                    if (sps == null || pps == null)
+                        LogStatus($"Warning: failed to parse SPS/PPS from extradata ({encoder.Extradata.Length} bytes, first byte: 0x{encoder.Extradata[0]:X2})");
                     _mjpegServer?.SetH264Parameters(sps, pps, nalLen);
                     encoderParamsSet = true;
                     LogStatus($"H.264 encoder active: {encoder.ActiveEncoderName}" +
                         (encoder.IsHardwareEncoder ? " (HW)" : " (SW)"));
+
+                    // Announce FLV endpoint to h264-streamer for proxy mode
+                    _ = Task.Run(() => AnnounceFlvToStreamerAsync(ct), ct);
                 }
             }
 
@@ -1797,6 +1847,12 @@ public class PrinterThread : IDisposable
         {
             await _mjpegSource.StartAsync(ct);
 
+            // Periodic FLV re-announcement tracking
+            var lastFlvAnnounce = DateTime.MinValue;
+            // LED auto-control tracking
+            var lastLedAutoControlCheck = DateTime.MinValue;
+            const int ledAutoControlIntervalSeconds = 30;
+
             // Wait for cancellation - MjpegSourceClient handles reconnection internally
             while (!ct.IsCancellationRequested && !_isPaused)
             {
@@ -1804,6 +1860,22 @@ public class PrinterThread : IDisposable
                 if (_mjpegSource.IsConnected)
                 {
                     _lastSeenOnline = DateTime.UtcNow;
+
+                    // LED auto-control check (every 30 seconds)
+                    if (Config.LedAutoControl && (DateTime.UtcNow - lastLedAutoControlCheck).TotalSeconds >= ledAutoControlIntervalSeconds)
+                    {
+                        lastLedAutoControlCheck = DateTime.UtcNow;
+                        await ProcessLedAutoControlAsync(ct);
+                    }
+
+                    // Periodic FLV re-announcement (every 30s) to handle h264-streamer restarts
+                    // Announce even before encoder produces output — the /flv endpoint will
+                    // start streaming once encoder initializes (slicer can wait/retry)
+                    if (encoder != null && (DateTime.UtcNow - lastFlvAnnounce).TotalSeconds >= 30)
+                    {
+                        lastFlvAnnounce = DateTime.UtcNow;
+                        _ = Task.Run(() => AnnounceFlvToStreamerAsync(ct), ct);
+                    }
                 }
                 else if (_streamFailedAt == DateTime.MinValue && _streamStartedAt != DateTime.MinValue)
                 {
@@ -1930,6 +2002,11 @@ public class PrinterThread : IDisposable
     /// </summary>
     private async void OnExternalCameraStopDetected(object? sender, EventArgs e)
     {
+        // When FLV proxy is active, h264-streamer's responder subprocesses handle
+        // camera start/stop for the slicer protocol — don't interfere
+        if (_flvProxyActive)
+            return;
+
         LogStatus("External camera stop detected! Immediately restarting camera...");
 
         // Small delay to let the stop command take effect
@@ -2217,13 +2294,127 @@ public class PrinterThread : IDisposable
     /// Parse SPS and PPS NAL units from AVCC extradata format.
     /// Also extracts the NAL length size used in the stream.
     /// </summary>
+    private static (int Width, int Height) ParseJpegResolution(byte[] jpegData)
+    {
+        // Scan for SOF0 (0xFFC0) or SOF2 (0xFFC2) marker to extract dimensions
+        for (int i = 0; i < jpegData.Length - 8; i++)
+        {
+            if (jpegData[i] != 0xFF) continue;
+            byte marker = jpegData[i + 1];
+            // SOF0 (baseline), SOF1 (extended), SOF2 (progressive)
+            if (marker == 0xC0 || marker == 0xC1 || marker == 0xC2)
+            {
+                // SOF format: FF Cx LL LL PP HHHH WWWW ...
+                // Height at offset +5 (2 bytes big-endian), Width at offset +7 (2 bytes big-endian)
+                int height = (jpegData[i + 5] << 8) | jpegData[i + 6];
+                int width = (jpegData[i + 7] << 8) | jpegData[i + 8];
+                return (width, height);
+            }
+        }
+        return (0, 0);
+    }
+
     private static (byte[]? Sps, byte[]? Pps, int NalLengthSize) ParseAvccExtradata(byte[] extradata)
+    {
+        if (extradata == null || extradata.Length < 4)
+            return (null, null, 4);
+
+        // Detect format: AVCC starts with version=1, Annex B starts with 00 00 00 01 or 00 00 01
+        bool isAnnexB = (extradata.Length >= 4 && extradata[0] == 0 && extradata[1] == 0 &&
+                        (extradata[2] == 1 || (extradata[2] == 0 && extradata.Length >= 5 && extradata[3] == 1)));
+
+        if (isAnnexB)
+            return ParseAnnexBExtradata(extradata);
+
+        return ParseAvccFormatExtradata(extradata);
+    }
+
+    /// <summary>
+    /// Parse SPS/PPS from Annex B format extradata (start-code separated NAL units).
+    /// libx264 with AV_CODEC_FLAG_GLOBAL_HEADER produces this format.
+    /// </summary>
+    private static (byte[]? Sps, byte[]? Pps, int NalLengthSize) ParseAnnexBExtradata(byte[] extradata)
     {
         byte[]? spsNal = null;
         byte[]? ppsNal = null;
-        int nalLengthSize = 4; // Default to 4 bytes
 
-        if (extradata == null || extradata.Length < 8)
+        try
+        {
+            // Find NAL units by scanning for start codes (00 00 01 or 00 00 00 01)
+            var nalUnits = new List<(int offset, int length)>();
+            int i = 0;
+
+            while (i < extradata.Length)
+            {
+                int startCodeLen = 0;
+                if (i + 3 <= extradata.Length && extradata[i] == 0 && extradata[i + 1] == 0 && extradata[i + 2] == 1)
+                    startCodeLen = 3;
+                else if (i + 4 <= extradata.Length && extradata[i] == 0 && extradata[i + 1] == 0 && extradata[i + 2] == 0 && extradata[i + 3] == 1)
+                    startCodeLen = 4;
+                else
+                {
+                    i++;
+                    continue;
+                }
+
+                int nalStart = i + startCodeLen;
+
+                // Find end of this NAL (next start code or end of data)
+                int nalEnd = extradata.Length;
+                for (int j = nalStart + 1; j < extradata.Length - 2; j++)
+                {
+                    if (extradata[j] == 0 && extradata[j + 1] == 0 &&
+                        (extradata[j + 2] == 1 || (j + 3 < extradata.Length && extradata[j + 2] == 0 && extradata[j + 3] == 1)))
+                    {
+                        nalEnd = j;
+                        break;
+                    }
+                }
+
+                int nalLength = nalEnd - nalStart;
+                if (nalLength > 0)
+                    nalUnits.Add((nalStart, nalLength));
+
+                i = nalEnd;
+            }
+
+            foreach (var (offset, length) in nalUnits)
+            {
+                byte nalType = (byte)(extradata[offset] & 0x1F);
+                if (nalType == 7 && spsNal == null) // SPS
+                {
+                    spsNal = new byte[length];
+                    Array.Copy(extradata, offset, spsNal, 0, length);
+                }
+                else if (nalType == 8 && ppsNal == null) // PPS
+                {
+                    ppsNal = new byte[length];
+                    Array.Copy(extradata, offset, ppsNal, 0, length);
+                }
+            }
+
+            if (spsNal != null)
+                Logger.Debug($"Parsed Annex B extradata: SPS={spsNal.Length}b, PPS={(ppsNal?.Length ?? 0)}b");
+        }
+        catch
+        {
+            // Failed to parse Annex B extradata
+        }
+
+        return (spsNal, ppsNal, 4); // Annex B doesn't have NAL length size, default to 4
+    }
+
+    /// <summary>
+    /// Parse SPS/PPS from AVCC format extradata (AVCDecoderConfigurationRecord).
+    /// Hardware encoders (VAAPI, NVENC) and some containers produce this format.
+    /// </summary>
+    private static (byte[]? Sps, byte[]? Pps, int NalLengthSize) ParseAvccFormatExtradata(byte[] extradata)
+    {
+        byte[]? spsNal = null;
+        byte[]? ppsNal = null;
+        int nalLengthSize = 4;
+
+        if (extradata.Length < 8)
             return (null, null, nalLengthSize);
 
         try
@@ -2271,10 +2462,13 @@ public class PrinterThread : IDisposable
                     }
                 }
             }
+
+            if (spsNal != null)
+                Logger.Debug($"Parsed AVCC extradata: SPS={spsNal.Length}b, PPS={(ppsNal?.Length ?? 0)}b, nalLen={nalLengthSize}");
         }
         catch
         {
-            // Failed to parse extradata
+            // Failed to parse AVCC extradata
         }
 
         return (spsNal, ppsNal, nalLengthSize);
@@ -2381,6 +2575,75 @@ public class PrinterThread : IDisposable
 
         _sshService = null;
         _lanModeService = null;
+    }
+
+    /// <summary>
+    /// Determine the local IP address reachable from the printer.
+    /// Uses UDP socket trick: connect to printer IP and read local endpoint.
+    /// </summary>
+    private string? GetLocalIpForPrinter()
+    {
+        try
+        {
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            socket.Connect(Config.Ip, 80);
+            return (socket.LocalEndPoint as IPEndPoint)?.Address.ToString();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Announce FLV endpoint availability to h264-streamer's proxy API.
+    /// h264-streamer will proxy slicer FLV requests to ACProxyCam's /flv endpoint.
+    /// </summary>
+    private async Task AnnounceFlvToStreamerAsync(CancellationToken ct)
+    {
+        if (Config.H264StreamerControlPort <= 0)
+            return;
+
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            var baseUrl = $"http://{Config.Ip}:{Config.H264StreamerControlPort}";
+
+            // First check if proxy is enabled on h264-streamer
+            var statusResponse = await client.GetAsync($"{baseUrl}/api/acproxycam/flv", ct);
+            if (!statusResponse.IsSuccessStatusCode)
+                return;
+
+            var statusJson = await statusResponse.Content.ReadAsStringAsync(ct);
+            var statusDoc = JsonDocument.Parse(statusJson);
+            if (!statusDoc.RootElement.TryGetProperty("enabled", out var enabledProp) || !enabledProp.GetBoolean())
+            {
+                return; // Proxy not enabled on h264-streamer
+            }
+
+            // Determine our reachable IP
+            var localIp = GetLocalIpForPrinter();
+            if (localIp == null)
+            {
+                LogStatusThrottled("flv_announce", "Cannot determine local IP for FLV announcement");
+                return;
+            }
+
+            // POST announcement
+            var payload = JsonSerializer.Serialize(new { port = Config.MjpegPort, ip = localIp });
+            var content = new StringContent(payload, Encoding.UTF8, "application/json");
+            var response = await client.PostAsync($"{baseUrl}/api/acproxycam/flv", content, ct);
+
+            if (response.IsSuccessStatusCode)
+            {
+                _flvProxyActive = true;
+                LogStatusThrottled("flv_announce", $"FLV proxy announced to h264-streamer ({localIp}:{Config.MjpegPort})");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogStatusThrottled("flv_announce_error", $"FLV announcement failed: {ex.Message}");
+        }
     }
 
     private void LogStatus(string message)

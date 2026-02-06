@@ -50,8 +50,8 @@ sudo pacman -S ffmpeg
 
 ```bash
 # Download the latest release for your architecture
-wget https://github.com/mann1x/acproxycam/releases/latest/download/acproxycam-linux-arm64-v1.4.0.zip
-unzip acproxycam-linux-arm64-v1.4.0.zip
+wget https://github.com/mann1x/acproxycam/releases/latest/download/acproxycam-linux-arm64-v1.5.0.zip
+unzip acproxycam-linux-arm64-v1.5.0.zip
 chmod +x acproxycam
 
 # Run with sudo for installation
@@ -424,6 +424,16 @@ dotnet publish src/ACProxyCam/ACProxyCam.csproj -c Release -r linux-arm64 --self
 4. Convert Annex B output → AVCC format
 5. Feed AVCC packets to H.264 WebSocket, HLS, and FLV endpoints
 6. Serve all stream formats on configured port
+
+**FLV proxy mode** (offload H.264 encoding from printer):
+1. ACProxyCam encodes MJPEG→H.264 and serves `/flv` endpoint
+2. Announces `/flv` availability to h264-streamer on the printer
+3. h264-streamer proxies slicer FLV requests to ACProxyCam
+4. Slicer connects to printer port 18088 as usual, stream is transparently proxied
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for version history and release notes.
 
 ## License
 

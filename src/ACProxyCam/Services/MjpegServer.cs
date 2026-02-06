@@ -2194,6 +2194,26 @@ public class MjpegServer : IDisposable
             }
         }
 
+        /// <summary>
+        /// Check if the underlying TCP socket is still connected.
+        /// Uses Socket.Poll to detect remote disconnection even when no data is being sent.
+        /// </summary>
+        public bool IsSocketAlive()
+        {
+            if (_disposed) return false;
+            try
+            {
+                var socket = _tcpClient.Client;
+                if (socket == null || !socket.Connected) return false;
+                // Poll: if readable AND no data available, peer has disconnected
+                return !(socket.Poll(0, System.Net.Sockets.SelectMode.SelectRead) && socket.Available == 0);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         public void Dispose()
         {
             if (_disposed) return;
@@ -2463,7 +2483,7 @@ public class MjpegServer : IDisposable
         private byte[]? _ppsNal;
         private readonly int _nalLengthSize;
 
-        public bool IsConnected => !_disposed;
+        public bool IsConnected => !_disposed && _connection.IsSocketAlive();
 
         public FlvStreamClient(ClientConnection connection, FlvMuxer muxer, byte[]? spsNal, byte[]? ppsNal, int nalLengthSize = 4)
         {
@@ -2486,17 +2506,25 @@ public class MjpegServer : IDisposable
             if (!_sentKeyframe && !isKeyframe)
                 return;
 
-            // If this is a keyframe and we haven't sent decoder config yet, send it now
-            if (isKeyframe && !_muxer.HasDecoderConfig && _spsNal != null && _ppsNal != null)
+            // If we haven't sent decoder config yet, try to send it on keyframe
+            if (!_muxer.HasDecoderConfig)
             {
-                var configTag = _muxer.CreateDecoderConfigTag(_spsNal, _ppsNal);
-                lock (_sendLock)
+                if (isKeyframe && _spsNal != null && _ppsNal != null)
                 {
-                    if (!_connection.TrySend(configTag))
+                    var configTag = _muxer.CreateDecoderConfigTag(_spsNal, _ppsNal);
+                    lock (_sendLock)
                     {
-                        _disposed = true;
-                        return;
+                        if (!_connection.TrySend(configTag))
+                        {
+                            _disposed = true;
+                            return;
+                        }
                     }
+                }
+                else
+                {
+                    // Skip all video data until decoder config is sent
+                    return;
                 }
             }
 

@@ -140,6 +140,13 @@ public class H264StreamerConfig
     public long SessionId { get; set; }
 
     /// <summary>
+    /// Whether ACProxyCam FLV proxy mode is enabled on h264-streamer.
+    /// When true, h264-streamer proxies ACProxyCam's /flv endpoint instead of encoding locally.
+    /// </summary>
+    [JsonPropertyName("acproxycam_flv_proxy")]
+    public bool AcproxycamFlvProxy { get; set; } = false;
+
+    /// <summary>
     /// Check if this encoder type produces hardware H.264.
     /// rkmpi-yuyv and gkcam provide H.264, rkmpi only provides MJPEG.
     /// </summary>

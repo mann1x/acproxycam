@@ -67,7 +67,9 @@ Program.cs (Entry Point)
 2. Push JPEG frames to MjpegServer for MJPEG/snapshot endpoints
 3. If `H264EncodingEnabled`: feed frames to FfmpegEncoder → AVCC H.264 packets
 4. Push AVCC packets to MjpegServer → H.264 WebSocket, HLS, and FLV endpoints
-5. SPS/PPS extracted from encoder extradata via `ParseAvccExtradata()`
+5. SPS/PPS extracted from encoder extradata via `ParseAvccExtradata()` (handles both AVCC and Annex B formats)
+6. Once encoder is active, announce `/flv` endpoint to h264-streamer via `POST /api/acproxycam/flv`
+7. Periodic re-announcement every 30s to handle h264-streamer restarts
 
 **FLV streaming pipeline**:
 - Each `/flv` client gets a per-client `FlvMuxer` with independent timestamps
@@ -136,8 +138,9 @@ Key code in `MqttCameraController.cs`:
   sudo chmod 600 /etc/acproxycam/config.json
   ```
 - **FFmpeg**: Uses system FFmpeg libraries (`libavcodec`, `libavformat`, `libswscale`). Code in `FfmpegDecoder.cs` and `FfmpegEncoder.cs` uses unsafe C#.
-- **FfmpegEncoder**: MJPEG→H.264 encoding pipeline. Decodes JPEG via MJPEG codec, optional `sws_scale` for pixel format conversion, encodes H.264 with detected encoder. Outputs Annex B which is converted to AVCC format. Uses `AV_CODEC_FLAG_GLOBAL_HEADER` for extradata SPS/PPS.
-- **FfmpegEncoderDetector**: Probes available H.264 encoders at runtime by attempting `avcodec_open2()` with minimal params. For VAAPI, also checks `/dev/dri/renderD128` and `av_hwdevice_ctx_create()`.
+- **FfmpegEncoder**: MJPEG→H.264 encoding pipeline. Decodes JPEG via MJPEG codec, optional `sws_scale` for pixel format conversion, encodes H.264 with detected encoder. Outputs Annex B which is converted to AVCC format. Uses `AV_CODEC_FLAG_GLOBAL_HEADER` for extradata SPS/PPS. Encoder fallback: if an encoder fails (e.g. v4l2m2m on Pi 5), automatically tries the next available encoder. Must call `FfmpegDecoder.Initialize()` before any FFmpeg P/Invoke calls.
+- **FfmpegEncoderDetector**: Probes available H.264 encoders at runtime by attempting `avcodec_open2()` AND encoding a test frame. Test-frame verification catches encoders that pass open but fail on actual encoding (e.g. h264_v4l2m2m on Pi 5 which has V4L2 decoder devices but no encoder support). For VAAPI, also checks `/dev/dri/renderD128` and `av_hwdevice_ctx_create()`.
+- **ParseAvccExtradata**: Auto-detects AVCC vs Annex B format extradata. libx264 with `AV_CODEC_FLAG_GLOBAL_HEADER` produces Annex B format (`00 00 00 01` start codes), while hardware encoders produce AVCC format (AVCDecoderConfigurationRecord). Both formats are parsed to extract SPS/PPS NAL units.
 - **FlvMuxer**: Converts AVCC H.264 packets to FLV container format. Creates FLV header, AMF0 metadata, AVC decoder config from SPS/PPS, and video tags. Filters SPS/PPS NALs (types 7,8) from video tags.
 - **Threading**: One thread per printer (`PrinterThread`). Thread-safe operations use explicit `lock()` on object monitors. State fields marked `volatile`.
 - **IPC**: Unix socket at `/run/acproxycam/acproxycam.sock` for daemon-CLI communication.
