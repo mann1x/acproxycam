@@ -28,7 +28,7 @@ public class DaemonService
     {
         // Initialize file logging
         Logger.Initialize("/var/log/acproxycam");
-        Logger.Log("ACProxyCam daemon starting...");
+        Logger.Log($"ACProxyCam v{Program.Version} starting...");
 
         // Set up signal handlers for graceful shutdown
         SetupSignalHandlers();

@@ -95,6 +95,13 @@ public class ManagementCli
             return 1;
         }
 
+        // Check for version mismatch between CLI and daemon
+        var (statusOk, daemonStatus, _) = await _ipcClient.GetStatusAsync();
+        if (statusOk && daemonStatus?.Version != null && daemonStatus.Version != Program.Version)
+        {
+            _ui.WriteWarning($"Version mismatch: CLI is v{Program.Version}, daemon is v{daemonStatus.Version}");
+        }
+
         // Enter management loop
         return await ManagementLoopAsync();
     }
