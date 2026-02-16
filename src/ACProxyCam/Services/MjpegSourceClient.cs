@@ -190,32 +190,30 @@ public class MjpegSourceClient : IDisposable
         var buffer = new byte[256 * 1024]; // 256KB buffer
         var frameBuffer = new MemoryStream();
 
-        // State machine for parsing
-        var readingHeaders = true;
+        // State machine for parsing multipart MJPEG
+        // Format: \r\n--boundary\r\n Headers \r\n\r\n [binary body] \r\n--boundary\r\n ...
+        var sawBoundary = false;
         var contentLength = -1;
 
         while (!ct.IsCancellationRequested)
         {
-            // Read a line or chunk of data
+            // Read headers line by line (text mode)
             var line = await ReadLineAsync(stream, ct);
             if (line == null)
-            {
-                // End of stream
                 break;
+
+            // Check for boundary
+            if (line.StartsWith("--") && line.Contains(boundary))
+            {
+                sawBoundary = true;
+                contentLength = -1;
+                frameBuffer.SetLength(0);
+                continue;
             }
 
-            if (readingHeaders)
+            // Parse headers (only after we've seen a boundary)
+            if (sawBoundary)
             {
-                // Check for boundary
-                if (line.StartsWith("--") && line.Contains(boundary))
-                {
-                    // Start of new part
-                    frameBuffer.SetLength(0);
-                    contentLength = -1;
-                    continue;
-                }
-
-                // Check for Content-Length header
                 if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
                 {
                     var lengthStr = line.Substring(15).Trim();
@@ -223,84 +221,53 @@ public class MjpegSourceClient : IDisposable
                     continue;
                 }
 
-                // Check for Content-Type header (skip it)
                 if (line.StartsWith("Content-Type:", StringComparison.OrdinalIgnoreCase))
-                {
                     continue;
-                }
 
-                // Empty line indicates end of headers
+                // Empty line after boundary+headers = end of headers, start of body
                 if (string.IsNullOrWhiteSpace(line))
                 {
-                    readingHeaders = false;
-                    continue;
-                }
-            }
-            else
-            {
-                // Reading frame data
-                if (contentLength > 0)
-                {
-                    // Read exact content length
-                    var frameData = new byte[contentLength];
-                    var totalRead = 0;
-
-                    while (totalRead < contentLength)
+                    if (contentLength > 0)
                     {
-                        var bytesRead = await stream.ReadAsync(
-                            frameData.AsMemory(totalRead, contentLength - totalRead),
-                            ct);
+                        // Read exact body bytes directly (binary, not line-by-line)
+                        var frameData = new byte[contentLength];
+                        var totalRead = 0;
 
-                        if (bytesRead == 0)
-                            break;
+                        while (totalRead < contentLength)
+                        {
+                            var bytesRead = await stream.ReadAsync(
+                                frameData.AsMemory(totalRead, contentLength - totalRead),
+                                ct);
 
-                        totalRead += bytesRead;
-                    }
+                            if (bytesRead == 0)
+                                break;
 
-                    if (totalRead == contentLength)
-                    {
-                        // Complete frame received
-                        ProcessFrame(frameData);
-                        fpsFrameCount++;
-                    }
+                            totalRead += bytesRead;
+                        }
 
-                    readingHeaders = true;
-                }
-                else
-                {
-                    // No Content-Length, look for JPEG markers or next boundary
-                    // This is less efficient but handles servers that don't send Content-Length
-                    var lineBytes = Encoding.ASCII.GetBytes(line);
-
-                    // Check for JPEG start marker in line
-                    if (lineBytes.Length >= 2 && lineBytes[0] == 0xFF && lineBytes[1] == 0xD8)
-                    {
-                        frameBuffer.SetLength(0);
-                        frameBuffer.Write(lineBytes, 0, lineBytes.Length);
-                    }
-                    else if (frameBuffer.Length > 0)
-                    {
-                        // Check for JPEG end marker
-                        frameBuffer.Write(lineBytes, 0, lineBytes.Length);
-
-                        var frameData = frameBuffer.ToArray();
-                        if (IsCompleteJpeg(frameData))
+                        if (totalRead == contentLength)
                         {
                             ProcessFrame(frameData);
                             fpsFrameCount++;
-                            frameBuffer.SetLength(0);
-                            readingHeaders = true;
                         }
                     }
-                }
 
-                // Update FPS every second
-                if (fpsStopwatch.ElapsedMilliseconds >= 1000)
-                {
-                    MeasuredFps = fpsFrameCount * 1000.0 / fpsStopwatch.ElapsedMilliseconds;
-                    fpsFrameCount = 0;
-                    fpsStopwatch.Restart();
+                    // Reset for next part
+                    sawBoundary = false;
+                    contentLength = -1;
                 }
+                continue;
+            }
+
+            // Fallback: not inside a boundary part, ignore line
+            // (handles separator CRLFs between parts)
+
+            // Update FPS every second
+            if (fpsStopwatch.ElapsedMilliseconds >= 1000)
+            {
+                MeasuredFps = fpsFrameCount * 1000.0 / fpsStopwatch.ElapsedMilliseconds;
+                fpsFrameCount = 0;
+                fpsStopwatch.Restart();
             }
         }
     }

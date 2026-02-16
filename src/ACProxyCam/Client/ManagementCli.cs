@@ -1594,12 +1594,22 @@ WantedBy=multi-user.target
                 _ui.WriteLine("    2. Encode MJPEG→H.264 on this server (FFmpeg)");
                 _ui.WriteLine("    3. MJPEG only (no H.264/HLS - lower CPU usage)");
 
-                var h264SourceChoices = new List<string>
-                {
-                    "Proxy native H.264 + MJPEG (recommended)",
-                    "Encode MJPEG→H.264 on this server (FFmpeg)",
-                    "MJPEG only (disable H.264/HLS)"
-                };
+                // When acproxycam_flv_proxy is enabled, rkmpi runs with --no-flv so :18088/flv
+                // is h264-streamer's proxy, not native H.264. Recommend encoding instead.
+                var flvProxyEnabled = preflightResult.StreamerConfig!.AcproxycamFlvProxy;
+                var h264SourceChoices = flvProxyEnabled
+                    ? new List<string>
+                    {
+                        "Encode MJPEG→H.264 on this server (FFmpeg) (recommended)",
+                        "Proxy native H.264 + MJPEG",
+                        "MJPEG only (disable H.264/HLS)"
+                    }
+                    : new List<string>
+                    {
+                        "Proxy native H.264 + MJPEG (recommended)",
+                        "Encode MJPEG→H.264 on this server (FFmpeg)",
+                        "MJPEG only (disable H.264/HLS)"
+                    };
                 var h264Choice = _ui.SelectOne("Output mode:", h264SourceChoices);
 
                 if (h264Choice.Contains("MJPEG only"))
@@ -2042,12 +2052,22 @@ WantedBy=multi-user.target
                     : "Proxy native H.264 + MJPEG";
                 _ui.WriteLine($"  Current: {currentMode}");
 
-                var h264SourceChoices = new List<string>
-                {
-                    "Proxy native H.264 + MJPEG (recommended)",
-                    "Encode MJPEG→H.264 on this server (FFmpeg)",
-                    "MJPEG only (disable H.264/HLS)"
-                };
+                // When acproxycam_flv_proxy is enabled, rkmpi runs with --no-flv so :18088/flv
+                // is h264-streamer's proxy, not native H.264. Recommend encoding instead.
+                var flvProxyEnabled = preflightResult?.StreamerConfig?.AcproxycamFlvProxy == true;
+                var h264SourceChoices = flvProxyEnabled
+                    ? new List<string>
+                    {
+                        "Encode MJPEG→H.264 on this server (FFmpeg) (recommended)",
+                        "Proxy native H.264 + MJPEG",
+                        "MJPEG only (disable H.264/HLS)"
+                    }
+                    : new List<string>
+                    {
+                        "Proxy native H.264 + MJPEG (recommended)",
+                        "Encode MJPEG→H.264 on this server (FFmpeg)",
+                        "MJPEG only (disable H.264/HLS)"
+                    };
                 var h264Choice = _ui.SelectOne("Output mode:", h264SourceChoices);
 
                 if (h264Choice.Contains("MJPEG only"))

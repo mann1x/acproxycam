@@ -303,20 +303,24 @@ public class MjpegServer : IDisposable
             _lastKeyframeIsJpeg = true;
         }
 
-        // Measure input FPS
-        if (_inputFpsWindowStart == DateTime.MinValue)
+        // Measure input FPS (only when no H.264 encoding active, to avoid double-counting
+        // since PushH264Packet also increments the same counter)
+        if (_h264PacketCount == 0)
         {
-            _inputFpsWindowStart = now;
-            _inputFpsFrameCount = 0;
-        }
-        _inputFpsFrameCount++;
+            if (_inputFpsWindowStart == DateTime.MinValue)
+            {
+                _inputFpsWindowStart = now;
+                _inputFpsFrameCount = 0;
+            }
+            _inputFpsFrameCount++;
 
-        var windowElapsed = (now - _inputFpsWindowStart).TotalMilliseconds;
-        if (windowElapsed >= InputFpsWindowMs)
-        {
-            _measuredInputFps = (int)Math.Round(_inputFpsFrameCount * 1000.0 / windowElapsed);
-            _inputFpsWindowStart = now;
-            _inputFpsFrameCount = 0;
+            var windowElapsed = (now - _inputFpsWindowStart).TotalMilliseconds;
+            if (windowElapsed >= InputFpsWindowMs)
+            {
+                _measuredInputFps = (int)Math.Round(_inputFpsFrameCount * 1000.0 / windowElapsed);
+                _inputFpsWindowStart = now;
+                _inputFpsFrameCount = 0;
+            }
         }
 
         // Send to all MJPEG streaming clients

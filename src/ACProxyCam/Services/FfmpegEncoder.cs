@@ -41,8 +41,8 @@ public unsafe class FfmpegEncoder : IDisposable
     private int _width;
     private int _height;
     private long _frameCount;
-    private long _pts;
     private DateTime _lastEncodeTime = DateTime.MinValue;
+    private DateTime _firstFrameTime = DateTime.MinValue;
     private int _framesSinceEncoderInit;
     private readonly HashSet<string> _failedEncoders = new();
 
@@ -54,6 +54,7 @@ public unsafe class FfmpegEncoder : IDisposable
     public string Preset { get; set; } = "medium";
     public string Profile { get; set; } = "main";
     public int MaxFps { get; set; } = 0; // 0 = no limit
+    public int InputFps { get; set; } = 0; // measured input FPS (0 = not yet known, defer init)
 
     /// <summary>
     /// AVCC-format extradata containing SPS/PPS.
@@ -101,6 +102,15 @@ public unsafe class FfmpegEncoder : IDisposable
 
             try
             {
+                // Validate JPEG framing
+                if (_frameCount < 100 || _frameCount % 100 == 0)
+                {
+                    bool hasSOI = jpegData.Length >= 2 && jpegData[0] == 0xFF && jpegData[1] == 0xD8;
+                    bool hasEOI = jpegData.Length >= 2 && jpegData[^2] == 0xFF && jpegData[^1] == 0xD9;
+                    if (!hasSOI || !hasEOI)
+                        Logger.Log($"FfmpegEncoder: JPEG frame #{_frameCount} invalid: SOI={hasSOI} EOI={hasEOI} len={jpegData.Length} first=[{jpegData[0]:X2} {jpegData[1]:X2}] last=[{jpegData[^2]:X2} {jpegData[^1]:X2}]");
+                }
+
                 // Decode JPEG
                 var decoded = DecodeJpeg(jpegData);
                 if (decoded == null)
@@ -112,11 +122,19 @@ public unsafe class FfmpegEncoder : IDisposable
                 }
                 _decodeFailCount = 0; // Reset on success
 
-                // Lazy init encoder on first successful decode (we need resolution)
+                // Lazy init encoder on first successful decode (we need resolution + input FPS)
                 if (!_initialized)
                 {
                     _width = decoded->width;
                     _height = decoded->height;
+
+                    // Defer encoder init until we have a measured input FPS.
+                    // InputFps is updated by PrinterThread from MjpegServer.MeasuredInputFps.
+                    if (InputFps <= 0)
+                    {
+                        ffmpeg.av_frame_unref(decoded);
+                        return; // wait for FPS measurement
+                    }
 
                     if (!InitializeEncoder())
                     {
@@ -172,8 +190,11 @@ public unsafe class FfmpegEncoder : IDisposable
                     frameToEncode = hwFrame;
                 }
 
-                // Set PTS
-                frameToEncode->pts = _pts++;
+                // Set PTS using wall-clock time (millisecond timebase)
+                var now = DateTime.UtcNow;
+                if (_firstFrameTime == DateTime.MinValue)
+                    _firstFrameTime = now;
+                frameToEncode->pts = (long)(now - _firstFrameTime).TotalMilliseconds;
                 frameToEncode->pict_type = AVPictureType.AV_PICTURE_TYPE_NONE;
 
                 // Encode
@@ -390,10 +411,14 @@ public unsafe class FfmpegEncoder : IDisposable
         // Base encoder configuration
         _encoderCtx->width = _width;
         _encoderCtx->height = _height;
-        _encoderCtx->time_base = new AVRational { num = 1, den = 30 };
-        _encoderCtx->framerate = new AVRational { num = 30, den = 1 };
+        _encoderCtx->time_base = new AVRational { num = 1, den = 1000 };
+        // Framerate hint for rate control — must match actual input FPS for correct bit budgeting.
+        // Actual frame timing is driven by wall-clock PTS, this only affects rate control.
+        var fpsHint = InputFps > 0 ? InputFps : 30; // fallback 30 if not yet measured
+        _encoderCtx->framerate = new AVRational { num = fpsHint, den = 1 };
         _encoderCtx->gop_size = GopSize;
         _encoderCtx->max_b_frames = 0;
+        _encoderCtx->thread_count = 0; // auto
         _encoderCtx->flags |= ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER;
 
         // Rate control
@@ -477,7 +502,7 @@ public unsafe class FfmpegEncoder : IDisposable
         }
 
         Logger.Log($"FfmpegEncoder: initialized {encoderInfo.Name} at {_width}x{_height}, " +
-            $"{Bitrate}kbps {RateControl}, GOP={GopSize}");
+            $"{Bitrate}kbps {RateControl}, GOP={GopSize}, fps_hint={fpsHint}, threads={_encoderCtx->thread_count}");
 
         return true;
     }
@@ -487,14 +512,23 @@ public unsafe class FfmpegEncoder : IDisposable
     /// </summary>
     private bool ConfigureLibx264(AVDictionary** opts)
     {
+        // YUV420P: the slicer's decoder assumes limited range, so signaling full range
+        // (YUVJ420P) causes dark video. Keep YUV420P — technically mislabeled for MJPEG
+        // full-range source, but displays correctly in all known consumers.
         _encoderCtx->pix_fmt = AVPixelFormat.AV_PIX_FMT_YUV420P;
 
         // Preset (ultrafast recommended for software encoding on low-power hardware)
         var preset = string.IsNullOrEmpty(Preset) ? "medium" : Preset;
         ffmpeg.av_dict_set(opts, "preset", preset, 0);
 
-        // Always use zerolatency tune for streaming
-        ffmpeg.av_dict_set(opts, "tune", "zerolatency", 0);
+        // Low-latency streaming without sliced-threads (which causes horizontal tearing).
+        // zerolatency tune enables sliced-threads that split each frame into independent
+        // horizontal slices — during fast motion, slice boundaries become visible artifacts.
+        // Instead, set the individual low-latency options we need:
+        // - rc-lookahead=0: no rate control lookahead (low latency)
+        // - sync-lookahead=0: no sync lookahead
+        // max_b_frames=0 is already set on the codec context (no frame reordering)
+        ffmpeg.av_dict_set(opts, "x264-params", "rc-lookahead=0:sync-lookahead=0", 0);
 
         // Profile
         var profile = string.IsNullOrEmpty(Profile) ? "main" : Profile;
@@ -613,19 +647,10 @@ public unsafe class FfmpegEncoder : IDisposable
             targetFmt = AVPixelFormat.AV_PIX_FMT_NV12;
         }
 
-        // libx264 accepts YUVJ420P directly (it's functionally identical to YUV420P)
-        if (ActiveEncoderName == "libx264" &&
-            (decoded->format == (int)AVPixelFormat.AV_PIX_FMT_YUVJ420P ||
-             decoded->format == (int)AVPixelFormat.AV_PIX_FMT_YUV420P))
-        {
-            // Set color range to full for YUVJ420P
-            decoded->color_range = AVColorRange.AVCOL_RANGE_JPEG;
-            return decoded;
-        }
-
-        // Check if conversion is actually needed
-        if (decoded->format == (int)targetFmt)
-            return decoded;
+        // Always convert through sws_scale to ensure the encoder gets its own
+        // independent pixel buffer copy. Passing the decoder's frame directly
+        // can cause tearing if the encoder's internal threading references
+        // the buffer while the next frame is being decoded.
 
         // Setup scaler if needed or if dimensions changed
         if (_swsContext == null || _scaledFrame == null)
@@ -832,7 +857,7 @@ public unsafe class FfmpegEncoder : IDisposable
             _initialized = false;
             Extradata = null;
             ActiveEncoderName = null;
-            _pts = 0;
+            _firstFrameTime = DateTime.MinValue;
         }
     }
 
@@ -907,7 +932,7 @@ public unsafe class FfmpegEncoder : IDisposable
         Extradata = null;
         ActiveEncoderName = null;
         IsHardwareEncoder = false;
-        _pts = 0;
+        _firstFrameTime = DateTime.MinValue;
         _frameCount = 0;
     }
 

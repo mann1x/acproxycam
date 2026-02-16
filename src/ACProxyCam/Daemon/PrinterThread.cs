@@ -204,8 +204,13 @@ public class PrinterThread : IDisposable
             var hlsActive = _mjpegServer?.HasHlsActivity == true;
 
             // Measure FPS based on video source mode
+            // When H.264 encoding is active, MjpegServer.MeasuredInputFps measures the
+            // H.264 output rate (from PushH264Packet), which reflects MaxFps limiting.
+            // MjpegSourceClient.MeasuredFps always shows the source MJPEG input rate.
             var measuredFps = Config.VideoSource?.ToLowerInvariant() == "mjpeg"
-                ? _mjpegSource?.MeasuredFps ?? _mjpegServer?.MeasuredInputFps ?? 0
+                ? (Config.H264EncodingEnabled
+                    ? _mjpegServer?.MeasuredInputFps ?? _mjpegSource?.MeasuredFps ?? 0
+                    : _mjpegSource?.MeasuredFps ?? _mjpegServer?.MeasuredInputFps ?? 0)
                 : _decoder?.MeasuredFps ?? _mjpegServer?.MeasuredInputFps ?? 0;
 
             return new PrinterStatus
@@ -1854,6 +1859,11 @@ public class PrinterThread : IDisposable
             // Feed encoder if H.264 encoding is enabled
             if (encoder != null)
             {
+                // Update encoder's input FPS hint from measured value so rate control
+                // budgets bits correctly. The encoder defers init until this is > 0.
+                if (_mjpegServer != null && _mjpegServer.MeasuredInputFps > 0)
+                    encoder.InputFps = _mjpegServer.MeasuredInputFps;
+
                 encoder.PushJpegFrame(jpegData);
 
                 // Extract SPS/PPS on first successful encode
