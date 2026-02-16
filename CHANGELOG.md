@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+### [1.6.0] - 2026-02-16
+
+#### Added
+- **Vanilla-klipper mode** — full support for Klipper without Anycubic firmware (no MQTT/SSH required)
+  - Auto-detected from h264-streamer `/api/config` mode field
+  - SSH credential retrieval and MQTT connection completely skipped
+  - Configurable Moonraker host and port (supports Moonraker running on a different host)
+  - MJPEG streaming via h264-streamer, Obico integration via Moonraker
+  - CLI Add/Modify printer flows adapt automatically (skip MQTT/SSH/LAN/LED questions)
+  - Pre-flight checks skip SSH and MQTT port verification in vanilla-klipper mode
+
+#### Fixed
+- rkmpi output mode recommendation now correctly checks both `h264_enabled` and `acproxycam_flv_proxy` from h264-streamer config — previously defaulted to "Proxy native H.264" even when H.264 was disabled on the printer
+- Modify Printer now always fetches fresh h264-streamer config for rkmpi output mode recommendation, even when video source wasn't changed
+
 ### [1.5.1] - 2026-02-16
 
 #### Fixed

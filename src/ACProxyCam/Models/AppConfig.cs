@@ -323,6 +323,27 @@ public class PrinterConfig
     public const string ObicoCloudUrl = "https://app.obico.io";
 
     /// <summary>
+    /// Whether this printer runs in vanilla-klipper mode (no Anycubic firmware/MQTT).
+    /// Auto-detected from h264-streamer /api/config mode field.
+    /// When true, SSH credential retrieval and MQTT are completely skipped.
+    /// </summary>
+    [JsonPropertyName("vanillaKlipperMode")]
+    public bool VanillaKlipperMode { get; set; } = false;
+
+    /// <summary>
+    /// Moonraker host override. Empty = use printer IP.
+    /// Needed for vanilla-klipper where Moonraker may run on a different host.
+    /// </summary>
+    [JsonPropertyName("moonrakerHost")]
+    public string MoonrakerHost { get; set; } = "";
+
+    /// <summary>
+    /// Moonraker port override. 0 = use Firmware.MoonrakerPort (default 7125).
+    /// </summary>
+    [JsonPropertyName("moonrakerPort")]
+    public int MoonrakerPort { get; set; } = 0;
+
+    /// <summary>
     /// Detected firmware information (auto-populated via SSH).
     /// </summary>
     [JsonPropertyName("firmware")]

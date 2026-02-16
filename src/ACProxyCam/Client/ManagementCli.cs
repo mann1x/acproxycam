@@ -1395,38 +1395,73 @@ WantedBy=multi-user.target
         var httpPort = await AskPortWithRetryAsync("Listen HTTP Port for proxy:", 8080, name);
         if (httpPort == null) return;
 
-        // SSH settings
-        var sshPort = AskValidatedPort("SSH port:", 22);
-        if (sshPort == null) return;
-
-        var sshUser = AskValidatedString("SSH username:", ValidateUsername, "root");
-        if (sshUser == null) return;
-
-        var sshPassword = _ui.AskSecret("SSH password:", "rockchip");
-
-        // MQTT settings
-        var mqttPort = AskValidatedPort("MQTT port:", 9883);
-        if (mqttPort == null) return;
-
-        // Auto LAN Mode setting
-        var autoLanMode = _ui.Confirm("Auto LAN Mode (enable LAN mode on printer if MQTT fails)?", true);
-
-        // LED settings
-        _ui.WriteLine();
-        _ui.WriteInfo("LED settings:");
-        var ledAutoControl = _ui.Confirm("LED Auto Control (automatically manage camera LED)?", false);
-        var standbyLedTimeout = 20;
-        if (ledAutoControl)
-        {
-            standbyLedTimeout = AskValidatedInt("Standby LED timeout (minutes):", 1, 1440, 20);
-        }
-
-        // Video source detection and configuration
+        // Detect h264-streamer first to check for vanilla-klipper mode
         _ui.WriteLine();
         _ui.WriteInfo("Detecting h264-streamer...");
 
         var preflightChecker = new PrinterPreflightChecker();
         var preflightResult = await preflightChecker.CheckAsync(ip);
+
+        var isVanillaKlipper = preflightResult.StreamerConfig?.IsVanillaKlipper == true;
+
+        // SSH/MQTT/LAN settings - skip for vanilla-klipper
+        int? sshPort;
+        var sshUser = "root";
+        var sshPassword = "";
+        int? mqttPort;
+        var autoLanMode = false;
+        var vanillaKlipperMode = false;
+        var moonrakerHost = "";
+        var moonrakerPortOverride = 0;
+
+        if (isVanillaKlipper)
+        {
+            _ui.WriteSuccess("Vanilla-klipper mode detected - MQTT/SSH not available");
+            _ui.WriteInfo("  Only MJPEG streaming via h264-streamer is available.");
+            _ui.WriteLine();
+
+            // Set defaults - SSH/MQTT not used
+            sshPort = 22;
+            mqttPort = 0;
+            vanillaKlipperMode = true;
+
+            // Moonraker host/port
+            var defaultMoonrakerHost = ip;
+            moonrakerHost = AskValidatedString($"Moonraker host (IP or hostname) [{defaultMoonrakerHost}]:",
+                ValidateIpAddress, defaultMoonrakerHost) ?? defaultMoonrakerHost;
+            moonrakerPortOverride = AskValidatedInt("Moonraker port:", 1, 65535, 7125);
+        }
+        else
+        {
+            // Standard mode - SSH/MQTT settings
+            sshPort = AskValidatedPort("SSH port:", 22);
+            if (sshPort == null) return;
+
+            var sshUserInput = AskValidatedString("SSH username:", ValidateUsername, "root");
+            if (sshUserInput == null) return;
+            sshUser = sshUserInput;
+
+            sshPassword = _ui.AskSecret("SSH password:", "rockchip");
+
+            mqttPort = AskValidatedPort("MQTT port:", 9883);
+            if (mqttPort == null) return;
+
+            autoLanMode = _ui.Confirm("Auto LAN Mode (enable LAN mode on printer if MQTT fails)?", true);
+        }
+
+        // LED settings (skip for vanilla-klipper - no MQTT to control LED)
+        var ledAutoControl = false;
+        var standbyLedTimeout = 20;
+        if (!isVanillaKlipper)
+        {
+            _ui.WriteLine();
+            _ui.WriteInfo("LED settings:");
+            ledAutoControl = _ui.Confirm("LED Auto Control (automatically manage camera LED)?", false);
+            if (ledAutoControl)
+            {
+                standbyLedTimeout = AskValidatedInt("Standby LED timeout (minutes):", 1, 1440, 20);
+            }
+        }
 
         // Video source settings
         var videoSource = "h264";
@@ -1436,7 +1471,17 @@ WantedBy=multi-user.target
         string? mjpegStreamUrl = null;
         string? snapshotUrl = null;
 
-        if (preflightResult.H264StreamerDetected && preflightResult.StreamerConfig != null)
+        if (isVanillaKlipper && preflightResult.H264StreamerDetected && preflightResult.StreamerConfig != null)
+        {
+            // Vanilla-klipper: force MJPEG (no MQTT to start native camera)
+            var config_detected = preflightResult.StreamerConfig;
+            h264StreamerControlPort = preflightResult.ControlPort;
+            h264StreamerStreamingPort = config_detected.StreamingPort;
+            h264StreamerEncoderType = config_detected.EncoderType;
+            videoSource = "mjpeg";
+            _ui.WriteInfo($"Video source: MJPEG from h264-streamer (:{h264StreamerStreamingPort})");
+        }
+        else if (preflightResult.H264StreamerDetected && preflightResult.StreamerConfig != null)
         {
             var config_detected = preflightResult.StreamerConfig;
             h264StreamerControlPort = preflightResult.ControlPort;
@@ -1594,10 +1639,12 @@ WantedBy=multi-user.target
                 _ui.WriteLine("    2. Encode MJPEG→H.264 on this server (FFmpeg)");
                 _ui.WriteLine("    3. MJPEG only (no H.264/HLS - lower CPU usage)");
 
-                // When acproxycam_flv_proxy is enabled, rkmpi runs with --no-flv so :18088/flv
-                // is h264-streamer's proxy, not native H.264. Recommend encoding instead.
+                // Recommend encoding when FLV proxy is enabled or H.264 is not available on printer
                 var flvProxyEnabled = preflightResult.StreamerConfig!.AcproxycamFlvProxy;
-                var h264SourceChoices = flvProxyEnabled
+                var h264Available = preflightResult.StreamerConfig!.H264Enabled;
+                var recommendEncoding = flvProxyEnabled || !h264Available;
+
+                var h264SourceChoices = recommendEncoding
                     ? new List<string>
                     {
                         "Encode MJPEG→H.264 on this server (FFmpeg) (recommended)",
@@ -1708,6 +1755,9 @@ WantedBy=multi-user.target
             SshPassword = sshPassword,
             MqttPort = mqttPort.Value,
             AutoLanMode = autoLanMode,
+            VanillaKlipperMode = vanillaKlipperMode,
+            MoonrakerHost = moonrakerHost,
+            MoonrakerPort = moonrakerPortOverride,
             LedAutoControl = ledAutoControl,
             StandbyLedTimeoutMinutes = standbyLedTimeout,
             VideoSource = videoSource,
@@ -1878,17 +1928,44 @@ WantedBy=multi-user.target
         var httpPort = await AskPortWithRetryAsync($"Listen HTTP Port for proxy [{existingConfig.MjpegPort}]:", existingConfig.MjpegPort, originalName, originalPort);
         if (httpPort == null) return;
 
-        var sshPort = AskValidatedPort($"SSH port [{existingConfig.SshPort}]:", existingConfig.SshPort);
-        if (sshPort == null) return;
+        // Detect vanilla-klipper from existing config
+        var isVanillaKlipper = existingConfig.VanillaKlipperMode;
 
-        var sshUser = AskValidatedString($"SSH user [{existingConfig.SshUser}]:", ValidateUsername, existingConfig.SshUser);
-        if (sshUser == null) return;
+        int? sshPort;
+        var sshUser = existingConfig.SshUser;
+        int? mqttPort;
+        var autoLanMode = existingConfig.AutoLanMode;
+        var moonrakerHost = existingConfig.MoonrakerHost;
+        var moonrakerPortOverride = existingConfig.MoonrakerPort;
 
-        var mqttPort = AskValidatedPort($"MQTT port [{existingConfig.MqttPort}]:", existingConfig.MqttPort);
-        if (mqttPort == null) return;
+        if (isVanillaKlipper)
+        {
+            _ui.WriteInfo("Vanilla-klipper mode: SSH/MQTT not available");
+            sshPort = existingConfig.SshPort;
+            mqttPort = 0;
 
-        // Auto LAN Mode setting
-        var autoLanMode = _ui.Confirm($"Auto LAN Mode [{(existingConfig.AutoLanMode ? "Yes" : "No")}]?", existingConfig.AutoLanMode);
+            // Moonraker host/port
+            var defaultMoonrakerHost = !string.IsNullOrEmpty(existingConfig.MoonrakerHost) ? existingConfig.MoonrakerHost : ip;
+            moonrakerHost = AskValidatedString($"Moonraker host [{defaultMoonrakerHost}]:",
+                ValidateIpAddress, defaultMoonrakerHost) ?? defaultMoonrakerHost;
+            moonrakerPortOverride = AskValidatedInt($"Moonraker port [{existingConfig.MoonrakerPort}]:",
+                1, 65535, existingConfig.MoonrakerPort > 0 ? existingConfig.MoonrakerPort : 7125);
+        }
+        else
+        {
+            sshPort = AskValidatedPort($"SSH port [{existingConfig.SshPort}]:", existingConfig.SshPort);
+            if (sshPort == null) return;
+
+            var sshUserInput = AskValidatedString($"SSH user [{existingConfig.SshUser}]:", ValidateUsername, existingConfig.SshUser);
+            if (sshUserInput == null) return;
+            sshUser = sshUserInput;
+
+            mqttPort = AskValidatedPort($"MQTT port [{existingConfig.MqttPort}]:", existingConfig.MqttPort);
+            if (mqttPort == null) return;
+
+            // Auto LAN Mode setting
+            autoLanMode = _ui.Confirm($"Auto LAN Mode [{(existingConfig.AutoLanMode ? "Yes" : "No")}]?", existingConfig.AutoLanMode);
+        }
 
         // Video source configuration
         _ui.WriteLine();
@@ -2001,14 +2078,18 @@ WantedBy=multi-user.target
             }
         }
 
-        // LED settings
-        _ui.WriteLine();
-        _ui.WriteInfo("LED settings:");
-        var ledAutoControl = _ui.Confirm($"LED Auto Control [{(existingConfig.LedAutoControl ? "Yes" : "No")}]?", existingConfig.LedAutoControl);
+        // LED settings (skip for vanilla-klipper - no MQTT to control LED)
+        var ledAutoControl = existingConfig.LedAutoControl;
         var standbyLedTimeout = existingConfig.StandbyLedTimeoutMinutes;
-        if (ledAutoControl)
+        if (!isVanillaKlipper)
         {
-            standbyLedTimeout = AskValidatedInt($"Standby LED timeout (minutes) [{existingConfig.StandbyLedTimeoutMinutes}]:", 1, 1440, existingConfig.StandbyLedTimeoutMinutes);
+            _ui.WriteLine();
+            _ui.WriteInfo("LED settings:");
+            ledAutoControl = _ui.Confirm($"LED Auto Control [{(existingConfig.LedAutoControl ? "Yes" : "No")}]?", existingConfig.LedAutoControl);
+            if (ledAutoControl)
+            {
+                standbyLedTimeout = AskValidatedInt($"Standby LED timeout (minutes) [{existingConfig.StandbyLedTimeoutMinutes}]:", 1, 1440, existingConfig.StandbyLedTimeoutMinutes);
+            }
         }
 
         // Output endpoint settings
@@ -2052,10 +2133,20 @@ WantedBy=multi-user.target
                     : "Proxy native H.264 + MJPEG";
                 _ui.WriteLine($"  Current: {currentMode}");
 
-                // When acproxycam_flv_proxy is enabled, rkmpi runs with --no-flv so :18088/flv
-                // is h264-streamer's proxy, not native H.264. Recommend encoding instead.
-                var flvProxyEnabled = preflightResult?.StreamerConfig?.AcproxycamFlvProxy == true;
-                var h264SourceChoices = flvProxyEnabled
+                // Ensure we have current streamer config for rkmpi recommendation
+                H264StreamerConfig? currentStreamerConfig = preflightResult?.StreamerConfig;
+                if (currentStreamerConfig == null && h264StreamerControlPort > 0)
+                {
+                    var preflight = new PrinterPreflightChecker();
+                    currentStreamerConfig = await preflight.TryGetStreamerConfigAsync(ip, h264StreamerControlPort);
+                }
+
+                // Recommend encoding when FLV proxy is enabled or H.264 is not available on printer
+                var flvProxyEnabled = currentStreamerConfig?.AcproxycamFlvProxy == true;
+                var h264Available = currentStreamerConfig?.H264Enabled == true;
+                var recommendEncoding = flvProxyEnabled || !h264Available;
+
+                var h264SourceChoices = recommendEncoding
                     ? new List<string>
                     {
                         "Encode MJPEG→H.264 on this server (FFmpeg) (recommended)",
@@ -2158,6 +2249,8 @@ WantedBy=multi-user.target
         existingConfig.SshUser = sshUser;
         existingConfig.MqttPort = mqttPort.Value;
         existingConfig.AutoLanMode = autoLanMode;
+        existingConfig.MoonrakerHost = moonrakerHost;
+        existingConfig.MoonrakerPort = moonrakerPortOverride;
         existingConfig.VideoSource = videoSource;
         existingConfig.H264StreamerControlPort = h264StreamerControlPort;
         existingConfig.H264StreamerStreamingPort = h264StreamerStreamingPort;
@@ -5009,28 +5102,42 @@ WantedBy=multi-user.target
             allPassed = false;
         }
 
-        // Check 2: SSH port
-        _ui.WriteInfo($"  [2/4] Checking SSH port ({config.SshPort})...");
-        if (await CheckTcpPortAsync(config.Ip, config.SshPort))
+        // Check 2: SSH port (skip for vanilla-klipper)
+        if (config.VanillaKlipperMode)
         {
-            _ui.WriteSuccess("    SSH port is open");
+            _ui.WriteInfo("  [2/4] SSH port check skipped (vanilla-klipper mode)");
         }
         else
         {
-            _ui.WriteError("    SSH port is not reachable");
-            allPassed = false;
+            _ui.WriteInfo($"  [2/4] Checking SSH port ({config.SshPort})...");
+            if (await CheckTcpPortAsync(config.Ip, config.SshPort))
+            {
+                _ui.WriteSuccess("    SSH port is open");
+            }
+            else
+            {
+                _ui.WriteError("    SSH port is not reachable");
+                allPassed = false;
+            }
         }
 
-        // Check 3: MQTT port
-        _ui.WriteInfo($"  [3/4] Checking MQTT port ({config.MqttPort})...");
-        if (await CheckTcpPortAsync(config.Ip, config.MqttPort))
+        // Check 3: MQTT port (skip for vanilla-klipper)
+        if (config.VanillaKlipperMode)
         {
-            _ui.WriteSuccess("    MQTT port is open");
+            _ui.WriteInfo("  [3/4] MQTT port check skipped (vanilla-klipper mode)");
         }
         else
         {
-            _ui.WriteError("    MQTT port is not reachable");
-            allPassed = false;
+            _ui.WriteInfo($"  [3/4] Checking MQTT port ({config.MqttPort})...");
+            if (await CheckTcpPortAsync(config.Ip, config.MqttPort))
+            {
+                _ui.WriteSuccess("    MQTT port is open");
+            }
+            else
+            {
+                _ui.WriteError("    MQTT port is not reachable");
+                allPassed = false;
+            }
         }
 
         // Check 4: HTTP stream port (18088)

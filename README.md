@@ -50,8 +50,8 @@ sudo pacman -S ffmpeg
 
 ```bash
 # Download the latest release for your architecture
-wget https://github.com/mann1x/acproxycam/releases/latest/download/acproxycam-linux-arm64-v1.5.1.zip
-unzip acproxycam-linux-arm64-v1.5.0.zip
+wget https://github.com/mann1x/acproxycam/releases/latest/download/acproxycam-linux-arm64-v1.6.0.zip
+unzip acproxycam-linux-arm64-v1.6.0.zip
 chmod +x acproxycam
 
 # Run with sudo for installation
@@ -164,6 +164,17 @@ Configure encoding when adding or modifying a printer — the CLI will detect av
 AutoLanMode ensures the printer's camera remains accessible by automatically enabling LAN mode when needed. This prevents issues where the camera becomes unavailable after being accessed by the Anycubic slicer or cloud services.
 
 Configure per-printer in the Modify menu.
+
+### Vanilla-Klipper Mode
+
+ACProxyCam supports printers running Klipper without Anycubic firmware (e.g. custom boards, BTT, Manta). In this mode:
+
+- **No MQTT/SSH required** — camera streaming works via h264-streamer MJPEG only
+- **Moonraker on any host** — configurable Moonraker host and port (can be different from the printer IP)
+- **Obico integration** — works via Moonraker, no MQTT needed
+- **Auto-detected** — when h264-streamer reports `mode: "vanilla-klipper"`, ACProxyCam automatically skips SSH/MQTT setup
+
+When adding a printer, if vanilla-klipper mode is detected you'll be asked for Moonraker host and port instead of SSH/MQTT credentials. LED auto-control is not available (requires MQTT).
 
 ### LED Auto-Control
 
@@ -424,6 +435,13 @@ dotnet publish src/ACProxyCam/ACProxyCam.csproj -c Release -r linux-arm64 --self
 4. Convert Annex B output → AVCC format
 5. Feed AVCC packets to H.264 WebSocket, HLS, and FLV endpoints
 6. Serve all stream formats on configured port
+
+**Vanilla-klipper mode** (Klipper without Anycubic firmware):
+1. Skip SSH/MQTT — no Anycubic firmware services
+2. Connect to h264-streamer MJPEG stream
+3. Optionally encode MJPEG→H.264 for HLS/WebSocket/FLV endpoints
+4. Connect to Moonraker (configurable host/port) for Obico integration
+5. Serve all stream formats on configured port
 
 **FLV proxy mode** (offload H.264 encoding from printer):
 1. ACProxyCam encodes MJPEG→H.264 and serves `/flv` endpoint

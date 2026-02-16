@@ -392,40 +392,51 @@ public class PrinterThread : IDisposable
                 // Only log on first attempt or after success - throttling handles repetitive failures
                 LogStatusThrottled("connection", $"Connecting to {Config.Ip}...");
 
-                // Step 1: Check deviceId and credentials
-                // Always verify deviceId on first connection - if it changed, printer was swapped or factory reset
-                var needFullRetrieval = string.IsNullOrEmpty(Config.MqttUsername) || string.IsNullOrEmpty(Config.MqttPassword);
-
-                if (!needFullRetrieval)
+                if (Config.VanillaKlipperMode)
                 {
-                    // Check if printer's deviceId matches our config
-                    var printerChanged = await CheckPrinterChangedAsync(ct);
-                    if (printerChanged)
+                    // Vanilla-klipper: no SSH/MQTT available, set Moonraker directly
+                    LogStatus("Vanilla-klipper mode: skipping SSH/MQTT");
+                    Config.Firmware.MoonrakerAvailable = true;
+                    Config.Firmware.MoonrakerPort = Config.MoonrakerPort > 0 ? Config.MoonrakerPort : 7125;
+                    Config.Firmware.Type = FirmwareType.Rinkhals; // Moonraker = Rinkhals-like
+                }
+                else
+                {
+                    // Step 1: Check deviceId and credentials
+                    // Always verify deviceId on first connection - if it changed, printer was swapped or factory reset
+                    var needFullRetrieval = string.IsNullOrEmpty(Config.MqttUsername) || string.IsNullOrEmpty(Config.MqttPassword);
+
+                    if (!needFullRetrieval)
                     {
-                        LogStatus("Printer deviceId changed - re-discovering credentials and device info");
-                        // Clear old credentials since they belong to a different printer
-                        Config.MqttUsername = "";
-                        Config.MqttPassword = "";
-                        Config.DeviceType = "";
-                        Config.ModelCode = "";
-                        needFullRetrieval = true;
+                        // Check if printer's deviceId matches our config
+                        var printerChanged = await CheckPrinterChangedAsync(ct);
+                        if (printerChanged)
+                        {
+                            LogStatus("Printer deviceId changed - re-discovering credentials and device info");
+                            // Clear old credentials since they belong to a different printer
+                            Config.MqttUsername = "";
+                            Config.MqttPassword = "";
+                            Config.DeviceType = "";
+                            Config.ModelCode = "";
+                            needFullRetrieval = true;
+                        }
                     }
-                }
 
-                if (needFullRetrieval)
-                {
-                    await RetrieveSshCredentialsAsync(ct);
-                }
-                else if (string.IsNullOrEmpty(Config.DeviceType) || string.IsNullOrEmpty(Config.ModelCode))
-                {
-                    // Credentials exist and deviceId matches, but device info missing - fetch it
-                    await RefreshPrinterInfoAsync(ct);
-                }
+                    if (needFullRetrieval)
+                    {
+                        await RetrieveSshCredentialsAsync(ct);
+                    }
+                    else if (string.IsNullOrEmpty(Config.DeviceType) || string.IsNullOrEmpty(Config.ModelCode))
+                    {
+                        // Credentials exist and deviceId matches, but device info missing - fetch it
+                        await RefreshPrinterInfoAsync(ct);
+                    }
 
-                // Step 2: MQTT - Connect and detect model code if needed (for camera)
-                if (Config.CameraEnabled)
-                {
-                    await ConnectMqttAndStartCameraAsync(ct);
+                    // Step 2: MQTT - Connect and detect model code if needed (for camera)
+                    if (Config.CameraEnabled)
+                    {
+                        await ConnectMqttAndStartCameraAsync(ct);
+                    }
                 }
 
                 // Step 3: Start MJPEG server (if camera enabled)
@@ -859,7 +870,9 @@ public class PrinterThread : IDisposable
         }
 
         // Create shared Moonraker client for all Obico instances
-        _sharedMoonraker = new MoonrakerApiClient(Config.Ip, Config.Firmware.MoonrakerPort);
+        var moonrakerHost = !string.IsNullOrEmpty(Config.MoonrakerHost) ? Config.MoonrakerHost : Config.Ip;
+        var moonrakerPort = Config.MoonrakerPort > 0 ? Config.MoonrakerPort : Config.Firmware.MoonrakerPort;
+        _sharedMoonraker = new MoonrakerApiClient(moonrakerHost, moonrakerPort);
 
         // Connect to Moonraker WebSocket and subscribe to objects ONCE
         // Both clients will share this connection and receive events

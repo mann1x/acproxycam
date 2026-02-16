@@ -147,6 +147,12 @@ public class H264StreamerConfig
     public bool AcproxycamFlvProxy { get; set; } = false;
 
     /// <summary>
+    /// Whether this is vanilla-klipper mode (no Anycubic firmware/MQTT).
+    /// </summary>
+    [JsonIgnore]
+    public bool IsVanillaKlipper => Mode == "vanilla-klipper";
+
+    /// <summary>
     /// Check if this encoder type produces hardware H.264.
     /// rkmpi-yuyv and gkcam provide H.264, rkmpi only provides MJPEG.
     /// </summary>
