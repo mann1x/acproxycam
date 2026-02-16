@@ -50,7 +50,7 @@ sudo pacman -S ffmpeg
 
 ```bash
 # Download the latest release for your architecture
-wget https://github.com/mann1x/acproxycam/releases/latest/download/acproxycam-linux-arm64-v1.5.0.zip
+wget https://github.com/mann1x/acproxycam/releases/latest/download/acproxycam-linux-arm64-v1.5.1.zip
 unzip acproxycam-linux-arm64-v1.5.0.zip
 chmod +x acproxycam
 

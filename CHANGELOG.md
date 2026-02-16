@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+### [1.5.1] - 2026-02-16
+
+#### Fixed
+- MJPEG stream parser corrupting JPEG frames — binary body data was read through line-based reader, truncating at first 0x0A byte and producing invalid frames for H.264 encoding (root cause of H.264 "screen tearing")
+- H.264 encoder framerate hint now uses measured input FPS instead of hardcoded value
+- FPS display in dashboard shows actual encoding output rate when MJPEG→H.264 encoding is active
+- CLI video source recommendation now correctly suggests "Encode MJPEG→H.264" when FLV proxy is enabled but printer doesn't provide native H.264
+
+#### Changed
+- Replaced x264 `tune=zerolatency` with explicit `rc-lookahead=0:sync-lookahead=0` for better encoding quality
+- H.264 encoder PTS now uses wall-clock milliseconds instead of frame counter for accurate timing
+- FLV proxy reconnection improved to avoid circular dependency with h264-streamer
+- Version logged at daemon startup for easier build identification
+- CLI warns when its version differs from running daemon
+
 ### [1.5.0] - 2026-02-06
 
 #### Added
