@@ -1337,7 +1337,44 @@ public class PrinterThread : IDisposable
     private async Task RunStreamingLoopAsync(CancellationToken ct)
     {
         // Route to appropriate source based on config
-        if (Config.VideoSource?.ToLowerInvariant() == "mjpeg")
+        var useMjpeg = Config.VideoSource?.ToLowerInvariant() == "mjpeg";
+
+        // When h264-streamer has FLV proxy enabled, the printer's /flv endpoint proxies
+        // from ACProxyCam — connecting to it would create a circular dependency.
+        // Detect this and automatically switch to MJPEG source.
+        if (!useMjpeg && Config.H264StreamerControlPort > 0)
+        {
+            try
+            {
+                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+                var url = $"http://{Config.Ip}:{Config.H264StreamerControlPort}/api/acproxycam/flv";
+                var resp = await client.GetAsync(url, ct);
+                if (resp.IsSuccessStatusCode)
+                {
+                    var json = await resp.Content.ReadAsStringAsync(ct);
+                    var doc = System.Text.Json.JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("enabled", out var enabled) && enabled.GetBoolean())
+                    {
+                        LogStatus("FLV proxy enabled on h264-streamer — using MJPEG source to avoid circular dependency");
+                        useMjpeg = true;
+
+                        // Force H.264 encoding on — the whole point of proxy mode is to
+                        // offload encoding from the printer, so ACProxyCam must produce /flv
+                        if (!Config.H264EncodingEnabled)
+                        {
+                            Config.H264EncodingEnabled = true;
+                            LogStatus("H.264 encoding auto-enabled for FLV proxy mode");
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // h264-streamer not reachable yet, proceed with configured source
+            }
+        }
+
+        if (useMjpeg)
         {
             await RunMjpegSourceLoopAsync(ct);
         }
@@ -1593,6 +1630,14 @@ public class PrinterThread : IDisposable
 
                     var failureDuration = DateTime.UtcNow - _streamFailedAt;
                     var inQuickRecoveryPeriod = failureDuration.TotalMinutes < QuickRecoveryPeriodMinutes;
+
+                    // Re-announce FLV endpoint during recovery so h264-streamer knows our URL
+                    // after a restart (the proxy server loses announcements when it restarts)
+                    if ((DateTime.UtcNow - lastFlvAnnounce).TotalSeconds >= 30)
+                    {
+                        lastFlvAnnounce = DateTime.UtcNow;
+                        _ = Task.Run(() => AnnounceFlvToStreamerAsync(ct), ct);
+                    }
 
                     if (inQuickRecoveryPeriod)
                     {
