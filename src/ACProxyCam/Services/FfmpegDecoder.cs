@@ -11,7 +11,7 @@ namespace ACProxyCam.Services;
 /// FFmpeg-based video decoder optimized for low-latency FLV streaming.
 /// Outputs raw BGR24 frames for encoding by SkiaSharp.
 /// </summary>
-public unsafe class FfmpegDecoder : IDisposable
+public unsafe class FfmpegDecoder : IDisposable, IH264PacketSource
 {
     private AVFormatContext* _formatContext;
     private AVCodecContext* _codecContext;
@@ -674,6 +674,16 @@ public class FrameEventArgs : EventArgs
         Height = height;
         Stride = stride;
     }
+}
+
+/// <summary>
+/// Common interface for H.264 packet sources (decoder or encoder).
+/// Used by H264RtpStreamer and ObicoClient for Janus WebRTC streaming.
+/// </summary>
+public interface IH264PacketSource
+{
+    event EventHandler<RawPacketEventArgs>? RawPacketReceived;
+    byte[]? Extradata { get; }
 }
 
 /// <summary>

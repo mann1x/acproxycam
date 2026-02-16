@@ -8,12 +8,12 @@ namespace ACProxyCam.Services.Obico;
 
 /// <summary>
 /// Streams H.264 video to Janus via RTP.
-/// Uses packets from FfmpegDecoder to share the source stream (no duplicate connections).
+/// Uses packets from any IH264PacketSource (decoder or encoder).
 /// Implements RFC 6184 for H.264 RTP packetization.
 /// </summary>
 public class H264RtpStreamer : IDisposable
 {
-    private readonly FfmpegDecoder _decoder;
+    private readonly IH264PacketSource _packetSource;
     private readonly string _janusServer;
     private readonly int _rtpPort;
 
@@ -56,14 +56,14 @@ public class H264RtpStreamer : IDisposable
     public long BytesSent => _bytesSent;
 
     /// <summary>
-    /// Create an H.264 RTP streamer that uses packets from FfmpegDecoder.
+    /// Create an H.264 RTP streamer from any H.264 packet source.
     /// </summary>
-    /// <param name="decoder">FfmpegDecoder to get H.264 packets from</param>
+    /// <param name="packetSource">H.264 packet source (decoder or encoder)</param>
     /// <param name="janusServer">Janus server hostname or IP</param>
     /// <param name="rtpPort">RTP port on Janus for video</param>
-    public H264RtpStreamer(FfmpegDecoder decoder, string janusServer, int rtpPort)
+    public H264RtpStreamer(IH264PacketSource packetSource, string janusServer, int rtpPort)
     {
-        _decoder = decoder;
+        _packetSource = packetSource;
         _janusServer = janusServer;
         _rtpPort = rtpPort;
         _ssrc = (uint)Random.Shared.Next();
@@ -99,7 +99,7 @@ public class H264RtpStreamer : IDisposable
             _udpSocket.SendBufferSize = 1024 * 1024; // 1MB send buffer
 
             // Subscribe to raw packets from decoder
-            _decoder.RawPacketReceived += OnRawPacketReceived;
+            _packetSource.RawPacketReceived += OnRawPacketReceived;
 
             _isStreaming = true;
             _packetsSent = 0;
@@ -126,7 +126,7 @@ public class H264RtpStreamer : IDisposable
         _isStreaming = false;
 
         // Unsubscribe from decoder
-        _decoder.RawPacketReceived -= OnRawPacketReceived;
+        _packetSource.RawPacketReceived -= OnRawPacketReceived;
 
         _udpSocket?.Close();
         _udpSocket?.Dispose();
@@ -147,9 +147,9 @@ public class H264RtpStreamer : IDisposable
         try
         {
             // Parse extradata (SPS/PPS) once if not yet done
-            if (!_spsPpsParsed && _decoder.Extradata != null)
+            if (!_spsPpsParsed && _packetSource.Extradata != null)
             {
-                ParseAvccExtradata(_decoder.Extradata);
+                ParseAvccExtradata(_packetSource.Extradata);
             }
 
             // Send SPS/PPS before keyframes to ensure decoder can initialize
@@ -470,66 +470,134 @@ public class H264RtpStreamer : IDisposable
     }
 
     /// <summary>
-    /// Parse SPS and PPS from AVCC extradata format.
-    /// AVCC format: configuration version, profile, compatibility, level, NAL length size,
-    /// then SPS count, SPS data, PPS count, PPS data.
+    /// Parse SPS and PPS from extradata (auto-detects AVCC or Annex B format).
+    /// AVCC: config record with length-prefixed NALs (from FLV/MP4 decoders).
+    /// Annex B: start-code separated NALs (from libx264 encoder with GLOBAL_HEADER).
     /// </summary>
     private void ParseAvccExtradata(byte[] extradata)
     {
-        if (extradata == null || extradata.Length < 8)
+        if (extradata == null || extradata.Length < 4)
             return;
 
         try
         {
-            int offset = 5; // Skip config header (version, profile, compat, level, nal_length_size)
+            // Detect format: Annex B starts with 00 00 00 01 or 00 00 01
+            bool isAnnexB = (extradata[0] == 0 && extradata[1] == 0 &&
+                            (extradata[2] == 1 || (extradata.Length >= 5 && extradata[2] == 0 && extradata[3] == 1)));
 
-            // Number of SPS (lower 5 bits)
-            int numSps = extradata[offset] & 0x1F;
-            offset++;
-
-            for (int i = 0; i < numSps && offset + 2 <= extradata.Length; i++)
-            {
-                // SPS length (big-endian 16-bit)
-                int spsLen = (extradata[offset] << 8) | extradata[offset + 1];
-                offset += 2;
-
-                if (offset + spsLen <= extradata.Length)
-                {
-                    _spsNal = new byte[spsLen];
-                    Array.Copy(extradata, offset, _spsNal, 0, spsLen);
-                    offset += spsLen;
-                    Log($"Extracted SPS from extradata: {spsLen} bytes");
-                }
-            }
-
-            // Number of PPS
-            if (offset < extradata.Length)
-            {
-                int numPps = extradata[offset];
-                offset++;
-
-                for (int i = 0; i < numPps && offset + 2 <= extradata.Length; i++)
-                {
-                    // PPS length (big-endian 16-bit)
-                    int ppsLen = (extradata[offset] << 8) | extradata[offset + 1];
-                    offset += 2;
-
-                    if (offset + ppsLen <= extradata.Length)
-                    {
-                        _ppsNal = new byte[ppsLen];
-                        Array.Copy(extradata, offset, _ppsNal, 0, ppsLen);
-                        offset += ppsLen;
-                        Log($"Extracted PPS from extradata: {ppsLen} bytes");
-                    }
-                }
-            }
-
-            _spsPpsParsed = true;
+            if (isAnnexB)
+                ParseAnnexBExtradata(extradata);
+            else
+                ParseAvccFormatExtradata(extradata);
         }
         catch (Exception ex)
         {
-            Log($"Failed to parse AVCC extradata: {ex.Message}");
+            Log($"Failed to parse extradata: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Parse SPS/PPS from Annex B format extradata (start-code separated NAL units).
+    /// libx264 with AV_CODEC_FLAG_GLOBAL_HEADER produces this format.
+    /// </summary>
+    private void ParseAnnexBExtradata(byte[] extradata)
+    {
+        int i = 0;
+        while (i < extradata.Length)
+        {
+            int startCodeLen = 0;
+            if (i + 3 <= extradata.Length && extradata[i] == 0 && extradata[i + 1] == 0 && extradata[i + 2] == 1)
+                startCodeLen = 3;
+            else if (i + 4 <= extradata.Length && extradata[i] == 0 && extradata[i + 1] == 0 && extradata[i + 2] == 0 && extradata[i + 3] == 1)
+                startCodeLen = 4;
+            else { i++; continue; }
+
+            int nalStart = i + startCodeLen;
+
+            // Find next start code or end of data
+            int nalEnd = extradata.Length;
+            for (int j = nalStart + 1; j < extradata.Length - 2; j++)
+            {
+                if (extradata[j] == 0 && extradata[j + 1] == 0 &&
+                    (extradata[j + 2] == 1 || (j + 3 < extradata.Length && extradata[j + 2] == 0 && extradata[j + 3] == 1)))
+                { nalEnd = j; break; }
+            }
+
+            int nalLength = nalEnd - nalStart;
+            if (nalLength > 0)
+            {
+                byte nalType = (byte)(extradata[nalStart] & 0x1F);
+                if (nalType == 7 && _spsNal == null) // SPS
+                {
+                    _spsNal = new byte[nalLength];
+                    Array.Copy(extradata, nalStart, _spsNal, 0, nalLength);
+                    Log($"Extracted SPS from Annex B extradata: {nalLength} bytes");
+                }
+                else if (nalType == 8 && _ppsNal == null) // PPS
+                {
+                    _ppsNal = new byte[nalLength];
+                    Array.Copy(extradata, nalStart, _ppsNal, 0, nalLength);
+                    Log($"Extracted PPS from Annex B extradata: {nalLength} bytes");
+                }
+            }
+
+            i = nalEnd;
+        }
+
+        _spsPpsParsed = _spsNal != null && _ppsNal != null;
+        if (!_spsPpsParsed)
+            Log($"Warning: Annex B extradata missing SPS or PPS (sps={_spsNal != null}, pps={_ppsNal != null})");
+    }
+
+    /// <summary>
+    /// Parse SPS and PPS from AVCC extradata format.
+    /// AVCC format: configuration version, profile, compatibility, level, NAL length size,
+    /// then SPS count, SPS data, PPS count, PPS data.
+    /// </summary>
+    private void ParseAvccFormatExtradata(byte[] extradata)
+    {
+        if (extradata.Length < 8)
+            return;
+
+        int offset = 5; // Skip config header
+
+        // Number of SPS (lower 5 bits)
+        int numSps = extradata[offset] & 0x1F;
+        offset++;
+
+        for (int i = 0; i < numSps && offset + 2 <= extradata.Length; i++)
+        {
+            int spsLen = (extradata[offset] << 8) | extradata[offset + 1];
+            offset += 2;
+            if (offset + spsLen <= extradata.Length)
+            {
+                _spsNal = new byte[spsLen];
+                Array.Copy(extradata, offset, _spsNal, 0, spsLen);
+                offset += spsLen;
+                Log($"Extracted SPS from AVCC extradata: {spsLen} bytes");
+            }
+        }
+
+        // Number of PPS
+        if (offset < extradata.Length)
+        {
+            int numPps = extradata[offset];
+            offset++;
+            for (int i = 0; i < numPps && offset + 2 <= extradata.Length; i++)
+            {
+                int ppsLen = (extradata[offset] << 8) | extradata[offset + 1];
+                offset += 2;
+                if (offset + ppsLen <= extradata.Length)
+                {
+                    _ppsNal = new byte[ppsLen];
+                    Array.Copy(extradata, offset, _ppsNal, 0, ppsLen);
+                    offset += ppsLen;
+                    Log($"Extracted PPS from AVCC extradata: {ppsLen} bytes");
+                }
+            }
+        }
+
+        _spsPpsParsed = true;
     }
 
     private void Log(string message)
@@ -543,7 +611,7 @@ public class H264RtpStreamer : IDisposable
         _isDisposed = true;
 
         _isStreaming = false;
-        _decoder.RawPacketReceived -= OnRawPacketReceived;
+        _packetSource.RawPacketReceived -= OnRawPacketReceived;
         _udpSocket?.Close();
         _udpSocket?.Dispose();
     }

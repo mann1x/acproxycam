@@ -40,6 +40,7 @@ public class PrinterThread : IDisposable
     private LanModeService? _lanModeService;
     private MqttCameraController? _mqttController;
     private FfmpegDecoder? _decoder;
+    private IH264PacketSource? _h264Source;       // Current H.264 source for Obico (decoder or encoder)
     private MjpegSourceClient? _mjpegSource;     // For MJPEG source mode (h264-streamer)
     private MjpegServer? _mjpegServer;
     private MoonrakerApiClient? _sharedMoonraker; // Shared Moonraker connection for all Obico clients
@@ -1310,10 +1311,10 @@ public class PrinterThread : IDisposable
                     isCloud,
                     CancellationToken.None);
 
-                // Pass decoder to the new client (decoder is already running)
-                if (_decoder != null)
+                // Pass H.264 source to the new client (decoder or encoder already running)
+                if (_h264Source != null)
                 {
-                    newClient?.SetDecoder(_decoder);
+                    newClient?.SetH264Source(_h264Source);
                 }
                 return newClient;
             }
@@ -1329,10 +1330,10 @@ public class PrinterThread : IDisposable
                 isCloud,
                 CancellationToken.None);
 
-            // Pass decoder to the new client (decoder is already running)
-            if (_decoder != null)
+            // Pass H.264 source to the new client (decoder or encoder already running)
+            if (_h264Source != null)
             {
-                newClient?.SetDecoder(_decoder);
+                newClient?.SetH264Source(_h264Source);
             }
             return newClient;
         }
@@ -1461,8 +1462,9 @@ public class PrinterThread : IDisposable
 
             // Pass decoder to Obico clients for H.264 RTP streaming (shares source stream)
             // Must be called after ObicoClient is started so Janus is ready
-            _obicoClient?.SetDecoder(_decoder);
-            _obicoCloudClient?.SetDecoder(_decoder);
+            _h264Source = _decoder;
+            _obicoClient?.SetH264Source(_decoder);
+            _obicoCloudClient?.SetH264Source(_decoder);
         };
         _decoder.DecodingStopped += (s, e) =>
         {
@@ -1790,6 +1792,14 @@ public class PrinterThread : IDisposable
                 try
                 {
                     await StartObicoClientAsync(ct);
+
+                    // In MJPEG mode, wire the encoder as H.264 source for Obico/Janus
+                    if (encoder != null)
+                    {
+                        _h264Source = encoder;
+                        _obicoClient?.SetH264Source(encoder);
+                        _obicoCloudClient?.SetH264Source(encoder);
+                    }
                 }
                 catch (Exception ex)
                 {

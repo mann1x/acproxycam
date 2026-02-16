@@ -12,7 +12,7 @@ namespace ACProxyCam.Services;
 /// Supports hardware (VAAPI, V4L2M2M, NVENC, QSV) and software (libx264) encoders.
 /// Thread-safe: PushJpegFrame can be called from multiple threads.
 /// </summary>
-public unsafe class FfmpegEncoder : IDisposable
+public unsafe class FfmpegEncoder : IDisposable, IH264PacketSource
 {
     // MJPEG decoder
     private AVCodecContext* _decoderCtx;
@@ -77,6 +77,13 @@ public unsafe class FfmpegEncoder : IDisposable
     /// Data is in AVCC format (4-byte length-prefixed NAL units).
     /// </summary>
     public event EventHandler<RawPacketEventArgs>? EncodedPacketReceived;
+
+    // IH264PacketSource explicit implementation - maps to EncodedPacketReceived
+    event EventHandler<RawPacketEventArgs>? IH264PacketSource.RawPacketReceived
+    {
+        add => EncodedPacketReceived += value;
+        remove => EncodedPacketReceived -= value;
+    }
 
     /// <summary>
     /// Push a JPEG frame for encoding to H.264.

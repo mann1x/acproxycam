@@ -84,8 +84,8 @@ public class ObicoClient : IDisposable
     // Snapshot callback (set by PrinterThread if camera is enabled)
     private Func<byte[]?>? _getSnapshotCallback;
 
-    // Decoder for H.264 packet sharing (set by PrinterThread if camera is enabled)
-    private FfmpegDecoder? _ffmpegDecoder;
+    // H.264 packet source for Janus streaming (decoder in native mode, encoder in MJPEG mode)
+    private IH264PacketSource? _h264Source;
 
     public event EventHandler<string>? StatusChanged;
     public event EventHandler<ObicoClientState>? StateChanged;
@@ -316,22 +316,23 @@ public class ObicoClient : IDisposable
     }
 
     /// <summary>
-    /// Set the FfmpegDecoder for H.264 RTP streaming (shares source stream with MJPEG decoder).
+    /// Set the H.264 packet source for Janus RTP streaming.
+    /// In native H.264 mode this is the FfmpegDecoder; in MJPEG encoding mode this is the FfmpegEncoder.
     /// If Janus is already connected and H.264 mode is configured, starts RTP streaming.
     /// </summary>
-    public async void SetDecoder(FfmpegDecoder decoder)
+    public async void SetH264Source(IH264PacketSource source)
     {
-        _ffmpegDecoder = decoder;
+        _h264Source = source;
 
-        // If Janus is enabled but H.264 streamer not started (waiting for decoder), start it now
+        // If Janus is enabled but H.264 streamer not started (waiting for source), start it now
         if (_janusEnabled && _janusClient != null && _h264Streamer == null &&
             _obicoConfig.StreamMode == ObicoStreamMode.H264)
         {
             try
             {
-                Log("Decoder now available - starting H.264 RTP streaming");
+                Log("H.264 source now available - starting RTP streaming");
                 _h264Streamer = new H264RtpStreamer(
-                    _ffmpegDecoder,
+                    _h264Source,
                     GetJanusServerAddress()!,
                     _janusClient.VideoPort);
                 _h264Streamer.Verbose = _verbose;
@@ -527,16 +528,16 @@ public class ObicoClient : IDisposable
             // Start the appropriate streamer based on mode
             if (streamMode == ObicoStreamMode.H264)
             {
-                // H.264 passthrough mode - use packets from shared FfmpegDecoder
-                if (_ffmpegDecoder == null)
+                // H.264 mode - use packets from decoder (native) or encoder (MJPEG)
+                if (_h264Source == null)
                 {
-                    // Decoder not available yet - streaming will be started when SetDecoder is called
-                    Log("H.264 mode ready - waiting for decoder (will start when stream begins)");
+                    // Source not available yet - streaming will be started when SetH264Source is called
+                    Log("H.264 mode ready - waiting for H.264 source (will start when stream begins)");
                 }
                 else
                 {
                     _h264Streamer = new H264RtpStreamer(
-                        _ffmpegDecoder,
+                        _h264Source,
                         janusServer,
                         _janusClient.VideoPort);
                     _h264Streamer.Verbose = _verbose;
