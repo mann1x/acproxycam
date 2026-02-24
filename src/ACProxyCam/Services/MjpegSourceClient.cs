@@ -1,7 +1,6 @@
 // MjpegSourceClient.cs - Client for consuming MJPEG streams from h264-streamer
 
 using System.Diagnostics;
-using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -86,24 +85,14 @@ public class MjpegSourceClient : IDisposable
         StreamUrl = streamUrl;
         SnapshotUrl = snapshotUrl;
 
-        // Use a small receive buffer (32KB) to create TCP backpressure during
-        // frame pacing delays. With the default auto-tuned buffer (256KB+), our
-        // pacing delay can't fill it fast enough to close the TCP window. A small
-        // buffer fills within ~10ms at typical MJPEG data rates (~3MB/s), causing
-        // the upstream encoder to block on write() and skip redundant JPEG encodes.
-        // This matches browser behavior where rendering delay naturally fills the buffer.
-        var handler = new SocketsHttpHandler
-        {
-            ConnectCallback = async (context, ct) =>
-            {
-                var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
-                socket.NoDelay = true;
-                socket.ReceiveBufferSize = 4096; // 4KB - forces many round trips per frame, creating natural backpressure
-                await socket.ConnectAsync(context.DnsEndPoint, ct);
-                return new NetworkStream(socket, ownsSocket: true);
-            }
-        };
-        _httpClient = new HttpClient(handler)
+        // Use default socket buffers — a tiny recv buffer (e.g. 4KB) creates TCP
+        // backpressure that can reduce encoder CPU, but on single-core SoCs (RV1106)
+        // the resulting small TCP window causes excessive IRQ/softirq overhead from
+        // many small segments and ACKs per frame, which increases gklib CPU by ~8%.
+        // Frame pacing (FramePacingMs) still controls read rate at the application
+        // level; with a large buffer the data simply accumulates in kernel space
+        // during pacing delays, which is fine — the frames are still paced.
+        _httpClient = new HttpClient()
         {
             Timeout = Timeout.InfiniteTimeSpan // Stream is continuous
         };
