@@ -59,6 +59,16 @@ public class MjpegServer : IDisposable
     private bool _mjpegSourceMode;
     private bool _lastKeyframeIsJpeg; // When true, _lastKeyframe is JPEG, not H.264
 
+    // Upstream snapshot proxy (fetches from printer when video stream is inactive)
+    private string? _upstreamSnapshotUrl;
+    private HttpClient? _upstreamHttpClient;
+    private byte[]? _upstreamSnapshotCache;
+    private DateTime _upstreamSnapshotCacheTime = DateTime.MinValue;
+    private readonly object _upstreamSnapshotLock = new();
+    private DateTime _lastKeyframeTime = DateTime.MinValue;
+    private const double KeyframeFreshnessSeconds = 2.0;
+    private const double UpstreamSnapshotCacheSeconds = 1.0;
+
     public event EventHandler<string>? StatusChanged;
 
     public MjpegServer()
@@ -138,6 +148,31 @@ public class MjpegServer : IDisposable
     public bool HasExternalStreamingClient { get; set; } = false;
 
     /// <summary>
+    /// URL to fetch snapshots from when the video stream is not active.
+    /// Setting this enables the upstream snapshot proxy with HTTP keep-alive.
+    /// </summary>
+    public string? UpstreamSnapshotUrl
+    {
+        get => _upstreamSnapshotUrl;
+        set
+        {
+            _upstreamSnapshotUrl = value;
+            if (value != null && _upstreamHttpClient == null)
+            {
+                var handler = new SocketsHttpHandler
+                {
+                    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
+                    PooledConnectionLifetime = TimeSpan.FromMinutes(10)
+                };
+                _upstreamHttpClient = new HttpClient(handler)
+                {
+                    Timeout = TimeSpan.FromSeconds(5)
+                };
+            }
+        }
+    }
+
+    /// <summary>
     /// Last time an HLS request was made (playlist, segment, or part).
     /// Used to determine if HLS clients are active.
     /// </summary>
@@ -189,14 +224,19 @@ public class MjpegServer : IDisposable
 
     /// <summary>
     /// Get the last encoded JPEG frame. Returns null if no frame available.
+    /// Falls back to upstream snapshot proxy when no local frame is cached.
     /// Used by Obico client for snapshot uploads.
     /// </summary>
     public byte[]? GetLastJpegFrame()
     {
         lock (_frameLock)
         {
-            return _lastJpegFrame;
+            if (_lastJpegFrame != null)
+                return _lastJpegFrame;
         }
+
+        // Fallback: try upstream snapshot proxy
+        return FetchUpstreamSnapshot();
     }
 
     /// <summary>
@@ -301,6 +341,7 @@ public class MjpegServer : IDisposable
         {
             _lastKeyframe = jpegData;
             _lastKeyframeIsJpeg = true;
+            _lastKeyframeTime = DateTime.UtcNow;
         }
 
         // Measure input FPS (only when no H.264 encoding active, to avoid double-counting
@@ -475,6 +516,7 @@ public class MjpegServer : IDisposable
             lock (_keyframeLock)
             {
                 _lastKeyframe = frameData;
+                _lastKeyframeTime = DateTime.UtcNow;
             }
         }
 
@@ -1145,71 +1187,94 @@ public class MjpegServer : IDisposable
     }
 
     /// <summary>
+    /// Fetch a snapshot from the upstream printer URL with 1-second caching.
+    /// Uses HTTP keep-alive to avoid reconnection overhead.
+    /// Returns cached data if less than 1 second old, or fetches fresh data.
+    /// Returns null if no upstream URL is configured or fetch fails with no cache.
+    /// </summary>
+    private byte[]? FetchUpstreamSnapshot()
+    {
+        if (_upstreamSnapshotUrl == null || _upstreamHttpClient == null)
+            return null;
+
+        lock (_upstreamSnapshotLock)
+        {
+            var now = DateTime.UtcNow;
+            var cacheAge = (now - _upstreamSnapshotCacheTime).TotalSeconds;
+
+            // Return cached data if fresh enough
+            if (_upstreamSnapshotCache != null && cacheAge < UpstreamSnapshotCacheSeconds)
+                return _upstreamSnapshotCache;
+
+            // Fetch from upstream
+            try
+            {
+                var response = _upstreamHttpClient.GetAsync(_upstreamSnapshotUrl).GetAwaiter().GetResult();
+                if (response.IsSuccessStatusCode)
+                {
+                    var data = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+                    if (data.Length > 0)
+                    {
+                        _upstreamSnapshotCache = data;
+                        _upstreamSnapshotCacheTime = DateTime.UtcNow;
+                        return data;
+                    }
+                }
+            }
+            catch
+            {
+                // Fetch failed - return stale cache if available
+            }
+
+            return _upstreamSnapshotCache;
+        }
+    }
+
+    /// <summary>
     /// Handle /snapshot request - decodes H.264 keyframe on-demand to JPEG.
     /// This avoids continuous MJPEG encoding, saving CPU.
     /// Rate-limited to 10fps max - multiple concurrent requests share the same decoded frame.
+    /// Falls back to upstream snapshot proxy when video stream is inactive.
     /// </summary>
     private void HandleSnapshotRequest(ClientConnection client)
     {
-        // Get the cached keyframe
+        byte[]? jpegData = null;
+
+        // Get the cached keyframe and check freshness
         byte[]? keyframeData;
         bool isJpeg;
+        bool keyframeFresh;
         lock (_keyframeLock)
         {
             keyframeData = _lastKeyframe;
             isJpeg = _lastKeyframeIsJpeg;
+            keyframeFresh = keyframeData != null &&
+                            (DateTime.UtcNow - _lastKeyframeTime).TotalSeconds < KeyframeFreshnessSeconds;
         }
 
-        if (keyframeData == null)
+        // Priority 1: Fresh keyframe from active video stream
+        if (keyframeData != null && keyframeFresh)
         {
-            // No keyframe available yet
-            SnapshotRequested?.Invoke(this, EventArgs.Empty);
-            SendServiceUnavailable(client);
-            return;
+            jpegData = DecodeKeyframeToJpeg(keyframeData, isJpeg);
         }
 
-        byte[]? jpegData;
-
-        if (isJpeg)
-        {
-            // MJPEG source mode - keyframe is already JPEG, use directly
-            jpegData = keyframeData;
-        }
-        else
-        {
-            // H.264 source mode - need to decode keyframe to JPEG
-            lock (_snapshotCacheLock)
-            {
-                var now = DateTime.UtcNow;
-                var minInterval = TimeSpan.FromSeconds(1.0 / SnapshotMaxFps);
-                var cacheValid = _cachedSnapshotJpeg != null &&
-                                 (now - _lastSnapshotDecodeTime) < minInterval &&
-                                 ReferenceEquals(_cachedSnapshotKeyframeSource, keyframeData);
-
-                if (cacheValid)
-                {
-                    // Use cached JPEG - rate limited
-                    jpegData = _cachedSnapshotJpeg;
-                }
-                else
-                {
-                    // Need to decode - either cache expired or keyframe changed
-                    _snapshotDecoder.JpegQuality = JpegQuality;
-                    jpegData = _snapshotDecoder.DecodeKeyframeToJpeg(keyframeData);
-
-                    if (jpegData != null)
-                    {
-                        _cachedSnapshotJpeg = jpegData;
-                        _cachedSnapshotKeyframeSource = keyframeData;
-                        _lastSnapshotDecodeTime = now;
-                    }
-                }
-            }
-        }
-
+        // Priority 2: Upstream snapshot proxy (when stream is not active)
         if (jpegData == null)
         {
-            SendError(client, 500, "Failed to decode keyframe");
+            jpegData = FetchUpstreamSnapshot();
+        }
+
+        // Priority 3: Stale keyframe (better than nothing)
+        if (jpegData == null && keyframeData != null)
+        {
+            jpegData = DecodeKeyframeToJpeg(keyframeData, isJpeg);
+        }
+
+        // Priority 4: Nothing available
+        if (jpegData == null)
+        {
+            SnapshotRequested?.Invoke(this, EventArgs.Empty);
+            SendServiceUnavailable(client);
             return;
         }
 
@@ -1226,6 +1291,41 @@ public class MjpegServer : IDisposable
         client.TrySend(Encoding.ASCII.GetBytes(header));
         client.TrySend(jpegData);
         client.Dispose();
+    }
+
+    /// <summary>
+    /// Decode a keyframe to JPEG. For MJPEG source mode, the keyframe is already JPEG.
+    /// For H.264 source mode, decodes on-demand with rate limiting.
+    /// </summary>
+    private byte[]? DecodeKeyframeToJpeg(byte[] keyframeData, bool isJpeg)
+    {
+        if (isJpeg)
+            return keyframeData;
+
+        // H.264 source mode - need to decode keyframe to JPEG
+        lock (_snapshotCacheLock)
+        {
+            var now = DateTime.UtcNow;
+            var minInterval = TimeSpan.FromSeconds(1.0 / SnapshotMaxFps);
+            var cacheValid = _cachedSnapshotJpeg != null &&
+                             (now - _lastSnapshotDecodeTime) < minInterval &&
+                             ReferenceEquals(_cachedSnapshotKeyframeSource, keyframeData);
+
+            if (cacheValid)
+                return _cachedSnapshotJpeg;
+
+            _snapshotDecoder.JpegQuality = JpegQuality;
+            var jpegData = _snapshotDecoder.DecodeKeyframeToJpeg(keyframeData);
+
+            if (jpegData != null)
+            {
+                _cachedSnapshotJpeg = jpegData;
+                _cachedSnapshotKeyframeSource = keyframeData;
+                _lastSnapshotDecodeTime = now;
+            }
+
+            return jpegData;
+        }
     }
 
     private void HandleStatusRequest(ClientConnection client)
@@ -2105,6 +2205,7 @@ public class MjpegServer : IDisposable
         Stop();
         _hlsService.Dispose();
         _snapshotDecoder.Dispose();
+        _upstreamHttpClient?.Dispose();
         GC.SuppressFinalize(this);
     }
 

@@ -1502,6 +1502,10 @@ public class PrinterThread : IDisposable
         if (_mjpegServer != null)
         {
             _mjpegServer.SnapshotRequested += OnSnapshotRequested;
+
+            // Set upstream snapshot URL for fallback when stream is inactive
+            var streamingPort = Config.H264StreamerStreamingPort > 0 ? Config.H264StreamerStreamingPort : 8080;
+            _mjpegServer.UpstreamSnapshotUrl = Config.SnapshotUrl ?? $"http://{Config.Ip}:{streamingPort}/snapshot";
         }
 
         // Build stream URL
@@ -1788,6 +1792,10 @@ public class PrinterThread : IDisposable
         }
 
         _mjpegSource = new MjpegSourceClient(streamUrl, snapshotUrl);
+
+        // Set upstream snapshot URL for fallback when stream is inactive
+        if (_mjpegServer != null)
+            _mjpegServer.UpstreamSnapshotUrl = snapshotUrl;
 
         _mjpegSource.Connected += () =>
         {

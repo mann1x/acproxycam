@@ -1,6 +1,7 @@
 // MjpegSourceClient.cs - Client for consuming MJPEG streams from h264-streamer
 
 using System.Diagnostics;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -71,12 +72,38 @@ public class MjpegSourceClient : IDisposable
     private int _reconnectAttempts;
     private const int MaxReconnectDelay = 30000; // 30 seconds max backoff
 
+    /// <summary>
+    /// Minimum milliseconds between frame reads. Creates TCP backpressure so the
+    /// upstream encoder can skip redundant JPEG encodes, reducing its CPU usage.
+    /// A browser naturally adds ~10-20ms of rendering delay per frame; this setting
+    /// replicates that effect. 0 = no pacing (read as fast as possible).
+    /// Default: 20ms.
+    /// </summary>
+    public int FramePacingMs { get; set; } = 20;
+
     public MjpegSourceClient(string streamUrl, string snapshotUrl)
     {
         StreamUrl = streamUrl;
         SnapshotUrl = snapshotUrl;
 
-        _httpClient = new HttpClient
+        // Use a small receive buffer (32KB) to create TCP backpressure during
+        // frame pacing delays. With the default auto-tuned buffer (256KB+), our
+        // pacing delay can't fill it fast enough to close the TCP window. A small
+        // buffer fills within ~10ms at typical MJPEG data rates (~3MB/s), causing
+        // the upstream encoder to block on write() and skip redundant JPEG encodes.
+        // This matches browser behavior where rendering delay naturally fills the buffer.
+        var handler = new SocketsHttpHandler
+        {
+            ConnectCallback = async (context, ct) =>
+            {
+                var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+                socket.NoDelay = true;
+                socket.ReceiveBufferSize = 4096; // 4KB - forces many round trips per frame, creating natural backpressure
+                await socket.ConnectAsync(context.DnsEndPoint, ct);
+                return new NetworkStream(socket, ownsSocket: true);
+            }
+        };
+        _httpClient = new HttpClient(handler)
         {
             Timeout = Timeout.InfiniteTimeSpan // Stream is continuous
         };
@@ -151,7 +178,11 @@ public class MjpegSourceClient : IDisposable
                     continue;
                 }
 
-                using var stream = await response.Content.ReadAsStreamAsync(ct);
+                using var rawStream = await response.Content.ReadAsStreamAsync(ct);
+                // Wrap in BufferedStream to batch socket reads — avoids chatty
+                // 1-byte recv() calls during header parsing which increase
+                // upstream CPU from extra TCP ACKs and window updates.
+                using var stream = new BufferedStream(rawStream, 256 * 1024);
 
                 IsConnected = true;
                 _reconnectAttempts = 0; // Reset on successful connection
@@ -185,6 +216,7 @@ public class MjpegSourceClient : IDisposable
         var boundaryBytes = Encoding.ASCII.GetBytes("--" + boundary);
         var fpsStopwatch = Stopwatch.StartNew();
         var fpsFrameCount = 0;
+        var frameTimer = Stopwatch.StartNew(); // Per-frame pacing timer
 
         // Buffer for reading
         var buffer = new byte[256 * 1024]; // 256KB buffer
@@ -229,6 +261,21 @@ public class MjpegSourceClient : IDisposable
                 {
                     if (contentLength > 0)
                     {
+                        // Pace reads: delay BEFORE reading body data to create TCP
+                        // backpressure. With a small receive buffer (4KB), the upstream
+                        // encoder's data fills the buffer during this delay, blocking its
+                        // writes and causing it to skip redundant JPEG encodes.
+                        var targetInterval = FramePacingMs;
+                        if (targetInterval > 0)
+                        {
+                            var elapsed = frameTimer.ElapsedMilliseconds;
+                            if (elapsed < targetInterval)
+                            {
+                                await Task.Delay((int)(targetInterval - elapsed), ct);
+                            }
+                            frameTimer.Restart();
+                        }
+
                         // Read exact body bytes directly (binary, not line-by-line)
                         var frameData = new byte[contentLength];
                         var totalRead = 0;
